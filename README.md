@@ -26,8 +26,10 @@ one ESM entry; the host does not install dependencies. Native SQLite and standar
 Node modules are provided by Node.js. Tests use temporary databases and synthetic
 native adapters, not production sessions.
 
-See [architecture and reliability](docs/architecture.md) and the role protocols
-in [coordinator](roles/coordinator.md) and [memory](roles/memory.md).
+See [API and role setup](docs/api.md) for host compatibility, initialization,
+HTTP/MCP payloads, and recovery; [architecture and reliability](docs/architecture.md)
+for the trust model; and the role protocols in
+[coordinator](roles/coordinator.md) and [memory](roles/memory.md).
 
 This repository does not automatically publish, install, deploy, or restart
 anything. Its CI is independent of Cockpit's other products' release pipelines.

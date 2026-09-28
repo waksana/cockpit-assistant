@@ -3,9 +3,10 @@
 ## Ownership and trust
 
 One activation manages one Assistant space under its module-private `dataRoot`.
-Cockpit authenticates the enclosing digest-bound HTTP routes. Every native read
-and user delivery is limited to an explicitly enrolled reception; internal role
-carriers are registered separately. There is no all-session catalog scan,
+Cockpit authenticates the enclosing digest-bound HTTP routes. Native conversation
+reads are limited to explicitly enrolled receptions/collaborators, and user
+deliveries to direct receptions; internal role carriers and their control/readiness
+checks are registered separately. There is no all-session catalog scan,
 private SDK handle, native-home scan, Task dependency, or shell-based native
 adapter. IDs locate records within this space, not arbitrary host data.
 
@@ -72,9 +73,9 @@ cursor. Whole durable native pages and their cursor commit together. Repeated
 event IDs are checked and deduplicated. Ephemeral token/reasoning deltas are not
 collected. Stored event projections omit reasoning and tool arguments/results.
 
-Initial enrollment establishes a live tail, not an implicit import of existing
-history. An explicit bounded recovery reads historical pages and records the
-remaining-history/gap warning. Historical outputs can be classified, but cannot
+Initial enrollment imports the recent bootstrap page as historical and establishes
+a live tail, not a complete archive import. An explicit bounded recovery reads
+historical pages and records the remaining-history/gap warning. Historical outputs can be classified, but cannot
 be pushed as newly received replies. Cursor expiry is visible and requires
 explicit resynchronization; taking a new tail never proves that nothing was
 missed.
@@ -113,6 +114,8 @@ may serve several topics. Topic labels do not isolate a shared native model
 context. Risk detection uses active independent topics and actual reception
 relationships. Its exact warning is both published and appended to the normal
 user prompt as separately attributed context; no extra native turn is created.
+Durable context-exposure records include anchored deliveries and survive routing
+changes; a handoff never means the previous reception forgot an active topic.
 Rate limiting and an explicit continue-sharing acknowledgment suppress repeats.
 The notice is not permission to create or split sessions.
 
@@ -135,8 +138,9 @@ original native session/event IDs and reply anchors remain provenance.
 ## Publication and reconnect
 
 Publication records contain full display text, references, topic, and optional
-stable anchor. Raw source text is stored separately. The durable event API
-supports bounded replay; SSE frames contain whole publication JSON values,
+stable anchor. Raw source text is stored separately. Accepted user input remains
+pending source/work data until a coordinator decision publishes it. The durable
+event API supports bounded replay; SSE frames contain whole publication JSON values,
 not token deltas. Reconnect after the last fully consumed event ID; duplicates
 can be discarded by that sequence. The stream applies backpressure and stops
 on request abort. Browser receipt is not an acknowledgment that the user read
@@ -145,3 +149,6 @@ the message.
 Background publication never changes the foreground topic. Internal wake
 receipts, risk notices, and system status do not become new semantic input, so
 they cannot create a reminder loop.
+
+See [API and role setup](api.md) for exact routes, payloads, resource readiness,
+and live persistent configuration.

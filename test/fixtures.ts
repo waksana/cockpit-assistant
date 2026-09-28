@@ -28,6 +28,10 @@ export function fixture() {
   for (const id of ['s1', 's2', 'coordinator', 'memory']) metas.set(id, {
     sessionId: id, cwd: '/synthetic', title: id, loaded: true, status: 'idle',
     ask: null, lastActivity: 0, currentModelId: 'synthetic',
+    ...(id === 'coordinator' || id === 'memory' ? {
+      roles: [{ moduleId: 'assistant', roleId: id, moduleName: 'Assistant', name: id }],
+      appliedRoles: [{ moduleId: 'assistant', roleId: id, moduleName: 'Assistant', name: id }],
+    } : {}),
   });
   const calls: { name: string; body: unknown }[] = [];
   let failure: Error | null = null;
@@ -36,11 +40,23 @@ export function fixture() {
     resourcePreparationVersion: 1,
     askResponseVersion: 1,
     chatReadVersion: 1,
+    roleAssignmentVersion: 1,
+    sessionDirectoryVersion: 1,
+    sessionLoadVersion: 1,
     async call<Name extends ModuleHostIntent>(name: Name, body: ModuleHostIntentBody<Name>): Promise<ModuleHostIntentResult<Name>> {
       calls.push({ name, body });
       const sessionId = 'sessionId' in body ? body.sessionId : '';
       let result: unknown;
       switch (name) {
+        case 'session/directory': result = { sessions: [...metas.values()] }; break;
+        case 'session/load': {
+          if (failure) throw failure;
+          const meta = metas.get(sessionId);
+          if (!meta) throw new Error('Synthetic session does not exist');
+          meta.loaded = true;
+          result = { sessionId, ok: true };
+          break;
+        }
         case 'session/get': result = { meta: metas.get(sessionId) ?? null }; break;
         case 'roles/readiness': result = {
           sessionId, ready: true, loaded: true, reasons: [], rolesNeedReload: false,
@@ -50,7 +66,7 @@ export function fixture() {
         }; break;
         case 'session/resources-prepare': result = { sessionId, ok: true, tools: 'initialized', skills: [],
           mcpServers: [{ name: 'assistant', effect: 'unchanged', enabled: true, status: 'connected',
-            tools: ['assistant_read', 'assistant_claim', 'assistant_decide', 'assistant_remember'] }] }; break;
+            tools: ['assistant_read', 'assistant_claim', 'assistant_decide', 'assistant_remember', 'assistant_create_session'] }] }; break;
         case 'session/new':
           if (failure) throw failure;
           result = { sessionId: 'new-synthetic' }; break;

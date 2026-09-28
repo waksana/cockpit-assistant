@@ -6,13 +6,14 @@ Assistant space and its `dataRoot/assistant.sqlite`. Use Linux and Node.js 24
 with built-in `node:sqlite`.
 
 The installed public SDK dependency is pinned to
-`@waksana/cockpit-module-sdk@0.5.0`, including the native methods used here.
+`@waksana/cockpit-module-sdk@0.6.0`, including the native methods used here.
 The host compatibility reference is commit
-[`985d18207694b4a795845194f525e3683e4f0d13`](https://github.com/waksana/cockpit/commit/985d18207694b4a795845194f525e3683e4f0d13),
-release `v0.0.0-rolling.19`; see its fixed
-[public bridge contract](https://github.com/waksana/cockpit/blob/985d18207694b4a795845194f525e3683e4f0d13/docs/module-contract.md#native-conversation-bridge).
+[`af4c8a227053640ae7c113c8849543a6731a5e19`](https://github.com/waksana/cockpit/commit/af4c8a227053640ae7c113c8849543a6731a5e19),
+release `v0.0.0-rolling.20`; see its fixed
+[role lifecycle contract](https://github.com/waksana/cockpit/blob/af4c8a227053640ae7c113c8849543a6731a5e19/docs/module-contract.md#role-assignment-lifecycle).
 Activation requires `serviceReadyVersion`, `chatReadVersion`,
-`askResponseVersion`, and `resourcePreparationVersion` all equal to `1`.
+`askResponseVersion`, `resourcePreparationVersion`, `roleAssignmentVersion`,
+`sessionDirectoryVersion`, and `sessionLoadVersion` all equal to `1`.
 Frontend activation separately requires Web API `2`, `globalComponentVersion`,
 `menuVersion`, `uiVersion`, and `uiSurfaceVersion` all `1`, and host `createPortal`.
 Rolling publication is described in [releases](releases.md). Source merge and
@@ -35,12 +36,12 @@ The digest header is optional for GET, but, if present, must match. Digest bindi
 is not authentication; stale digest URLs do not select newer packages.
 Do not expose this management API as an untrusted multi-user boundary.
 
-Management HTTP reads cover this Assistant space, not the host session catalog
-or arbitrary native history. Only explicitly enrolled sessions are observed for
-conversation; only enabled `reception` entries receive user deliveries.
-`collaborator` entries can be observed but are not direct delivery or public-reply
-targets. Coordinator and memory carriers are bound separately and cannot be
-enrolled, share a carrier, or receive user conversation.
+Management HTTP reads cover this Assistant space, not arbitrary native history.
+Ordinary sessions are automatically discovered through the public metadata
+directory and maintained through session events. Their durable reception records
+are delivery targets, not a separately configured role. Saved/applied internal
+role identities and registered coordinator/memory carriers are excluded, cannot
+share a carrier, and never receive ordinary user conversation.
 
 Management bodies and MCP tool arguments are strict objects: unknown fields,
 incorrect types, and malformed versions are rejected. Management writes accept
@@ -82,7 +83,38 @@ Use an already authorized, active module installation. Build/dependency commands
 are in the [README](../README.md#development); installation and restart are
 separate operator actions, not initialization side effects.
 
-1. Explicitly create two different native carriers through `POST /sessions`:
+Select `coordinator` and `memory` on **two separate sessions** in Cockpit's normal
+session creation or add-role controls. The host asks Assistant whether each role
+can be assigned, then notifies it after the native role save. Assistant registers
+that session without claiming readiness. A still-existing carrier retains its
+role even when unloaded or unavailable; a second session cannot replace it.
+Ordinary sessions require no manual registration.
+
+Opening Assistant checks the saved carriers and may load an unloaded carrier.
+The UI retains a durable activation receipt if loading is uncertain and never
+creates a replacement internal session. Missing carriers, unapplied roles and
+resource-readiness failures remain explicit. New business input still requires
+both roles to pass fresh verification at the send boundary.
+
+Creating or cold-loading a role session includes the host's normal native tool
+initialization. Loading never reapplies roles to an already-loaded handle or
+repairs intentionally disabled resources. Refresh is passive. Use Cockpit's
+explicit controls to apply pending roles or change resource settings.
+
+Directory discovery does not retroactively register old role selections.
+Explicit host `roles/add` with the same saved selections can deliver a missing
+notification without saving again. For a known failed notification, use the
+host's `roles/notify` with its original `notificationId`; no automatic retry or
+replacement is performed. A partial creation receipt preserves `sessionId`,
+the native error `code`, and the full `roleAssignment` recovery object.
+An ID or `saved:true` alone is not proof of native creation or readiness.
+
+### Explicit management and recovery
+
+The existing management APIs remain available for deliberate operations, not as
+the normal role setup flow:
+
+1. `POST /sessions` explicitly creates a native session:
 
    ```json
    {"requestId":"create-coordinator-1","cwd":"/absolute/project","role":"coordinator"}
@@ -93,15 +125,15 @@ separate operator actions, not initialization side effects.
    ```
 
    The optional `role` adds `{moduleId:"assistant",roleId:<role>}` at creation.
-   Omit it only for an explicitly requested ordinary session. Creation neither
-   binds nor enrolls the result and sends no prompt. Save the native result and
+   Omit it only for an explicitly requested ordinary session. Role creation
+   uses the same host role-save callbacks and sends no prompt. Save the native result and
    `create:<requestId>` receipt. Never repeat uncertain creation with a new ID.
 
 2. Inspect each original session through Cockpit's native controls for its
    actual model, working directory, loaded state, and applied role/resources.
    Creation uses the host default model; `/sessions` has no model parameter.
-   Arrange any intended native model change explicitly before binding.
-   Bind each carrier with its **actual expected model ID**, initially epoch zero:
+   Arrange any intended native model change explicitly. For an explicit recovery
+   binding, use its **actual expected model ID** and current binding epoch:
 
    ```json
    {"requestId":"bind-coordinator-1","role":"coordinator","sessionId":"COORDINATOR_SESSION","expectedEpoch":0,"definitionVersion":"1","expectedModelId":"ACTUAL_MODEL_ID"}
@@ -113,21 +145,23 @@ separate operator actions, not initialization side effects.
 
    Send these to `POST /roles/bind`. Binding prepares the existing `assistant`
    MCP server with the exact role tools, checks actual role readiness, records
-   the native working directory/model, and returns epoch `1`. Saved role labels
+   the native working directory/model, and advances the binding epoch. Saved role labels
    or an enabled MCP switch alone are not readiness. Binding does not install
    resources or authenticate servers. Preparation can have effects even if
    binding fails: inspect the `bind:<requestId>` receipt and native state.
 
-3. Explicitly enroll a known, user-authorized reception session:
+3. `/enrollment` is a legacy management endpoint, not a setup prerequisite:
 
    ```json
    {"requestId":"enroll-reception-1","sessionId":"RECEPTION_SESSION","label":"Project reception","kind":"reception","evidence":"User selected this existing session for this conversation."}
    ```
 
-   Send to `POST /enrollment`. The session must exist; loading the original
-   session is an explicit host action. An unloaded enrollment is not proof of
-   availability. New ordinary sessions require their own explicit `/sessions`
-   request followed by enrollment. There is no automatic creation/replacement.
+   Automatically observed sessions already have reception records and reject a
+   second enrollment. All ordinary sessions are direct reception targets under
+   the current policy; legacy disabled/collaborator state is normalized when
+   that session is observed again. No ordinary session is loaded just to observe
+   it. A coordinator can request an ordinary session for a current unanchored
+   input using the dedicated creation tool; it cannot create internal carriers.
 
 4. With both bound roles freshly ready, submit user input through `POST /messages`:
 
@@ -207,6 +241,7 @@ are only hints to reread this durable log, not publications or read receipts.
 | `POST /sessions` | `cwd` (1–4,000 characters), `[role]`; explicit native creation. |
 | `POST /enrollment` | `sessionId`, `label` (1–240), `kind:"reception"|"collaborator"`, `evidence` (1–4,000). |
 | `POST /roles/bind` | `role`, `sessionId`, `expectedEpoch`, `definitionVersion:"1"`, `expectedModelId`. |
+| `POST /roles/activate` | `bindings:[{role,sessionId,epoch}]`; exact current registered carriers, loads only those that are unloaded. Returns a durable `activate:<requestId>` operation. |
 | `POST /roles/verify` | `role`, positive `expectedEpoch`. |
 | `POST /roles/:role/refresh` | Positive `expectedEpoch`; role comes from path. |
 | `PATCH /config` | `config:{[riskEnabled],[riskCooldownMs],[maxReceptions]}`. |
@@ -224,7 +259,8 @@ state or kind invalidates in-flight reception readers through its generation.
 
 Config defaults are `riskEnabled:true`, `riskCooldownMs:600000`,
 `maxReceptions:32`. Allowed cooldown is 0–86,400,000 milliseconds; reception
-limit is 1–100. Installed module config is validated at activation but seeds the
+limit is 1–100 and only limits legacy explicit enrollment, not automatic ordinary
+session observation. Installed module config is validated at activation but seeds the
 database **only once**. Thereafter `PATCH /config` merges live, persisted values;
 editing installed config does not overwrite the initialized store on restart.
 
@@ -248,8 +284,8 @@ undecided input gets fresh work. Native ask source text is immutable through
 `/correct`. Read the current source and version/assignment endpoints to render
 corrections without rewriting the original publication.
 
-Recovery reads the **loaded original** enrolled session, at most `maxPages`
-native pages of 64 events each. Initial enrollment already bootstraps the recent
+Recovery reads the **loaded original** observed session, at most `maxPages`
+native pages of 64 events each. Initial observation already bootstraps the recent
 tail as historical, then reads forward; it is not a full archive import. Cursor
 expiry records a gap and stops forward consumption until explicit recovery.
 Successful recovery returns `sessionId`, `pages`, `historical:true`,
@@ -276,7 +312,7 @@ The manifest exposes `/mcp` through the role's host-managed HTTP server:
 
 | Role | Allowed tools |
 | --- | --- |
-| `coordinator` | `assistant_read`, `assistant_claim`, `assistant_decide` |
+| `coordinator` | `assistant_read`, `assistant_claim`, `assistant_decide`, `assistant_create_session` |
 | `memory` | `assistant_read`, `assistant_claim`, `assistant_remember` |
 
 POST JSON-RPC 2.0 supports `initialize`, `ping`, `tools/list`, and `tools/call`;
@@ -291,6 +327,29 @@ The host attaches `params._meta["cockpit/invocation"]` with observed `sessionId`
 in tool arguments or manufacture it in an HTTP client. Calls require the bound
 main session (`subagent:false`, equal session/runtime IDs), current ready epoch,
 and rechecked native model/directory/role readiness.
+
+### Creating an ordinary topic carrier
+
+`assistant_create_session` accepts the same current coordinator work proof as a
+decision, plus an explicit absolute `cwd` and nonempty `reason`. It is limited
+to a claimed ordinary user input: no historical/native output, anchored reply,
+or possible literal answer to a pending native question. If the required
+directory is unknown, the coordinator asks a clarification rather than inventing
+one. Native creation uses the host default model and no internal roles.
+
+The `topic-create:<workId>` operation reserves one creation for that input;
+`topic-create-request:<requestId>` preserves the original request receipt.
+The result includes `createdId`, `nativeOperationId`, original native result,
+`observation`, and `retryAllowed`. Native creation and automatic observation
+are separate facts: observation failure never erases a created session or permits
+recreation. Unknown and in-flight creations cannot be retried under a new ID.
+Only an explicit known rejection before native intent was reserved can permit
+a corrected request. Stable replay preserves the original receipt.
+
+Creation does not route input or complete work. Read the receipt through
+`assistant_read {resource:"receipts",workId,...}` (`sessionCreation`), then
+claim/read fresh state and use `assistant_decide` to select the created target.
+The original work/epoch and native receipt remain auditable.
 
 ### Claim, read, and proof
 

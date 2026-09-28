@@ -600,7 +600,7 @@ test('stateless MCP negotiates protocol and publishes detailed standard JSON sch
     assert.equal(initialization.jsonSchemaDialect, 'https://json-schema.org/draft/2020-12/schema');
     const tools = ((await f.rpc('tools/list')).body as { result: { tools: { name: string;
       inputSchema: { additionalProperties: boolean; properties: Record<string, unknown> } }[] } }).result.tools;
-    assert.equal(tools.length, 4);
+    assert.equal(tools.length, 5);
     assert.ok(tools.find(tool => tool.name === 'assistant_decide')!.inputSchema.properties.action);
     assert.ok(tools.every(tool => tool.inputSchema.additionalProperties === false));
     assert.deepEqual((await f.rpc('ping')).body, { jsonrpc: '2.0', id: 1, result: {} });

@@ -6,24 +6,46 @@ On a compatible host, choose **助手** in the global hamburger menu. This opens
 near-viewport native dialog (full-screen layout on mobile), not browser
 Fullscreen mode. A public global component stays in the host React tree outside
 session routes; the menu only changes the module-owned visibility service.
-The frontend declares no native draft or send capability.
+The frontend declares no native draft or send capability. The left arrow closes
+the native dialog and returns to the existing Cockpit view; it never navigates
+browser history or changes the selected host session. The single gear on the
+right toggles settings. Both actions use exact Lucide 1.46.0 nodes through host
+React, public `ck-icon-button` targets and `ck-icon ck-icon-lg` sizing, with
+accessible names and tooltips. The package includes the upstream Lucide license.
 
-Each opening checks the bound coordinator and memory sessions. Opening never
-creates, loads, repairs, replaces, or enrolls sessions. Their status distinguishes
+Each opening freshly checks the registered **coordinator** and **memory**
+sessions. Display names are exactly these role identifiers. Status distinguishes
 checking, unbound, unloaded, invalid, unknown and ready. History and draft editing
 remain available while sending is disabled.
 
-Use the setup controls to explicitly create a carrier with its working directory,
-or inspect a known session ID. Creation and binding are separate actions. Binding
-uses the inspected actual model and current role epoch, not a guessed default.
-The two roles must use distinct eligible carriers with their applied Assistant
-role; labels alone do not establish readiness. Native session loading, model
-changes and applying changed roles remain explicit Cockpit operations.
+Choose coordinator or memory when creating a session or adding roles in Cockpit.
+The host's saved-role callback registers the carrier even when the role is not
+ready yet. Registration does not prove application or readiness. Settings explain
+this workflow and show status and receipts, not manual session-ID, creation,
+binding, reception-enrollment or default-scope forms. Existing explicit backend
+binding APIs remain available for recovery.
 
-An ordinary reception also needs explicit enrollment. Internal role carriers are
-not reception targets. The UI does not browse or enroll the host session catalog.
-Every create/bind/enroll action retains its request ID and receipt; an uncertain
-operation does not silently retry under a fresh ID.
+When the fresh opening snapshot identifies an already-bound unloaded carrier,
+the frontend makes a separate `/roles/activate` mutation with a stable request ID
+and the captured role/session/epoch binding vector. The backend verifies that
+vector before loading only those already-bound unloaded internal carriers.
+Opening never creates or replaces carriers, scans directories for bindings,
+reloads loaded sessions, changes models or forces pending roles to apply on an
+already-loaded carrier. Refresh is read-only. Cold-loading an unloaded carrier
+includes the host's ordinary native tool initialization and validation, but
+Assistant adds no extra resource repair, forced reload or automatic enablement
+of disabled resources. Users handle pending roles on loaded sessions or disabled
+resources in Cockpit, then refresh. A loaded registered carrier can still remain
+not ready.
+Unknown load state is not treated as unloaded or ready. Ordinary sessions are
+observed automatically; no reception enrollment is required.
+
+Activation retains the exact `activate:<requestId>` receipt through close/reopen.
+Pending and unknown operations block a fresh automatic activation request.
+Receipt inspection uses `GET /operations/:id`, not another mutation. A completed
+receipt is not readiness: the UI refreshes the passive readiness endpoint.
+Refresh itself never activates. An attempted binding vector is not automatically
+retried until its originally unloaded roles have subsequently been observed ready.
 
 ## Conversation
 
@@ -85,7 +107,8 @@ These module-relative routes supplement, not replace, existing `/history`,
 | `GET /timeline?after=N&limit=100` | Exclusive forward recovery; also returns `cursor`. |
 | `GET /timeline/items/:sequence` | One enriched current projection of a durable publication. |
 | `GET /timeline/stream?after=N` | SSE `publication` frames with enriched items; `Last-Event-ID` wins. |
-| `GET /readiness` | Fresh passive roles and explicitly enrolled receptions; no creation or wake. |
+| `GET /readiness` | Fresh passive role status; no creation, load, reload or registration. |
+| `POST /roles/activate` | Stable request ID and captured `bindings: [{role,sessionId,epoch}]`; exact durable activation operation. |
 | `GET /sessions/:id/inspect` | Explicit session model, directory, loaded state and reload flag; no catalog. |
 | `GET /operations/:id` | Exact durable operation receipt, or 404. |
 | `GET /inputs/:requestId` | Original accepted input, bounded related work/deliveries and per-list `hasMore`. |
@@ -99,11 +122,9 @@ publication text or anchors. Exact lookup and a fresh page can observe later
 question state; SSE is a publication log, not a general mutable-record change feed.
 
 `Readiness` contains role session IDs, expected epochs/models/directories,
-statuses and explanations, plus `canSend` and up to 100 enabled direct receptions.
-Disabled historical entries and collaborators remain available through the
-existing paginated `/receptions` API, but do not crowd active receivers out of
-the readiness window. The interface additionally
-requires an enabled loaded reception before submitting. Readiness is an observation,
+statuses and explanations, plus `canSend`. The compatibility `receptions` field
+is not a setup list or an additional frontend send requirement.
+Readiness is an observation,
 not a lease over future native state; races can still fail explicitly at dispatch.
 
 ## Delivery boundaries

@@ -9,6 +9,7 @@ import { nativeAccess } from './native.ts';
 import { requireFact } from './errors.ts';
 import { nativeTypes } from './ingestion.ts';
 import { configSchema } from './schema.ts';
+import type { Role } from './types.ts';
 
 export async function activate(context: ModuleBackendContext): Promise<ModuleBackend> {
   requireFact(context.serviceReadyVersion === 1, 'HOST_CAPABILITY', 'Assistant requires serviceReadyVersion 1');
@@ -59,10 +60,28 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
   };
   context.signal.addEventListener('abort', stop, { once: true });
   const wake = (sessionId: string): void => {
-    if (!ready || disposed || !db.get('receptions', sessionId)?.enabled) return;
+    if (!ready || disposed) return;
     void runtime.wake(sessionId).catch(error => context.report(error));
   };
   return {
+    roleAssignments: {
+      permit(input, signal) {
+        return track(async () => {
+          requireFact(!disposed && !signal.aborted, 'STOPPING', 'Assistant is stopping');
+          const roles: Role[] = input.roles.flatMap(item => item.moduleId === 'assistant'
+            && (item.roleId === 'coordinator' || item.roleId === 'memory') ? [item.roleId] : []);
+          return runtime.allowRoles(input.operation === 'create' ? null : input.sessionId, roles);
+        });
+      },
+      saved(input, signal) {
+        return track(async () => {
+          requireFact(!disposed && !signal.aborted, 'STOPPING', 'Assistant stopped before role registration');
+          const roles: Role[] = input.roles.flatMap(item => item.moduleId === 'assistant'
+            && (item.roleId === 'coordinator' || item.roleId === 'memory') ? [item.roleId] : []);
+          if (roles.length) await runtime.registerRoles(input.sessionId, roles, input.notificationId, signal);
+        });
+      },
+    },
     routes: routes(service, runtime).map(route => ({
       ...route,
       async handler(request) {
@@ -74,19 +93,26 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
     async onReady() {
       if (disposed || context.signal.aborted) return;
       ready = true;
-      await track(() => runtime.start());
+      try { await track(() => runtime.start()); }
+      catch (error) { ready = false; runtime.stop(); throw error; }
     },
-    events: { types: nativeTypes, handle: observation => wake(observation.sessionId) },
+    events: { types: nativeTypes, handle: observation => {
+      if (!ready || disposed) return;
+      runtime.noteEvent(observation.sessionId, observation.event);
+      wake(observation.sessionId);
+    } },
     controlEvents: {
       types: ['session/invalidated', 'session/removed', 'session/added', 'chat/invalidated', 'session/patch'],
       handle(event) {
         if (event.type === 'session/added') wake(event.session.sessionId);
         else if ('sessionId' in event) {
           if (event.type === 'session/patch') {
-            const relevant = ['ask', 'decisions', 'loaded', 'status', 'closing', 'currentModelId', 'rolesNeedReload'];
+            const relevant = ['ask', 'decisions', 'loaded', 'status', 'closing', 'currentModelId',
+              'roles', 'appliedRoles', 'rolesNeedReload'];
             if (!relevant.some(key => key in event)) return;
           }
-          if (event.type === 'session/invalidated' && event.resources?.every(r => !['control', 'controls'].includes(r))) return;
+          if (event.type === 'session/invalidated'
+            && event.resources?.every(r => !['control', 'controls', 'identity'].includes(r))) return;
           wake(event.sessionId);
         }
       },

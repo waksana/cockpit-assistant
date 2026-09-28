@@ -52,11 +52,12 @@ loopback port (default 4179); existing servers are never reused.
 - The real runtime fetches a synthetic module manifest and dynamically imports
   the production module bundle; it owns registration and invokes the real
   Assistant global-menu action. The renderer and menu share one React tree and
-  runtime. The homepage has no selected session.
+  runtime. The homepage initially has no selected session; a synthetic selection
+  and host draft verify that closing Assistant preserves the existing view.
 - Only the host `net/store` import is replaced with an empty session snapshot.
   Native draft submission throws instead of making a request. The fixture does
   not import the host App or initialize its networking/authentication.
-- Playwright supplies deterministic timeline, readiness, inspection, enrollment,
+- Playwright supplies deterministic timeline, readiness, internal activation,
   and POST/receipt responses. A loopback-only server supplies idle synthetic SSE;
   tests inject duplicate/out-of-order publications and catch-up responses.
   Unexpected module requests, host API requests, and external requests fail.
@@ -69,9 +70,11 @@ smoke test. It does not claim to test native session creation or real delivery.
 Every scenario runs in desktop/mobile Chromium with light/dark themes. Tests
 cover complete Markdown and A/B/A topic segments, fixed composer visibility,
 immediate settings visibility even when initial history is delayed,
-readiness-gated sending with editable drafts, explicit role creation and binding
-using the inspected model/epoch and loaded/applied-role checks, reception
-enrollment, cross-form blocking while a creation result is unknown, reply anchors and question
+readiness-gated sending with editable drafts, exact role names and Cockpit role
+registration guidance without manual registration or reception forms, public
+arrow/gear icons with native dialog return and preserved host selection/draft,
+captured role/session/epoch activation, pending and unknown load receipts across
+reopen without new-ID retries or invalid-role repair, reply anchors and question
 choices (including six 120-character choices without hiding the mobile composer),
 retained question choices outside the reopened timeline without duplicate controls,
 stable uncertain request identities, late writes after close/reopen,

@@ -1,13 +1,17 @@
 # Cockpit Assistant
 
 Assistant is a trusted Cockpit module for durable topic-based
-conversation across explicitly enrolled native sessions. It does not require
+conversation across ordinary native sessions. It does not require
 Task or replace native history. The global menu's **助手** action opens its
 session-independent conversation dialog, including on an empty Cockpit home.
 
-The coordinator classifies inputs and reception outputs; the program validates,
+The coordinator classifies inputs and session outputs; the program validates,
 persists, sends, and publishes them. A separate memory role extracts versioned,
 source-bound memory on topic changes. Neither internal role is a receptionist.
+Select `coordinator` and `memory` on two separate sessions using Cockpit's
+normal role controls; successful role saves register their carriers with the
+module. Registration does not claim readiness. Ordinary sessions are observed
+automatically, without a separate receptionist setup step.
 
 ## Development
 
@@ -49,3 +53,5 @@ The initial backend implementation is tracked in
 [issue #1](https://github.com/waksana/cockpit-assistant/issues/1).
 The interface follow-up is tracked in
 [issue #3](https://github.com/waksana/cockpit-assistant/issues/3).
+Role registration and automatic session observation are tracked in
+[issue #5](https://github.com/waksana/cockpit-assistant/issues/5).

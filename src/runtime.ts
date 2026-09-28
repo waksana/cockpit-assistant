@@ -3,8 +3,8 @@ import { fingerprint } from './database.ts';
 import { BusinessError, errorText, requireFact } from './errors.ts';
 import { Ingestion } from './ingestion.ts';
 import { AssistantService, questionKey } from './service.ts';
-import type { Binding, Delivery, Reception, Role } from './types.ts';
-import { bindingSchema, createSessionSchema, enrollSchema, inputSchema } from './schema.ts';
+import type { Binding, Delivery, Operation, Reception, Role } from './types.ts';
+import { activateRolesSchema, bindingSchema, createSessionSchema, enrollSchema, inputSchema } from './schema.ts';
 import type { Readiness, RoleReadiness, SessionInspection } from './ui-types.ts';
 
 export interface HistoryPage {
@@ -20,7 +20,7 @@ export interface NativeAccess {
   answer(sessionId: string, requestId: string, answer: string, wasFreeform: boolean): Promise<{ accepted: boolean; result: unknown }>;
 }
 const tools: Record<Role, string[]> = {
-  coordinator: ['assistant_read', 'assistant_claim', 'assistant_decide'],
+  coordinator: ['assistant_read', 'assistant_claim', 'assistant_decide', 'assistant_create_session'],
   memory: ['assistant_read', 'assistant_claim', 'assistant_remember'],
 };
 
@@ -31,12 +31,29 @@ export class Runtime {
   private again = false;
   private stopped = false;
   private leaseTimer: ReturnType<typeof setTimeout> | null = null;
+  private liveEnds = new Map<string, Set<string>>();
   constructor(readonly service: AssistantService, readonly native: NativeAccess,
     readonly report: (error: unknown) => void, readonly notify: () => void) {
     this.ingestion = new Ingestion(service);
   }
   async start(): Promise<void> {
     this.service.recover();
+    let cursor: string | undefined;
+    const visited = new Set<string>();
+    do {
+      const page = await this.native.host.call('session/directory', { limit: 100, ...(cursor ? { cursor } : {}) });
+      if (this.stopped) return;
+      for (const session of page.sessions) {
+        await this.observe(session.sessionId);
+        if (this.stopped) return;
+        this.sessions.add(session.sessionId);
+      }
+      cursor = page.cursor;
+      if (cursor) {
+        requireFact(!visited.has(cursor), 'DIRECTORY_CURSOR', 'Session directory cursor did not advance');
+        visited.add(cursor);
+      }
+    } while (cursor);
     for (const binding of this.service.db.find('bindings', () => true)) {
       try { await this.verifyBinding(binding); } catch (error) { this.problem(`role:${binding.id}`, error); }
     }
@@ -51,7 +68,7 @@ export class Runtime {
   async settled(): Promise<void> { await this.running; }
   wake(sessionId?: string): Promise<void> {
     if (this.stopped) return Promise.resolve();
-    if (sessionId && this.service.db.get('receptions', sessionId)?.enabled) this.sessions.add(sessionId);
+    if (sessionId) this.sessions.add(sessionId);
     this.again = true;
     if (!this.running) {
       this.running = this.pump().finally(() => { this.running = null; });
@@ -65,7 +82,14 @@ export class Runtime {
       this.sessions.clear();
       for (const id of ids) {
         if (this.stopped) return;
-        try { await this.consume(id); } catch (error) { this.problem(`reception:${id}`, error); }
+        try {
+          await this.observe(id);
+          for (const binding of this.service.db.find('bindings', binding => binding.sessionId === id)) {
+            try { await this.verifyBinding(binding); }
+            catch (error) { this.problem(`role:${binding.id}`, error); }
+          }
+          await this.consume(id);
+        } catch (error) { this.problem(`reception:${id}`, error); }
       }
       this.queueWorkers();
       for (const delivery of this.service.db.find('deliveries', d => d.state === 'pending')) {
@@ -99,12 +123,225 @@ export class Runtime {
   private async meta(sessionId: string): Promise<PublicSessionMeta | null> {
     return (await this.native.host.call('session/get', { sessionId })).meta;
   }
+  private internal(meta: PublicSessionMeta): boolean {
+    return [...(meta.roles ?? []), ...(meta.appliedRoles ?? [])].some(item =>
+      item.moduleId === 'assistant' && (item.roleId === 'coordinator' || item.roleId === 'memory'))
+      || this.service.db.find('bindings', binding => binding.sessionId === meta.sessionId).length > 0;
+  }
+  noteEvent(sessionId: string, event: NativeChatEvent): void {
+    if (event.type !== 'assistant.turn_end' || this.service.db.get('receptions', sessionId)?.baseline) return;
+    const ends = this.liveEnds.get(sessionId) ?? new Set<string>();
+    ends.add(event.id);
+    this.liveEnds.set(sessionId, ends);
+  }
+  private async stillOrdinary(sessionId: string): Promise<boolean> {
+    const meta = await this.meta(sessionId);
+    if (this.stopped) return false;
+    requireFact(!meta || meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
+    if (!meta || this.internal(meta)) {
+      await this.observe(sessionId);
+      return false;
+    }
+    return true;
+  }
+  async observe(sessionId: string): Promise<void> {
+    const meta = await this.meta(sessionId);
+    if (this.stopped) return;
+    requireFact(!meta || meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
+    const excluded = meta !== null && this.internal(meta);
+    const { db } = this.service;
+    db.transaction(() => {
+      const existing = db.get('receptions', sessionId);
+      if (!meta || excluded) {
+        if (existing && (existing.enabled || !meta && existing.availability !== 'missing')) {
+          existing.enabled = false;
+          existing.availability = meta ? meta.loaded ? 'loaded' : 'unloaded' : 'missing';
+          existing.generation++;
+          existing.version++;
+          db.put('receptions', existing);
+          this.service.syncQuestions(sessionId, [], false);
+          for (const delivery of db.find('deliveries', item => item.sessionId === sessionId
+            && item.kind !== 'wake' && item.state === 'pending')) {
+            delivery.state = 'cancelled';
+            delivery.error = excluded ? 'Target is an internal role carrier' : 'Target no longer exists';
+            db.put('deliveries', delivery);
+          }
+          if (excluded) for (const work of db.find('work', item => item.state !== 'done'
+            && !!item.messageId && db.get('messages', item.messageId)?.sessionId === sessionId)) {
+            work.state = 'invalidated';
+            db.put('work', work);
+          }
+          this.service.changed();
+        }
+        this.liveEnds.delete(sessionId);
+        return;
+      }
+      if (!existing) {
+        db.put('receptions', {
+          id: sessionId, label: meta.title || sessionId, kind: 'reception', enabled: true,
+          evidence: 'Public ordinary-session observation', availability: meta.loaded ? 'loaded' : 'unloaded',
+          cursor: null, cursorSource: 'live', cursorDirection: 'forward', baseline: false,
+          gap: null, generation: 1, version: 1,
+        });
+        this.service.changed();
+      } else if (!existing.enabled || existing.kind !== 'reception') {
+        existing.enabled = true;
+        existing.kind = 'reception';
+        existing.evidence = 'Public ordinary-session observation';
+        existing.generation++;
+        existing.version++;
+        db.put('receptions', existing);
+        this.service.changed();
+      }
+    });
+  }
   async inspect(sessionId: string): Promise<SessionInspection> {
     const meta = await this.meta(sessionId);
     requireFact(meta, 'SESSION_MISSING', 'Explicit session does not exist', 404);
     requireFact(meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
     return { sessionId, modelId: meta.currentModelId ?? null, cwd: meta.cwd,
       loaded: meta.loaded, status: meta.status, rolesNeedReload: meta.rolesNeedReload ?? null };
+  }
+  async activateRoles(input: unknown): Promise<Operation> {
+    const value = activateRolesSchema.parse(input);
+    const { db } = this.service;
+    const key = `activate:${value.requestId}`;
+    const prior = db.get('operations', key);
+    if (prior) {
+      requireFact(prior.fingerprint === fingerprint(value), 'IDEMPOTENCY_CONFLICT', 'Activation request changed');
+      return prior;
+    }
+    const matches = (): void => {
+      const actual = db.find('bindings', () => true).map(binding =>
+        ({ role: binding.id, sessionId: binding.sessionId, epoch: binding.epoch })).sort((a, b) => a.role.localeCompare(b.role));
+      requireFact(fingerprint(actual) === fingerprint([...value.bindings].sort((a, b) => a.role.localeCompare(b.role))),
+        'STALE_ROLE', 'Registered carriers changed; refresh before activation');
+    };
+    db.transaction(() => {
+      matches();
+      requireFact(!db.find('operations', operation => operation.id.startsWith('activate:')
+        && (operation.state === 'calling' || operation.state === 'unknown')).length,
+      'UNRESOLVED_ACTIVATION', 'Inspect the outstanding role activation before starting another');
+      db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'calling',
+        result: { bindings: value.bindings, effects: [] } });
+    });
+    const effects: { role: Role; sessionId: string; effect: 'already_loaded' | 'load_accepted'; result?: unknown }[] = [];
+    let mutationStarted = false;
+    try {
+      for (const expected of value.bindings) {
+        matches();
+        const meta = await this.meta(expected.sessionId);
+        requireFact(meta?.sessionId === expected.sessionId, 'SESSION_MISSING', 'Registered role session no longer exists');
+        requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before loading a role');
+        matches();
+        if (meta.loaded) effects.push({ role: expected.role, sessionId: expected.sessionId, effect: 'already_loaded' });
+        else {
+          mutationStarted = true;
+          const result = await this.native.host.call('session/load', { sessionId: expected.sessionId });
+          requireFact(result.ok === true && result.sessionId === expected.sessionId,
+            'LOAD_UNCONFIRMED', 'Host did not confirm loading the registered session');
+          effects.push({ role: expected.role, sessionId: expected.sessionId, effect: 'load_accepted', result });
+        }
+        db.transaction(() => db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'calling',
+          result: { bindings: value.bindings, effects } }));
+      }
+      requireFact(!this.stopped, 'STOPPING', 'Assistant stopped after role loading');
+      matches();
+      const readiness = await this.readiness();
+      matches();
+      db.transaction(() => db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'accepted',
+        result: { bindings: value.bindings, effects, readiness,
+          detail: 'Loading completed; readiness is separate and no resources or already-loaded roles were repaired.' } }));
+    } catch (error) {
+      db.transaction(() => db.put('operations', { id: key, fingerprint: fingerprint(value),
+        state: mutationStarted || !(error instanceof BusinessError) ? 'unknown' : 'rejected',
+        result: { bindings: value.bindings, effects, error: errorText(error),
+          detail: 'Inspect this original activation and native state before retrying; prior load effects are not rolled back.' } }));
+    }
+    return db.must('operations', key);
+  }
+  async allowRoles(sessionId: string | null, requested: readonly Role[]): Promise<{ allowed: true } | { allowed: false; reason: string }> {
+    requireFact(!this.stopped, 'STOPPING', 'Assistant is stopping');
+    if (requested.length > 1) return { allowed: false, reason: 'coordinator and memory require separate sessions' };
+    const { db } = this.service;
+    for (const role of requested) {
+      const binding = db.get('bindings', role);
+      if (sessionId && db.find('bindings', item => item.id !== role && item.sessionId === sessionId).length) {
+        return { allowed: false, reason: 'This session already carries the other internal role' };
+      }
+      if (!binding || binding.sessionId === sessionId) continue;
+      const existing = await this.meta(binding.sessionId);
+      requireFact(!this.stopped, 'STOPPING', 'Assistant stopped during role permission check');
+      const current = db.get('bindings', role);
+      if (current?.epoch !== binding.epoch || current.sessionId !== binding.sessionId) {
+        return { allowed: false, reason: 'Role binding changed; inspect the current carrier before retrying' };
+      }
+      if (existing) return { allowed: false, reason: `${role} is already registered to ${binding.sessionId}` };
+    }
+    return { allowed: true };
+  }
+  async registerRoles(sessionId: string, requested: readonly Role[], requestId: string, signal?: AbortSignal): Promise<void> {
+    requireFact(!this.stopped && !signal?.aborted, 'STOPPING', 'Role registration was stopped');
+    const { db } = this.service;
+    const input = { sessionId, roles: [...requested].sort() };
+    const key = `role-registration:${requestId}`;
+    const existing = db.get('operations', key);
+    if (existing) {
+      requireFact(existing.fingerprint === fingerprint(input), 'IDEMPOTENCY_CONFLICT', 'Role notification changed');
+      await this.observe(sessionId);
+      return;
+    }
+    const permission = await this.allowRoles(sessionId, requested);
+    requireFact(permission.allowed, 'ROLE_OCCUPIED', permission.allowed ? 'Role assignment is not allowed' : permission.reason);
+    const meta = await this.meta(sessionId);
+    requireFact(meta?.sessionId === sessionId, 'SESSION_MISSING', 'Saved role session is not available');
+    requireFact(requested.every(role => meta.roles?.some(item => item.moduleId === 'assistant' && item.roleId === role)),
+      'ROLE_NOT_SAVED', 'Host role notification must match the actual saved role identities');
+    requireFact(new Set(meta.roles?.filter(item => item.moduleId === 'assistant'
+      && (item.roleId === 'coordinator' || item.roleId === 'memory')).map(item => item.roleId)).size <= 1,
+    'ROLE_CONFLICT', 'Saved coordinator and memory roles cannot share a session');
+    const previous = new Map(requested.map(role => [role, db.get('bindings', role)]));
+    // Recheck existence immediately before local registration; an unloaded carrier still occupies its role.
+    for (const role of requested) {
+      const binding = previous.get(role);
+      if (binding && binding.sessionId !== sessionId) {
+        requireFact(await this.meta(binding.sessionId) === null, 'ROLE_OCCUPIED', 'Existing role carrier still exists');
+      }
+    }
+    requireFact(!this.stopped && !signal?.aborted, 'STOPPING',
+      'Assistant stopped after native role save; registration is incomplete');
+    db.transaction(() => {
+      for (const role of requested) {
+        const before = previous.get(role);
+        const current = db.get('bindings', role);
+        requireFact((current?.epoch ?? 0) === (before?.epoch ?? 0)
+          && current?.sessionId === before?.sessionId, 'STALE_ROLE', 'Role changed before registration');
+        if (current?.sessionId === sessionId) continue;
+        requireFact(!db.find('bindings', item => item.id !== role && item.sessionId === sessionId).length,
+          'ROLE_CONFLICT', 'One session cannot carry both internal roles');
+        const binding: Binding = { id: role, sessionId, epoch: (before?.epoch ?? 0) + 1,
+          definitionVersion: '1', modelId: meta.currentModelId ?? null, cwd: meta.cwd,
+          ready: false, evidence: { registeredBy: requestId, saved: true, readiness: 'unchecked' } };
+        db.put('bindings', binding);
+        this.retireRoleWork(role, before);
+      }
+      db.put('operations', { id: key, fingerprint: fingerprint(input), state: 'accepted', result: input });
+      this.service.changed();
+    });
+    await this.observe(sessionId);
+  }
+  private retireRoleWork(role: Role, previous: Binding | undefined): void {
+    const { db } = this.service;
+    for (const work of db.find('work', item => item.role === role && item.state === 'leased')) {
+      work.state = 'pending'; work.epoch = null; work.token = null; work.leaseUntil = 0;
+      db.put('work', work);
+    }
+    if (!previous) return;
+    for (const delivery of db.find('deliveries', item => item.kind === 'wake'
+      && item.sessionId === previous.sessionId && item.roleEpoch === previous.epoch && item.state === 'pending')) {
+      delivery.state = 'cancelled';
+      db.put('deliveries', delivery);
+    }
   }
   async readiness(): Promise<Readiness> {
     const roles = await Promise.all((['coordinator', 'memory'] as const).map(async role => {
@@ -114,7 +351,8 @@ export class Runtime {
         status: binding ? 'unknown' : 'unbound', detail: null };
       if (!binding) return result;
       try {
-        await this.verifyBinding(binding);
+        const verified = await this.verifyBinding(binding);
+        result.modelId = verified.modelId;
         result.status = 'ready';
       } catch (error) {
         result.status = error instanceof BusinessError
@@ -199,6 +437,10 @@ export class Runtime {
     if (!reception?.enabled) return;
     const meta = await this.meta(sessionId);
     if (this.stopped) return;
+    if (meta && this.internal(meta)) {
+      await this.observe(sessionId);
+      return;
+    }
     db.transaction(() => {
       const current = db.must('receptions', sessionId);
       requireFact(current.generation === reception.generation, 'STALE_READER', 'Enrollment changed during native read');
@@ -212,21 +454,23 @@ export class Runtime {
     if (!meta?.loaded || reception.gap) return;
     if (!reception.baseline) {
       const page = await this.native.read(sessionId, null, true);
-      if (this.stopped) return;
+      if (this.stopped || !await this.stillOrdinary(sessionId)) return;
       requireFact(typeof page.liveCursor === 'string', 'NO_LIVE_CURSOR', 'Native bootstrap returned no continuation cursor');
       db.transaction(() => {
-        this.ingestion.applyWithinTransaction(sessionId, reception.generation, page.events, page.liveCursor!, true, false);
+        this.ingestion.applyWithinTransaction(sessionId, reception.generation, page.events, page.liveCursor!,
+          true, false, this.liveEnds.get(sessionId));
         const current = db.must('receptions', sessionId);
         requireFact(current.generation === reception.generation, 'STALE_READER', 'Enrollment changed during bootstrap');
         current.baseline = true;
         current.cursor = page.liveCursor!;
         db.put('receptions', current);
       });
+      this.liveEnds.delete(sessionId);
     }
     for (let count = 0; count < 16; count++) {
       const current = db.must('receptions', sessionId);
       const page = await this.native.read(sessionId, current.cursor, false);
-      if (this.stopped) return;
+      if (this.stopped || !await this.stillOrdinary(sessionId)) return;
       if (page.cursorStatus === 'expired') {
         db.transaction(() => {
           const latest = db.must('receptions', sessionId);
@@ -266,6 +510,8 @@ export class Runtime {
       while (pages < maxPages && hasMore) {
         const page = await this.native.read(sessionId, cursor, pages === 0, true);
         requireFact(!this.stopped, 'STOPPING', 'Runtime stopped during recovery');
+        requireFact(await this.stillOrdinary(sessionId), 'INTERNAL_TARGET',
+          'History target disappeared or became an internal carrier during recovery');
         requireFact(page.cursorStatus !== 'expired' && typeof page.cursor === 'string',
           'RECOVERY_CURSOR', 'Recovery cursor expired or is unavailable; no forward position was changed');
         if (pages === 0) {
@@ -309,6 +555,7 @@ export class Runtime {
     }
   }
   async verifyBinding(binding: Binding): Promise<Binding> {
+    let expectedModel = binding.modelId;
     const matches = (current: Binding | undefined): boolean => !!current
       && current.epoch === binding.epoch && current.sessionId === binding.sessionId
       && current.modelId === binding.modelId && current.cwd === binding.cwd
@@ -317,7 +564,8 @@ export class Runtime {
       requireFact(meta, 'SESSION_MISSING', 'Bound role session no longer exists');
       requireFact(meta.sessionId === binding.sessionId, 'ROLE_CONFIGURATION', 'Host returned a different session');
       requireFact(meta.loaded === true, 'ROLE_UNLOADED', 'Bound role session is unloaded');
-      requireFact(meta.currentModelId === binding.modelId && meta.cwd === binding.cwd,
+      expectedModel ??= meta.currentModelId ?? null;
+      requireFact(expectedModel && meta.currentModelId === expectedModel && meta.cwd === binding.cwd,
         'ROLE_CONFIGURATION', 'Native role model or directory changed');
       requireFact(meta.rolesNeedReload !== true, 'ROLE_NOT_READY', 'Native role assembly requires reload');
     };
@@ -334,8 +582,9 @@ export class Runtime {
       return this.service.db.transaction(() => {
         const current = this.service.db.must('bindings', binding.id);
         requireFact(matches(current), 'STALE_ROLE', 'Role changed during native readiness read');
+        current.modelId = expectedModel;
         current.ready = true;
-        current.evidence = { readiness, modelId: binding.modelId, checkedAt: this.service.now() };
+        current.evidence = { readiness, modelId: expectedModel, checkedAt: this.service.now() };
         this.service.db.put('bindings', current);
         return current;
       });
@@ -373,7 +622,7 @@ export class Runtime {
     const { db } = this.service;
     db.transaction(() => {
       requireFact((db.get('bindings', value.role)?.epoch ?? 0) === value.expectedEpoch, 'STALE_ROLE', 'Role epoch changed');
-      requireFact(!db.get('receptions', value.sessionId), 'RECEPTION_TARGET', 'Reception cannot become an internal role');
+      requireFact(!db.get('receptions', value.sessionId)?.enabled, 'RECEPTION_TARGET', 'Active reception cannot become an internal role');
       requireFact(!db.find('bindings', b => b.id !== value.role && b.sessionId === value.sessionId).length,
         'ROLE_CONFLICT', 'One native session cannot carry both internal roles');
       db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'calling', result: null });
@@ -395,22 +644,15 @@ export class Runtime {
       requireFact(!this.stopped, 'STOPPING', 'Runtime stopped before role cutover');
       result = db.transaction(() => {
         requireFact((db.get('bindings', value.role)?.epoch ?? 0) === value.expectedEpoch, 'STALE_ROLE', 'Concurrent role replacement won');
-        requireFact(!db.get('receptions', value.sessionId)
+        requireFact(!db.get('receptions', value.sessionId)?.enabled
           && !db.find('bindings', b => b.id !== value.role && b.sessionId === value.sessionId).length,
         'ROLE_CONFLICT', 'Candidate was enrolled or assigned another role during preparation');
-        const previousSession = db.get('bindings', value.role)?.sessionId;
+        const previous = db.get('bindings', value.role);
         const binding: Binding = { id: value.role, sessionId: value.sessionId, epoch: value.expectedEpoch + 1,
           definitionVersion: value.definitionVersion, modelId: value.expectedModelId, cwd: meta.cwd,
           ready: true, evidence: { preparation, readiness } };
         db.put('bindings', binding);
-        for (const work of db.find('work', w => w.role === value.role && w.state === 'leased')) {
-          work.state = 'pending'; work.epoch = null; work.token = null; work.leaseUntil = 0;
-          db.put('work', work);
-        }
-        for (const delivery of db.find('deliveries', d => d.kind === 'wake' && d.sessionId === previousSession
-          && d.roleEpoch === value.expectedEpoch && d.state === 'pending')) {
-          delivery.state = 'cancelled'; db.put('deliveries', delivery);
-        }
+        this.retireRoleWork(value.role, previous);
         db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'accepted', result: binding });
         this.service.changed();
         return binding;
@@ -432,7 +674,8 @@ export class Runtime {
       return existing;
     }
     db.transaction(() => {
-      requireFact(db.find('operations', op => op.id.startsWith('create:') && op.state === 'unknown').length === 0,
+      requireFact(db.find('operations', op => op.id.startsWith('create:')
+        && (op.state === 'unknown' || op.state === 'calling')).length === 0,
         'UNRESOLVED_CREATE', 'Resolve uncertain native creation before creating another session');
       db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'calling', result: null });
     });
@@ -442,8 +685,12 @@ export class Runtime {
       db.transaction(() => db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'accepted', result }));
       return result;
     } catch (error) {
+      const detail = error !== null && typeof error === 'object' ? error : {};
       db.transaction(() => db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'unknown',
-        result: { error: errorText(error) } }));
+        result: { error: errorText(error),
+          ...('code' in detail && typeof detail.code === 'string' ? { code: detail.code } : {}),
+          ...('sessionId' in detail && typeof detail.sessionId === 'string' ? { sessionId: detail.sessionId } : {}),
+          ...('roleAssignment' in detail ? { roleAssignment: detail.roleAssignment } : {}) } }));
       throw error;
     }
   }
@@ -481,6 +728,7 @@ export class Runtime {
         requireFact(binding, 'STALE_ROLE', 'Wake belongs to a retired role epoch');
         await this.verifyBinding(binding);
       } else {
+        requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Target now has an internal role identity');
         this.service.reception(delivery.sessionId);
         if (delivery.kind === 'ask') {
           const asks = meta.decisions?.filter(d => d.kind === 'ask').map(d => d.request) ?? (meta.ask ? [meta.ask] : []);

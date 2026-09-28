@@ -12,19 +12,19 @@
   "roles": [
     {
       "id": "coordinator",
-      "name": "Assistant coordinator",
+      "name": "coordinator",
       "instructions": "roles/coordinator.md",
       "mcpServers": {
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_read", "assistant_claim", "assistant_decide"]
+          "tools": ["assistant_read", "assistant_claim", "assistant_decide", "assistant_create_session"]
         }
       }
     },
     {
       "id": "memory",
-      "name": "Assistant memory",
+      "name": "memory",
       "instructions": "roles/memory.md",
       "mcpServers": {
         "assistant": {

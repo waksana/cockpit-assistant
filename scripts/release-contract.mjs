@@ -43,6 +43,9 @@ export async function product(root) {
     ['src/native.ts', 'host.chatReadVersion === 1'],
     ['src/native.ts', 'host.askResponseVersion === 1'],
     ['src/native.ts', 'host.resourcePreparationVersion === 1'],
+    ['src/native.ts', 'host.roleAssignmentVersion === 1'],
+    ['src/native.ts', 'host.sessionDirectoryVersion === 1'],
+    ['src/native.ts', 'host.sessionLoadVersion === 1'],
     ['frontend/index.ts', 'context.apiVersion !== 2'],
     ['frontend/index.ts', 'context.globalComponentVersion !== 1'],
     ['frontend/index.ts', 'context.menuVersion !== 1'],
@@ -63,7 +66,8 @@ export async function product(root) {
     return {
       kind: 'module', id: manifest.id, hostApi: { min: 1, max: 1 },
       requiresCapabilities: ['module-api.v1', 'serviceReady.v1', 'chatRead.v1', 'askResponse.v1',
-        'resourcePreparation.v1', 'frontend-api.v2', 'globalComponent.v1', 'menu.v1', 'ui.v1', 'uiSurface.v1'],
+        'resourcePreparation.v1', 'roleAssignment.v1', 'sessionDirectory.v1', 'sessionLoad.v1',
+        'frontend-api.v2', 'globalComponent.v1', 'menu.v1', 'ui.v1', 'uiSurface.v1'],
       requiredIntents: [...new Set(Object.values(sources).flatMap(source =>
         [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1])))].sort(),
       databases: [{ path: 'assistant.sqlite', schema, preserve }], migrations: [],
@@ -97,7 +101,7 @@ export function verifyAssets(directory, expected, expectedProduct) {
     assert.equal(value.version, expected.version);
     if (name === 'module-build.json') {
       assert.equal(value.sourceSha, expected.sourceSha);
-      assert.equal(value.sdk, '0.5.0');
+      assert.equal(value.sdk, '0.6.0');
       assert.equal(value.platform, 'linux');
       assert.match(value.node, /^24\./);
     }

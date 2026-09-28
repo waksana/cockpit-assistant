@@ -10,6 +10,7 @@
 .ca-dialog[open] { display: flex; flex-direction: column; }
 .ca-header, .ca-composer { flex: 0 0 auto; padding: calc(1.5 * var(--ck-space)); }
 .ca-header { display: flex; align-items: center; justify-content: space-between; gap: var(--ck-space); border-bottom: 1px solid var(--ck-color-border); }
+.ca-header > h2 { flex: 1; margin: 0; }
 .ca-scroller { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; }
 .ca-content { padding: calc(2 * var(--ck-space)); }
 .ca-content > * + * { margin-top: calc(3 * var(--ck-space)); }
@@ -21,19 +22,11 @@
 .ca-readiness > p { margin: 0; }
 .ca-role-status { display: flex; align-items: center; flex-wrap: wrap; gap: var(--ck-space); flex: 1 1 24rem; min-width: 0; }
 .ca-role-status > .ck-status-text { flex-basis: 100%; }
-.ca-settings:not([hidden]) { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 23rem), 1fr)); gap: calc(2 * var(--ck-space)); }
-.ca-setup-form { min-width: 0; border: 1px solid var(--ck-color-border); border-radius: var(--ck-radius); padding: calc(2 * var(--ck-space)); }
-.ca-form-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--ck-space); margin-top: calc(2 * var(--ck-space)); }
-.ca-field { display: flex; flex-direction: column; gap: var(--ck-space); flex: 1 1 12rem; min-width: 0; }
-.ca-field > input { width: 100%; box-sizing: border-box; }
-.ca-inspection { margin-top: calc(2 * var(--ck-space)); }
-.ca-inspection > .ca-field { margin: var(--ck-space) 0; }
+.ca-settings { border: 1px solid var(--ck-color-border); border-radius: var(--ck-radius); padding: calc(2 * var(--ck-space)); }
 .ca-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--ck-space); margin: var(--ck-space) 0; }
 .ca-facts dt { color: var(--ck-color-muted); }
 .ca-facts dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .ca-wrap { overflow-wrap: anywhere; white-space: pre-wrap; }
-.ca-receptions { padding-inline-start: calc(2 * var(--ck-space)); }
-.ca-receptions p { margin: var(--ck-space) 0; }
 .ca-timeline-header, .ca-message-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--ck-space) calc(2 * var(--ck-space)); }
 .ca-timeline-header { margin-bottom: calc(2 * var(--ck-space)); }
 .ca-message { padding: var(--ck-space) 0 var(--ck-space) calc(2 * var(--ck-space)); border-inline-start: .2rem solid var(--ca-topic-color, var(--ck-color-accent)); min-width: 0; }

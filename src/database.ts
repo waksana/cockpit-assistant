@@ -40,6 +40,12 @@ export class Database {
       ON publications(json_extract(document, '$.sequence'))`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS receptions_active_kind
       ON receptions(json_extract(document, '$.enabled'), json_extract(document, '$.kind'), ordinal)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS native_session_type
+      ON native(json_extract(document, '$.sessionId'), json_extract(document, '$.event.type'), ordinal)`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS messages_native_message
+      ON messages(json_extract(document, '$.sessionId'), json_extract(document, '$.nativeMessageId'))`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS messages_native_event
+      ON messages(json_extract(document, '$.sessionId'), json_extract(document, '$.nativeEventId'))`);
     for (const table of ['questions', 'work', 'deliveries']) {
       this.sql.exec(`CREATE INDEX IF NOT EXISTS ${table}_message
         ON ${table}(json_extract(document, '$.messageId'), ordinal)`);
@@ -104,6 +110,21 @@ export class Database {
       WHERE json_extract(document, '$.enabled')=1 AND json_extract(document, '$.kind')='reception'
       ORDER BY ordinal LIMIT 100`).all();
     return rows.map(row => JSON.parse(String(row.document)) as Tables['receptions']);
+  }
+  nativeByType(sessionId: string, type: string, after = 0) {
+    const rows = this.sql.prepare(`SELECT ordinal,document FROM native
+      WHERE json_extract(document, '$.sessionId')=? AND json_extract(document, '$.event.type')=?
+      AND ordinal>? AND NOT EXISTS
+        (SELECT 1 FROM meta WHERE key='consumed:' || native.id AND value='true')
+      ORDER BY ordinal LIMIT 200`).all(sessionId, type, after);
+    return rows.map(row => ({ ordinal: Number(row.ordinal),
+      record: JSON.parse(String(row.document)) as Tables['native'] }));
+  }
+  nativeMessage(sessionId: string, messageId: string | null, eventId: string): Tables['messages'] | undefined {
+    const field = messageId ? 'nativeMessageId' : 'nativeEventId';
+    const row = this.sql.prepare(`SELECT document FROM messages WHERE json_extract(document, '$.sessionId')=?
+      AND json_extract(document, '$.${field}')=? ORDER BY ordinal LIMIT 1`).get(sessionId, messageId ?? eventId);
+    return row ? JSON.parse(String(row.document)) as Tables['messages'] : undefined;
   }
   publicationPage(direction: 'before' | 'after', cursor: number | undefined, limit: number) {
     requireFact((cursor === undefined || Number.isSafeInteger(cursor) && cursor >= 0)

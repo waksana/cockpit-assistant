@@ -121,9 +121,11 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
       }
       if (await options.post?.(post, route)) return;
       if (path === '/messages') { await json(route, { messageId: `input-${String(body.requestId)}`, accepted: true }); return; }
-      const prefix = path === '/sessions' ? 'create' : path === '/roles/bind' ? 'bind' : path === '/enrollment' ? 'enroll' : null;
+      const prefix = path === '/roles/activate' ? 'activate'
+        : path === '/sessions' ? 'create' : path === '/roles/bind' ? 'bind' : path === '/enrollment' ? 'enroll' : null;
       if (prefix) {
-        const result = path === '/sessions'
+        const result = path === '/roles/activate' ? { bindings: body.bindings }
+          : path === '/sessions'
           ? { sessionId: `synthetic-created-${body.role ?? 'reception'}`, modelId: 'synthetic-model', cwd: body.cwd }
           : path === '/roles/bind' ? { sessionId: body.sessionId, role: body.role, epoch: Number(body.expectedEpoch) + 1 }
             : { sessionId: body.sessionId, enrolled: true };

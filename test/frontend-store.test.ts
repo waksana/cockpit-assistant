@@ -145,7 +145,8 @@ test('known preflight rejection retries only the same logical ID without discard
 test('binding HTTP rejection with unknown durable receipt cannot be repeated as a new operation', async () => {
   const f = fixture(path => {
     if (path === '/roles/bind') return Response.json({ error: { code: 'ROLE_NOT_READY', message: 'preparation ran' } }, { status: 409 });
-    if (path.startsWith('/operations/')) return Response.json({ id: 'bind', state: 'unknown', fingerprint: 'x', result: null });
+    if (path.startsWith('/operations/')) return Response.json({ id: decodeURIComponent(path.split('/').at(-1)!),
+      state: 'unknown', fingerprint: 'x', result: null });
   });
   try {
     f.store.open(); await turn();
@@ -153,6 +154,137 @@ test('binding HTTP rejection with unknown durable receipt cannot be repeated as 
     assert.equal(f.store.getSnapshot().setup[0]?.state, 'unknown');
     await f.store.bind('coordinator', 'candidate', 'model', 1);
     assert.equal(f.requests.filter(request => request.path === '/roles/bind').length, 1);
+  } finally { f.store.dispose(); }
+});
+
+test('fresh opening captures bound role epochs before activation; late completion preserves newer drafts', async () => {
+  const pending = deferred<Response>();
+  let readiness: Readiness = { ...ready, canSend: false,
+    roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) };
+  const f = fixture(path => {
+    if (path === '/readiness') return Response.json(readiness);
+    if (path === '/roles/activate') return pending.promise;
+  });
+  try {
+    f.store.open(); await turn();
+    const operation = f.store.getSnapshot().setup[0]!;
+    assert.equal(operation.state, 'pending');
+    const post = f.requests.find(request => request.path === '/roles/activate')!;
+    assert.deepEqual(JSON.parse(String(post.init?.body)), { requestId: operation.requestId, bindings: [
+      { role: 'coordinator', sessionId: 'coordinator', epoch: 1 },
+      { role: 'memory', sessionId: 'memory', epoch: 1 },
+    ] });
+    f.store.close();
+    assert.equal(post.init?.signal?.aborted, false);
+    f.store.open(); f.store.edit('new draft'); f.store.reply(item(5, 'retained-topic')); await turn();
+    assert.equal(f.store.getSnapshot().setup[0]?.requestId, operation.requestId);
+    assert.equal(f.requests.filter(request => request.path === '/roles/activate').length, 1);
+    readiness = ready;
+    pending.resolve(Response.json({ id: operation.receiptId, fingerprint: 'x', state: 'accepted', result: { loaded: true } }));
+    await turn();
+    assert.equal(f.store.getSnapshot().setup[0]?.state, 'accepted');
+    assert.equal(f.store.getSnapshot().readiness?.canSend, true);
+    assert.equal(f.store.getSnapshot().draft.text, 'new draft');
+    assert.equal(f.store.getSnapshot().draft.reply?.topicId, 'retained-topic');
+  } finally { f.store.dispose(); }
+});
+
+test('unknown activation never retries on refresh or reopen; exact receipt remains inspectable', async () => {
+  let inspectionState = 'unknown';
+  const f = fixture((path, init) => {
+    if (path === '/readiness') return Response.json({ ...ready, canSend: false,
+      roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
+    if (path === '/roles/activate') return Response.json({ id: `activate:${JSON.parse(String(init?.body)).requestId}`,
+      state: 'unknown', fingerprint: 'x', result: { detail: 'Unconfirmed load' } });
+    if (path.startsWith('/operations/')) return Response.json({ id: decodeURIComponent(path.split('/').at(-1)!),
+      state: inspectionState, fingerprint: 'x', result: {} });
+  });
+  try {
+    f.store.open(); await turn();
+    const operation = f.store.getSnapshot().setup[0]!;
+    assert.equal(operation.state, 'unknown');
+    f.store.close(); f.store.open(); await turn();
+    await f.store.refresh();
+    await f.store.inspectOperation(operation.requestId);
+    assert.equal(f.store.getSnapshot().setup[0]?.state, 'unknown');
+    inspectionState = 'accepted';
+    await f.store.inspectOperation(operation.requestId);
+    assert.equal(f.store.getSnapshot().readiness?.canSend, false);
+    f.store.close(); f.store.open(); await turn();
+    assert.equal(f.requests.filter(request => request.path === '/roles/activate').length, 1);
+    assert.ok(f.requests.some(request => decodeURIComponent(request.path) === `/operations/${operation.receiptId}`));
+  } finally { f.store.dispose(); }
+});
+
+test('stale readiness cannot activate a former carrier and unknown/invalid roles are not repaired', async () => {
+  const delayed = deferred<Response>();
+  let checks = 0;
+  const f = fixture(path => {
+    if (path !== '/readiness') return;
+    if (++checks === 1) return delayed.promise;
+    return Response.json({ ...ready, canSend: false, roles: ready.roles.map((role, index) =>
+      ({ ...role, status: index ? 'unknown' : 'invalid' })) });
+  });
+  try {
+    f.store.open(); await turn();
+    f.store.close(); f.store.open(); await turn();
+    delayed.resolve(Response.json({ ...ready, canSend: false,
+      roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) }));
+    await turn();
+    assert.equal(f.store.getSnapshot().readiness?.roles[0]?.status, 'invalid');
+    assert.equal(f.requests.some(request => request.init?.method === 'POST'), false);
+  } finally { f.store.dispose(); }
+});
+
+test('a confirmed carrier can be activated after a later unload without requiring the other role to be ready', async () => {
+  const readiness: Readiness = { ...ready, canSend: false,
+    roles: ready.roles.map((role, index) => ({ ...role, status: index ? 'invalid' : 'unloaded' })) };
+  const f = fixture((path, init) => {
+    if (path === '/readiness') return Response.json(readiness);
+    if (path === '/roles/activate') {
+      readiness.roles[0]!.status = 'ready';
+      return Response.json({ id: `activate:${JSON.parse(String(init?.body)).requestId}`,
+        fingerprint: 'x', state: 'accepted', result: {} });
+    }
+  });
+  try {
+    f.store.open(); await turn();
+    assert.equal(f.store.getSnapshot().setup[0]?.state, 'accepted');
+    assert.equal(f.store.getSnapshot().readiness?.roles[0]?.status, 'ready');
+    f.store.close();
+    readiness.roles[0]!.status = 'unloaded';
+    f.store.open(); await turn();
+    assert.equal(f.requests.filter(request => request.path === '/roles/activate').length, 2);
+    assert.notEqual(f.store.getSnapshot().setup[0]?.requestId, f.store.getSnapshot().setup[1]?.requestId);
+  } finally { f.store.dispose(); }
+});
+
+test('activation errors or malformed receipt IDs stay unknown when effect cannot be inspected', async () => {
+  for (const malformed of [false, true]) {
+    const f = fixture(path => {
+      if (path === '/readiness') return Response.json({ ...ready, canSend: false,
+        roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
+      if (path === '/roles/activate') return malformed
+        ? Response.json({ id: 'wrong-id', fingerprint: 'x', state: 'accepted', result: {} })
+        : Promise.reject(new Error('network lost'));
+      if (path.startsWith('/operations/')) return Response.json(
+        { error: { code: 'NOT_FOUND', message: 'not known yet' } }, { status: 404 });
+    });
+    try {
+      f.store.open(); await turn();
+      assert.equal(f.store.getSnapshot().setup[0]?.state, 'unknown');
+      f.store.close(); f.store.open(); await turn();
+      assert.equal(f.requests.filter(request => request.path === '/roles/activate').length, 1);
+    } finally { f.store.dispose(); }
+  }
+});
+
+test('ready roles can submit with no separately enrolled receptions', async () => {
+  const f = fixture(path => path === '/readiness' ? Response.json({ ...ready, receptions: [] }) : undefined);
+  try {
+    f.store.open(); await turn(); f.store.edit('automatic observation');
+    await f.store.send();
+    assert.equal(f.requests.filter(request => request.path === '/messages').length, 1);
   } finally { f.store.dispose(); }
 });
 

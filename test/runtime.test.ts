@@ -117,6 +117,24 @@ test('unknown create blocks a new attempt and replay does not create another ses
   } finally { f.close(); }
 });
 
+test('partial role creation retains native identity and notification recovery without claiming success', async () => {
+  const f = fixture();
+  try {
+    const roleAssignment = { notificationId: 'notification-1', saved: true,
+      roles: [{ moduleId: 'assistant', roleId: 'coordinator' }], recovery: 'roles/notify' };
+    f.fail(Object.assign(new Error('Role notification incomplete'), {
+      code: 'ROLE_ASSIGNMENT_INCOMPLETE', sessionId: 'created-before-notification', roleAssignment,
+    }));
+    await assert.rejects(f.runtime.create({ requestId: 'partial-role', cwd: '/synthetic', role: 'coordinator' }));
+    const operation = f.db.must('operations', 'create:partial-role');
+    assert.equal(operation.state, 'unknown');
+    assert.deepEqual(operation.result, { error: 'Role notification incomplete', code: 'ROLE_ASSIGNMENT_INCOMPLETE',
+      sessionId: 'created-before-notification', roleAssignment });
+    assert.deepEqual(await f.runtime.create({ requestId: 'partial-role', cwd: '/synthetic', role: 'coordinator' }), operation);
+    assert.equal(f.calls.filter(c => c.name === 'session/new').length, 1);
+  } finally { f.close(); }
+});
+
 test('bootstrap retains historical turn linkage for a newly completed reply', async () => {
   const f = fixture();
   try {

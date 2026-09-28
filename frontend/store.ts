@@ -18,6 +18,12 @@ const itemSchema = z.object({
 });
 const pageSchema = z.object({ items: z.array(itemSchema), before: sequence.nullable(),
   hasMore: z.boolean(), watermark: sequence, cursor: sequence.optional() });
+const operationSchema = z.object({ id: z.string(), fingerprint: z.string(),
+  state: z.enum(['pending', 'calling', 'accepted', 'rejected', 'unknown', 'cancelled']), result: z.unknown() });
+const operationState = (state: Operation['state']): SetupOperation['state'] =>
+  state === 'accepted' ? 'accepted' : state === 'rejected' || state === 'cancelled' ? 'error'
+    : state === 'pending' || state === 'calling' ? 'pending' : 'unknown';
+const activationLabel = '加载内部角色会话';
 
 class RequestFailure extends Error {
   constructor(message: string, readonly known: boolean) { super(message); }
@@ -87,6 +93,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let applied = 0;
   let backoff = 1000;
+  const activationAttempts = new Map<string, Role[]>();
   const update = (patch: Partial<Snapshot>) => {
     if (disposed) return;
     state = { ...state, ...patch };
@@ -164,13 +171,30 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       backoff = Math.min(backoff * 2, 30_000);
     }
   };
-  const refresh = async () => {
+  const refresh = async (activate = false) => {
     const epoch = generation;
     const check = ++readinessGeneration;
     update({ checking: true, readinessError: null });
     try {
       const result = await read<Readiness>('/readiness', lifetime?.signal);
-      if (current(epoch) && check === readinessGeneration) update({ readiness: result, checking: false });
+      if (current(epoch) && check === readinessGeneration) {
+        update({ readiness: result, checking: false });
+        const bindings = result.roles.filter(role => role.sessionId !== null)
+          .map(({ role, sessionId, epoch }) => ({ role, sessionId, epoch }))
+          .sort((a, b) => a.role.localeCompare(b.role));
+        const key = JSON.stringify(bindings);
+        const uncertain = state.setup.some(operation => operation.receiptId.startsWith('activate:')
+          && (operation.state === 'pending' || operation.state === 'unknown'));
+        const attemptedRoles = activationAttempts.get(key);
+        if (!uncertain && attemptedRoles?.every(role =>
+          result.roles.some(entry => entry.role === role && entry.status === 'ready'))) activationAttempts.delete(key);
+        if (activate && !uncertain && !activationAttempts.has(key)
+          && result.roles.some(role => role.sessionId !== null && role.status === 'unloaded')) {
+          activationAttempts.set(key, result.roles.filter(role => role.sessionId !== null && role.status === 'unloaded')
+            .map(role => role.role));
+          await operate('/roles/activate', 'activate', activationLabel, { bindings });
+        }
+      }
     } catch (error) {
       if (current(epoch) && check === readinessGeneration) {
         update({ checking: false, readiness: null, readinessError: errorText(error) });
@@ -200,20 +224,27 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       label, state: 'pending', detail: '请求处理中；关闭窗口不代表撤销' }] });
     try {
       const result = await post<unknown>(path, { requestId, ...value });
-      const receipt = z.object({ state: z.string(), result: z.unknown() }).safeParse(result);
-      const effectState = receipt.success ? receipt.data.state : 'accepted';
-      setOperation(requestId, { state: effectState === 'accepted' ? 'accepted'
-        : effectState === 'rejected' || effectState === 'cancelled' ? 'error' : 'unknown',
-      detail: effectState === 'accepted' ? '已接受，请查看回执并刷新状态'
-        : `回执状态：${effectState}，不会自动重试`, result });
+      if (prefix === 'activate') {
+        const receipt = operationSchema.parse(result);
+        if (receipt.id !== `${prefix}:${requestId}`) throw new Error('加载回执编号不匹配；请检查原操作');
+        setOperation(requestId, { state: operationState(receipt.state), result: receipt.result,
+          detail: `加载回执：${receipt.state}；实际就绪状态以刷新检查为准，不会自动重试` });
+      } else {
+        const receipt = z.object({ state: z.string(), result: z.unknown() }).safeParse(result);
+        const effectState = receipt.success ? receipt.data.state : 'accepted';
+        setOperation(requestId, { state: effectState === 'accepted' ? 'accepted'
+          : effectState === 'rejected' || effectState === 'cancelled' ? 'error' : 'unknown',
+        detail: effectState === 'accepted' ? '已接受，请查看回执并刷新状态'
+          : `回执状态：${effectState}，不会自动重试`, result });
+      }
     } catch (error) {
       // A binding failure may follow successful resource preparation. HTTP 409 alone
       // does not establish that nothing happened; the durable receipt owns the effect.
       setOperation(requestId, { state: 'unknown', detail: errorText(error) });
       try {
-        const receipt = await read<Operation>(`/operations/${encodeURIComponent(`${prefix}:${requestId}`)}`, context.signal);
-        setOperation(requestId, { state: receipt.state === 'accepted' ? 'accepted'
-          : receipt.state === 'rejected' || receipt.state === 'cancelled' ? 'error' : 'unknown',
+        const receipt = operationSchema.parse(await read<Operation>(`/operations/${encodeURIComponent(`${prefix}:${requestId}`)}`, context.signal));
+        if (receipt.id !== `${prefix}:${requestId}`) throw new Error('操作回执编号不匹配');
+        setOperation(requestId, { state: operationState(receipt.state),
         result: receipt.result, detail: `${errorText(error)}；回执：${receipt.state}` });
       } catch (inspectionError) {
         const absent = inspectionError instanceof RequestFailure && inspectionError.known
@@ -236,7 +267,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       update({ open: true, items: [], loading: true, hasOlder: false, error: null,
         loadingOlder: false, readiness: null, checking: true });
       void initialize(epoch, lifetime.signal);
-      void refresh();
+      void refresh(true);
     },
     close() {
       ++generation;
@@ -250,13 +281,12 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     async send() {
       const draft = state.draft;
       if (!draft.text.trim() || state.checking || !state.readiness?.canSend
-        || !state.readiness.receptions.some(entry => entry.enabled && entry.kind === 'reception' && entry.availability === 'loaded')
         || state.submissions.some(entry => entry.state === 'pending' || entry.state === 'unknown')) return;
       const previous = state.submissions.find(entry => entry.revision === draft.revision && entry.state === 'error');
       const requestId = previous?.requestId ?? id();
       const submission: Submission = { requestId, revision: draft.revision, text: draft.text,
         ...(draft.reply?.anchorId ? { replyTo: draft.reply.anchorId } : {}),
-        state: 'pending', detail: '正在保存输入；接受不代表接待者已处理' };
+        state: 'pending', detail: '正在保存输入；接受不代表会话已处理' };
       if (previous) setSubmission(requestId, submission);
       else update({ submissions: [...state.submissions, submission] });
       try {
@@ -306,7 +336,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
         void initialize(generation, lifetime!.signal);
       } else void connect(generation, true);
     },
-    refresh,
+    refresh: () => refresh(),
     inspectSession: sessionId => read<SessionInspection>(`/sessions/${encodeURIComponent(sessionId)}/inspect`, lifetime?.signal),
     createSession: (cwd, role) => operate('/sessions', 'create', `创建${role ?? 'reception'}`, { cwd, ...(role ? { role } : {}) }),
     bind: (role, sessionId, expectedModelId, expectedEpoch) =>
@@ -317,9 +347,9 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       const operation = state.setup.find(entry => entry.requestId === requestId);
       if (!operation) return null;
       try {
-        const receipt = await read<Operation>(`/operations/${encodeURIComponent(operation.receiptId)}`, context.signal);
-        setOperation(requestId, { state: receipt.state === 'accepted' ? 'accepted'
-          : receipt.state === 'rejected' || receipt.state === 'cancelled' ? 'error' : 'unknown',
+        const receipt = operationSchema.parse(await read<Operation>(`/operations/${encodeURIComponent(operation.receiptId)}`, context.signal));
+        if (receipt.id !== operation.receiptId) throw new Error('操作回执编号不匹配');
+        setOperation(requestId, { state: operationState(receipt.state),
         result: receipt.result, detail: `回执状态：${receipt.state}；不会自动重试` });
         if (state.open) await refresh();
         return receipt;

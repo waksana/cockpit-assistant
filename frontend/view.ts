@@ -2,20 +2,18 @@ import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend
 import type { ComponentType, CSSProperties, FormEvent, KeyboardEvent } from 'react';
 import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts';
 import type { Role } from '../src/types.ts';
-import type { RoleReadiness, SessionInspection, TimelineItem } from '../src/ui-types.ts';
+import type { TimelineItem } from '../src/ui-types.ts';
 import { createMarkdown } from './markdown.ts';
+import { createIcon } from './icons.ts';
 
-const roleNames: Record<Role, string> = { coordinator: '编排者', memory: '记忆者' };
+const roleNames: Record<Role, string> = { coordinator: 'coordinator', memory: 'memory' };
 const statusNames = {
   ready: '已就绪', unbound: '未绑定', unloaded: '未加载', invalid: '不可用', unknown: '状态未知',
   pending: '处理中', accepted: '已接受', error: '失败', calling: '调用中', rejected: '已拒绝',
   cancelled: '已取消', answered: '已回答', stale: '已过期',
 };
 const stateName = (state: string) => statusNames[state as keyof typeof statusNames] ?? state;
-const describeError = (error: unknown) => error instanceof Error ? error.message : String(error);
 const json = (value: unknown) => JSON.stringify(value, null, 2);
-const setupLabel = (label: string) => label.replace('coordinator', '编排者').replace('memory', '记忆者').replace('reception', '接待者');
-const isUncertain = (operation: SetupOperation) => operation.state === 'pending' || operation.state === 'unknown';
 
 export function topicStyle(topicId: string | null): CSSProperties {
   let hash = 0;
@@ -24,108 +22,16 @@ export function topicStyle(topicId: string | null): CSSProperties {
 }
 
 export function createDialog(context: ModuleFrontendContext, store: AssistantActions): ComponentType {
-  const { createElement: h, Fragment, useSyncExternalStore, useState, useRef, useLayoutEffect, useEffect, useId } = context.react;
+  const { createElement: h, Fragment, useSyncExternalStore, useState, useRef, useLayoutEffect, useId } = context.react;
   const markdown = createMarkdown(context);
+  const icon = createIcon(context);
   const button = (text: string, onClick: () => void, disabled = false, extra: Record<string, unknown> = {}) =>
     h('button', { type: 'button', className: 'ck-button', onClick, disabled, ...extra }, text);
-  const field = (label: string, value: string, setValue: (value: string) => void, placeholder?: string) =>
-    h('label', { className: 'ca-field' }, h('span', null, label),
-      h('input', { className: 'ck-input', value, placeholder,
-        onChange: (event: { currentTarget: HTMLInputElement }) => setValue(event.currentTarget.value) }));
   const choices = (item: TimelineItem) => item.question?.state === 'pending' && item.question.choices?.length
     ? h('div', { className: 'ca-choices', 'aria-label': '待回答问题的选项' },
       item.question.choices.map((choice, index) => button(choice, () => {
         store.reply(item); store.edit(choice);
       }, !item.anchorId, { key: index }))) : null;
-
-  function SessionForm({ role, readiness, snapshot }: {
-    role?: Role; readiness?: RoleReadiness; snapshot: Snapshot;
-  }) {
-    const [cwd, setCwd] = useState('');
-    const [sessionId, setSessionId] = useState('');
-    const [label, setLabel] = useState('');
-    const [inspection, setInspection] = useState<SessionInspection | null>(null);
-    const [inspectionEpoch, setInspectionEpoch] = useState<number | null>(null);
-    const [inspecting, setInspecting] = useState(false);
-    const [error, setError] = useState<string | null>(null);
-    const generation = useRef(0);
-    const mounted = useRef(true);
-    useEffect(() => {
-      mounted.current = true;
-      return () => { mounted.current = false; ++generation.current; };
-    }, []);
-    const changeId = (value: string) => {
-      ++generation.current;
-      setSessionId(value); setInspection(null); setInspectionEpoch(null); setInspecting(false); setError(null);
-    };
-    const inspect = async () => {
-      const target = sessionId.trim();
-      if (!target || inspecting) return;
-      const request = ++generation.current;
-      const epoch = readiness?.epoch ?? null;
-      setInspecting(true); setInspection(null); setInspectionEpoch(null); setError(null);
-      try {
-        const result = await store.inspectSession(target);
-        if (mounted.current && generation.current === request) {
-          if (result.sessionId !== target) throw new Error('检查返回了不同的会话，请重新检查');
-          setInspection(result); setInspectionEpoch(epoch);
-        }
-      } catch (failure) {
-        if (mounted.current && generation.current === request) setError(describeError(failure));
-      } finally {
-        if (mounted.current && generation.current === request) setInspecting(false);
-      }
-    };
-    const bindLabel = role ? `绑定${role}` : '接入接待者';
-    const createBlocked = snapshot.setup.some(operation => operation.receiptId.startsWith('create:') && isUncertain(operation));
-    const bindBlocked = snapshot.setup.some(operation => operation.label === bindLabel && isUncertain(operation));
-    const epochChanged = !!role && inspection !== null && inspectionEpoch !== readiness?.epoch;
-    const canBind = !!inspection && inspection.sessionId === sessionId.trim() && !!inspection.modelId
-      && inspection.loaded && inspection.rolesNeedReload === false
-      && !snapshot.checking && !snapshot.readinessError && !!readiness && !epochChanged && !bindBlocked;
-    const canEnroll = !!inspection && inspection.sessionId === sessionId.trim() && !bindBlocked;
-    return h('section', { className: 'ca-setup-form', 'aria-label': `${role ? roleNames[role] : '接待者'}设置` },
-      h('h3', { className: 'ck-heading' }, role ? roleNames[role] : '接待者'),
-      h('form', { className: 'ca-form-row', onSubmit: (event: FormEvent) => {
-        event.preventDefault();
-        if (cwd.trim() && !createBlocked) void store.createSession(cwd.trim(), role);
-      } },
-      field('新会话工作目录', cwd, setCwd, '绝对路径'),
-      h('button', { type: 'submit', className: 'ck-button', disabled: !cwd.trim() || createBlocked }, '创建会话')),
-      h('p', { className: 'ck-input-hint' }, role
-        ? '创建不会自动绑定。请从操作回执复制会话编号，检查实际模型后明确绑定。'
-        : '创建普通会话不会自动接入。请检查会话后明确接入接待者。'),
-      h('form', { className: 'ca-form-row', onSubmit: (event: FormEvent) => { event.preventDefault(); void inspect(); } },
-        field('已有会话编号', sessionId, changeId),
-        h('button', { type: 'submit', className: 'ck-button', disabled: !sessionId.trim() || inspecting }, inspecting ? '正在检查…' : '检查会话')),
-      error ? h('p', { role: 'alert', className: 'ck-danger ca-wrap' }, error) : null,
-      inspection ? h('div', { className: 'ca-inspection' },
-        h('dl', { className: 'ca-facts' },
-          h('dt', null, '会话编号'), h('dd', null, inspection.sessionId),
-          h('dt', null, '实际模型（只读）'), h('dd', null, inspection.modelId ?? '未知'),
-          h('dt', null, '工作目录'), h('dd', null, inspection.cwd),
-          h('dt', null, '加载状态'), h('dd', null, inspection.loaded ? '已加载' : '未加载'),
-          h('dt', null, '会话状态'), h('dd', null, inspection.status),
-          h('dt', null, '角色配置'), h('dd', null, inspection.rolesNeedReload === null ? '未知'
-            : inspection.rolesNeedReload ? '需要重新加载' : '无需重新加载'),
-          role ? h(Fragment, null, h('dt', null, '检查时绑定版本'), h('dd', null, inspectionEpoch ?? '未知')) : null),
-        role && !inspection.loaded
-          ? h('p', { className: 'ck-input-hint' }, '请先在 Cockpit 中明确加载此会话，然后重新检查。助手不会自动加载。') : null,
-        role && inspection.rolesNeedReload === true
-          ? h('p', { className: 'ck-input-hint' }, '请先在 Cockpit 中重新加载会话以应用角色配置，然后重新检查。助手不会自动修复。') : null,
-        role && inspection.rolesNeedReload === null
-          ? h('p', { className: 'ck-input-hint' }, '角色配置是否已应用尚不明确，请先在 Cockpit 中确认后重新检查。') : null,
-        epochChanged ? h('p', { className: 'ck-status-text' }, '绑定状态已改变，请重新检查会话后绑定。') : null,
-        role ? button(`明确绑定为${roleNames[role]}`, () => {
-          if (canBind && inspection.modelId && inspectionEpoch !== null) {
-            void store.bind(role, inspection.sessionId, inspection.modelId, inspectionEpoch);
-          }
-        }, !canBind) : h(Fragment, null,
-          field('接待者名称', label, setLabel),
-          button('明确接入接待者', () => {
-            if (canEnroll) void store.enroll(inspection.sessionId, label.trim() || inspection.sessionId);
-          }, !canEnroll))) : null);
-  }
 
   function OperationCard({ operation }: { operation: SetupOperation }) {
     const [checking, setChecking] = useState(false);
@@ -135,8 +41,8 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
     const payload = result && typeof result === 'object' && 'result' in result ? result.result : result;
     const createdId = operation.receiptId.startsWith('create:') && payload && typeof payload === 'object'
       && 'sessionId' in payload && typeof payload.sessionId === 'string' ? payload.sessionId : null;
-    return h('article', { className: 'ca-operation', 'aria-label': setupLabel(operation.label) },
-      h('p', { className: 'ca-operation-title' }, setupLabel(operation.label), ' · ', stateName(operation.state)),
+    return h('article', { className: 'ca-operation', 'aria-label': operation.label },
+      h('p', { className: 'ca-operation-title' }, operation.label, ' · ', stateName(operation.state)),
       h('p', { className: operation.state === 'error' || operation.state === 'unknown' ? 'ck-danger' : 'ck-status-text',
         role: operation.state === 'error' || operation.state === 'unknown' ? 'alert' : 'status' }, operation.detail),
       h('dl', { className: 'ca-facts' },
@@ -271,15 +177,13 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
       return () => observer.disconnect();
     }, []);
 
-    const receptions = snapshot.readiness?.receptions.filter(entry => entry.kind === 'reception') ?? [];
-    const receptionReady = receptions.some(entry => entry.enabled && entry.availability === 'loaded');
     const rolesReady = (['coordinator', 'memory'] as const).every(role =>
       snapshot.readiness?.roles.some(entry => entry.role === role && entry.status === 'ready'));
     const unresolvedSend = snapshot.submissions.some(entry => entry.state === 'pending' || entry.state === 'unknown');
     const pendingQuestion = snapshot.draft.reply?.question?.state === 'pending' ? snapshot.draft.reply.question : null;
     const choiceRequired = pendingQuestion?.allowFreeform === false;
     const validAnswer = !choiceRequired || !!pendingQuestion?.choices?.includes(snapshot.draft.text);
-    const canSend = !!snapshot.readiness?.canSend && rolesReady && receptionReady && !snapshot.checking
+    const canSend = !!snapshot.readiness?.canSend && rolesReady && !snapshot.checking
       && !snapshot.readinessError && !unresolvedSend && !!snapshot.draft.text.trim() && validAnswer;
     const send = () => { if (canSend) void store.send(); };
     const keyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -301,11 +205,12 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
         onCancel: (event: { preventDefault(): void }) => { event.preventDefault(); store.close(); },
         onClose: () => { if (store.getSnapshot().open) store.close(); } },
       h('header', { className: 'ca-header' },
+        h('button', { type: 'button', className: 'ck-icon-button', title: '返回 Cockpit',
+          'aria-label': '返回 Cockpit', onClick: () => store.close(), autoFocus: true }, icon('arrow-left')),
         h('h2', { id: `${id}-title`, className: 'ck-heading' }, '助手'),
-        h('div', { className: 'ck-actions' },
-          button(settingsOpen ? '收起设置' : '展开设置', () => setSettingsOpen(open => !open), false,
-            { 'aria-expanded': settingsOpen, 'aria-controls': `${id}-settings` }),
-          button('关闭', () => store.close(), false, { autoFocus: true }))),
+        h('button', { type: 'button', className: 'ck-icon-button', title: '设置', 'aria-label': '设置',
+          'aria-expanded': settingsOpen, 'aria-controls': `${id}-settings`,
+          onClick: () => setSettingsOpen(open => !open) }, icon('settings'))),
       h('div', { className: 'ca-scroller', ref: scrollerRef, onScroll: () => {
         const scroller = scrollerRef.current;
         if (!scroller) return;
@@ -316,22 +221,15 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
       h('div', { ref: contentRef, className: 'ca-content' },
         h('section', { className: 'ca-readiness', 'aria-label': '助手就绪状态', 'aria-busy': snapshot.checking },
           roleStatus('coordinator'), roleStatus('memory'),
-          h('p', { className: 'ck-status-text' }, receptionReady ? '接待者：已有启用且加载的会话' : '接待者：尚无启用且加载的会话'),
           snapshot.readinessError ? h('p', { role: 'alert', className: 'ck-danger ca-wrap' }, snapshot.readinessError) : null,
           button(snapshot.checking ? '正在检查…' : '刷新就绪状态', () => { void store.refresh(); }, snapshot.checking)),
         h('section', { id: `${id}-settings`, hidden: !settingsOpen, className: 'ca-settings', 'aria-label': '设置' },
           settingsOpen ? h(Fragment, null,
-            ...(['coordinator', 'memory'] as const).map(role => h(SessionForm, { key: role, role, snapshot,
-              readiness: snapshot.readiness?.roles.find(entry => entry.role === role) })),
-            h(SessionForm, { key: 'reception', snapshot }),
-            receptions.length ? h('section', { className: 'ca-setup-form' },
-              h('h3', { className: 'ck-heading' }, '接待者状态'),
-              h('ul', { className: 'ca-receptions' }, receptions.map(entry => h('li', { key: entry.id },
-                h('strong', null, entry.label), h('p', { className: 'ca-wrap' }, entry.id),
-                h('p', null, entry.enabled ? '已启用' : '未启用', ' · ',
-                  entry.availability === 'loaded' ? '已加载' : entry.availability === 'unloaded' ? '未加载'
-                    : entry.availability === 'missing' ? '会话不存在' : '状态未知'),
-                entry.gap ? h('p', { className: 'ck-status-text ca-wrap' }, entry.gap) : null)))) : null) : null),
+            h('h3', { className: 'ck-heading' }, '角色设置'),
+            h('p', null, '在 Cockpit 创建会话或添加角色时选择 coordinator 或 memory，保存角色后会自动登记。登记不代表角色已就绪。'),
+            h('p', null, '打开助手时会检查最新状态，仅加载已登记且未加载的内部角色会话；不会创建或替换会话、重载已加载会话或更改模型。'),
+            h('p', null, '所有普通会话都会自动观察，无需单独接入。刷新只读取状态；未加载会话的冷加载包含宿主正常的原生工具初始化，但助手不会额外修复资源、强制重载或自动启用被禁用的资源。已加载会话的待生效角色或禁用资源请在 Cockpit 中处理后刷新状态。'),
+            h('p', { className: 'ck-input-hint' }, '加载结果未知时请检查操作回执，不会自动重复请求。')) : null),
         snapshot.setup.length ? h('section', { className: 'ca-operations', 'aria-label': '设置操作回执' },
           h('h3', { className: 'ck-heading' }, '设置操作回执'),
           ...snapshot.setup.map(operation => h(OperationCard, { key: operation.requestId, operation }))) : null,
@@ -376,8 +274,8 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
             h('button', { type: 'submit', className: 'ck-button ck-primary', disabled: !canSend }, '发送')),
           h('p', { id: `${id}-send-hint`, className: 'ck-input-hint' },
             unresolvedSend ? '上次发送尚未确认，请检查发送回执；不会自动重发。'
-              : !rolesReady || !receptionReady || !snapshot.readiness?.canSend || snapshot.readinessError
-                ? '两位助手均就绪且有启用、已加载的接待者后才能发送。草稿仍可编辑。'
+              : !rolesReady || !snapshot.readiness?.canSend || snapshot.readinessError
+                ? 'coordinator 和 memory 均就绪后才能发送。草稿仍可编辑。'
                 : snapshot.checking ? '正在检查就绪状态，草稿仍可编辑。'
                   : !validAnswer ? '请选择此问题允许的选项。'
                     : 'Enter 发送，Shift+Enter 换行。关闭窗口会保留草稿。')))),

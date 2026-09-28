@@ -15,6 +15,8 @@ const runtime = new ModuleRuntime({ report: error => {
 function EmptyHomepage() {
   const trigger = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState(false);
+  const [selected, setSelected] = useState(false);
+  const [draft, setDraft] = useState('');
   return h(ModuleRuntimeProvider, { runtime },
     h('header', { className: 'fixture-header' },
       h('strong', null, 'Cockpit'),
@@ -23,7 +25,11 @@ function EmptyHomepage() {
         onClick: () => setMenu(!menu) }, '☰'),
       menu ? h(AnchoredMenu, { triggerRef: trigger, items: [], label: '全局菜单',
         moduleTarget: { menu: 'global' }, onClose: () => setMenu(false) }) : null),
-    h('main', { 'data-testid': 'empty-homepage' }, h('h1', null, '没有选择会话')),
+    h('main', { 'data-testid': selected ? 'selected-session' : 'empty-homepage' },
+      h('h1', null, selected ? '合成会话' : '没有选择会话'),
+      selected ? h('label', null, 'Cockpit 草稿',
+        h('textarea', { value: draft, onChange: (event: { currentTarget: HTMLTextAreaElement }) => setDraft(event.currentTarget.value) }))
+        : h('button', { type: 'button', className: 'ck-button', onClick: () => setSelected(true) }, '选择合成会话')),
     h(ModuleGlobalComponents));
 }
 

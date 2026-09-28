@@ -30,7 +30,7 @@ function fixture() {
   for (const [name, value] of Object.entries({
     'package.json': { version: expected.version },
     'cockpit.module.json': { version: expected.version },
-    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.5.0', platform: 'linux', node: '24.20.0' },
+    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.6.0', platform: 'linux', node: '24.20.0' },
     'cockpit-deployment.json': descriptor,
   })) writeFileSync(join(stage, name), `${JSON.stringify(value)}\n`);
   writeFileSync(join(directory, 'cockpit-deployment.json'), readFileSync(join(stage, 'cockpit-deployment.json')));

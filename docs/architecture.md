@@ -3,12 +3,13 @@
 ## Ownership and trust
 
 One activation manages one Assistant space under its module-private `dataRoot`.
-Cockpit authenticates the enclosing digest-bound HTTP routes. Native conversation
-reads are limited to explicitly enrolled receptions/collaborators, and user
-deliveries to direct receptions; internal role carriers and their control/readiness
-checks are registered separately. There is no all-session catalog scan,
-private SDK handle, native-home scan, Task dependency, or shell-based native
-adapter. IDs locate records within this space, not arbitrary host data.
+Cockpit authenticates the enclosing digest-bound HTTP routes. Ordinary sessions
+are observed automatically. A bounded public metadata directory establishes the
+initial set; subsequent native/control events drive incremental updates, not a
+repeated full catalog scan. Saved or applied coordinator/memory role identities
+and registered internal carriers are excluded from ordinary conversation reads
+and deliveries. There is no private SDK handle, native-home scan, Task dependency,
+or shell-based adapter. IDs locate durable records in this Assistant space.
 
 The module runs trusted code in the host process. Role instructions and MCP
 checks are not an OS sandbox and do not remove Copilot's native permissions.
@@ -18,12 +19,22 @@ retired epochs, unready bindings, and obsolete leases are rejected. The
 installation trusts the host and its authenticated same-user operator, not
 arbitrary HTTP clients claiming to be the host.
 
-No automatic session creation or replacement is enabled. Each creation is an
-explicit API operation, produces a durable receipt, and does not enroll the
-result as a receptionist. Creation uncertainty blocks further creation until
-explicitly resolved. Binding checks the expected model, directory, actual role
-assembly, resource preparation, and readiness. Replacement is a compare-and-swap
-epoch change; late work cannot commit through the retired carrier.
+Normal role selection uses optional host permission and saved-role callbacks.
+Assistant denies a second carrier while its registered session still exists;
+unloaded does not mean missing. A successful save registers the carrier and
+epoch without claiming readiness or preparing resources. Replayed notifications
+do not increment the epoch or replace later registrations. Native save and module
+registration are separate effects: a notification failure is not native rollback.
+Readiness separately checks the actual model, directory, applied roles and
+resources. An intentional recovery replacement retains compare-and-swap epochs;
+late work cannot commit through a retired carrier.
+
+The coordinator may request an ordinary session for a claimed, unanchored user
+input when no suitable existing target exists. Creation requires an explicit
+working directory and a durable per-work receipt; it does not deliver the user
+input or complete the work. The coordinator reads the result and makes a separate
+validated route decision. Uncertain creation blocks another creation, including
+under a new request ID. Internal role sessions are never created automatically.
 
 ## Durable processing
 
@@ -32,7 +43,7 @@ user input -> inbox -> coordinator work -> atomic decision + outbox
                                                        |
                                                  native effect
                                                        |
-enrolled cursor history -> evidenced output -> coordinator -> publication log
+ordinary-session cursor history -> evidenced output -> coordinator -> publication log
                                           topic switch -> memory work
 ```
 
@@ -73,12 +84,16 @@ cursor. Whole durable native pages and their cursor commit together. Repeated
 event IDs are checked and deduplicated. Ephemeral token/reasoning deltas are not
 collected. Stored event projections omit reasoning and tool arguments/results.
 
-Initial enrollment imports the recent bootstrap page as historical and establishes
+Initial observation imports the recent bootstrap page as historical and establishes
 a live tail, not a complete archive import. An explicit bounded recovery reads
 historical pages and records the remaining-history/gap warning. Historical outputs can be classified, but cannot
 be pushed as newly received replies. Cursor expiry is visible and requires
 explicit resynchronization; taking a new tail never proves that nothing was
 missed.
+An exact completion event observed live before that initial page finishes remains
+new; other bootstrap content stays historical. Changing an ordinary session into
+an internal role invalidates its active reader and pending ordinary work/effects.
+Neither old source records nor immutable reply anchors are rewritten.
 
 Only a durable primary `assistant.message` with an explicit empty
 `toolRequests`, a known parent `assistant.turn_start`, and a primary
@@ -108,16 +123,17 @@ choice. Other ambiguous answers need clarification. Several pending questions
 coexist; a missing/unloaded/deleted original session is visible, not replaced
 silently. Ask answer text never receives a risk warning or context suffix.
 
-Reception enrollment distinguishes direct reception from background
-collaborators. A topic may route to several enabled receptions and a reception
-may serve several topics. Topic labels do not isolate a shared native model
+Reception records now index observed ordinary sessions; they are not a separate
+role or a prerequisite the user must configure. A topic may route to several
+ordinary sessions and a session may serve several topics. Topic labels do not isolate a shared native model
 context. Risk detection uses active independent topics and actual reception
 relationships. Its exact warning is both published and appended to the normal
 user prompt as separately attributed context; no extra native turn is created.
 Durable context-exposure records include anchored deliveries and survive routing
 changes; a handoff never means the previous reception forgot an active topic.
 Rate limiting and an explicit continue-sharing acknowledgment suppress repeats.
-The notice is not permission to create or split sessions.
+The notice alone is not permission to create or split sessions; creating a target
+still needs the coordinator's validated current input work and explicit directory.
 
 ## Memory and revisions
 

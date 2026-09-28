@@ -5,8 +5,10 @@ import { nativeTypes } from './ingestion.ts';
 
 export function nativeAccess(host: ModuleHostApi): NativeAccess {
   requireFact(host.chatReadVersion === 1 && host.askResponseVersion === 1
-    && host.resourcePreparationVersion === 1,
-  'HOST_CAPABILITY', 'Assistant requires chatReadVersion, askResponseVersion and resourcePreparationVersion 1');
+    && host.resourcePreparationVersion === 1 && host.roleAssignmentVersion === 1
+    && host.sessionDirectoryVersion === 1 && host.sessionLoadVersion === 1,
+  'HOST_CAPABILITY', 'Assistant requires chatReadVersion, askResponseVersion, resourcePreparationVersion, '
+    + 'roleAssignmentVersion, sessionDirectoryVersion and sessionLoadVersion 1');
   return {
     host,
     async read(sessionId, cursor, bootstrap, backward = false) {

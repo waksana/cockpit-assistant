@@ -17,7 +17,7 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 test('real host global menu opens on an empty homepage; complete Markdown, A/B/A and public theme', async ({ page }, info) => {
   const fixture = await installFixture(page);
   await page.goto('/');
-  await expect(page.getByTestId('empty-homepage')).toHaveText('没有选择会话');
+  await expect(page.getByTestId('empty-homepage').getByRole('heading')).toHaveText('没有选择会话');
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await openAssistant(page);
   await expect(page.getByRole('menu')).toHaveCount(0);
@@ -61,11 +61,26 @@ test('real host global menu opens on an empty homepage; complete Markdown, A/B/A
   await expect(page.getByRole('textbox', { name: '消息', exact: true })).toBeInViewport();
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeInViewport();
   await page.screenshot({ path: info.outputPath('synthetic-assistant.png') });
-  await page.getByRole('button', { name: '展开设置', exact: true }).click();
-  const coordinator = page.getByRole('region', { name: '编排者设置', exact: true });
-  // These read-only assertions cannot scroll a previously hidden form into view.
-  await expect(coordinator.getByRole('heading', { name: '编排者', exact: true })).toBeInViewport({ ratio: 1 });
-  await expect(coordinator.getByRole('textbox', { name: '新会话工作目录', exact: true })).toBeInViewport();
+  const back = page.getByRole('button', { name: '返回 Cockpit', exact: true });
+  const settings = page.getByRole('button', { name: '设置', exact: true });
+  await expect(page.locator('.ca-header button')).toHaveCount(2);
+  for (const [control, title] of [[back, '返回 Cockpit'], [settings, '设置']] as const) {
+    await expect(control).toHaveClass('ck-icon-button');
+    await expect(control).toHaveAttribute('title', title);
+    await expect(control.locator('svg')).toHaveClass('ck-icon ck-icon-lg');
+    await expect(control.locator('svg')).toHaveAttribute('aria-hidden', 'true');
+    await expect(control.locator('svg')).toHaveAttribute('focusable', 'false');
+    const rect = await control.boundingBox();
+    expect(rect!.width).toBeGreaterThanOrEqual(info.project.name.startsWith('mobile') ? 44 : 40);
+    expect(rect!.height).toBeGreaterThanOrEqual(info.project.name.startsWith('mobile') ? 44 : 40);
+  }
+  expect((await back.boundingBox())!.x).toBeLessThan((await settings.boundingBox())!.x);
+  await expect(back.locator('path').first()).toHaveAttribute('d', 'm12 19-7-7 7-7');
+  await settings.click();
+  const setup = page.getByRole('region', { name: '设置', exact: true });
+  // These read-only assertions cannot scroll hidden settings into view.
+  await expect(setup.getByRole('heading', { name: '角色设置', exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(setup).toContainText('选择 coordinator 或 memory');
   await expect(page.locator('.ca-scroller')).toHaveJSProperty('scrollTop', 0);
   expect(fixture.posts).toEqual([]);
   assertClean(fixture);
@@ -74,6 +89,10 @@ test('real host global menu opens on an empty homepage; complete Markdown, A/B/A
 test('not-ready users can edit and preserve drafts but cannot send, then refresh actual readiness', async ({ page }) => {
   const fixture = await installFixture(page, { ready: false, items: [], hasOlder: false });
   await page.goto('/');
+  await page.getByRole('button', { name: '选择合成会话', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Cockpit 草稿', exact: true }).fill('保留宿主草稿');
+  await page.evaluate(() => history.pushState({}, '', '/#synthetic-selected-session'));
+  const hostUrl = page.url();
   await openAssistant(page);
   const draft = page.getByRole('textbox', { name: '消息', exact: true });
   const send = page.getByRole('button', { name: '发送', exact: true });
@@ -82,9 +101,14 @@ test('not-ready users can edit and preserve drafts but cannot send, then refresh
   await expect(send).toBeDisabled();
   await draft.press('Enter');
   expect(fixture.posts).toEqual([]);
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByTestId('selected-session')).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Cockpit 草稿', exact: true })).toHaveValue('保留宿主草稿');
+  expect(page.url()).toBe(hostUrl);
   await openAssistant(page);
   await expect(draft).toHaveValue('尚未就绪也保留我的草稿');
+  expect(fixture.requests.filter(request => request.path === '/readiness')).toHaveLength(2);
   fixture.setReadiness(readiness());
   await page.getByRole('button', { name: '刷新就绪状态' }).click();
   await expect(send).toBeEnabled();
@@ -114,9 +138,9 @@ test('settings opened before delayed history retain the viewport when the initia
   const history = page.getByRole('region', { name: '对话记录', exact: true });
   await expect(history).toHaveAttribute('aria-busy', 'true');
   await expect(page.getByRole('button', { name: '重新连接', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: '展开设置', exact: true }).click();
-  const heading = page.getByRole('region', { name: '编排者设置', exact: true })
-    .getByRole('heading', { name: '编排者', exact: true });
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  const heading = page.getByRole('region', { name: '设置', exact: true })
+    .getByRole('heading', { name: '角色设置', exact: true });
   await expect(heading).toBeInViewport({ ratio: 1 });
   await expect(page.locator('.ca-scroller')).toHaveJSProperty('scrollTop', 0);
   release?.();
@@ -145,7 +169,7 @@ test('reply anchors distinguish pending choices from stale questions without hid
   await expect(page.getByText('来源：synthetic-reception · 引用：anchor-8')).toBeVisible();
   await expect(reference.locator('.ca-choices')).toHaveCount(0);
   await page.getByRole('textbox', { name: '消息', exact: true }).fill('关于旧问题的普通评论');
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
   await expect(page.getByText('来源：synthetic-reception · 引用：anchor-8')).toBeVisible();
   await expect(page.getByRole('textbox', { name: '消息', exact: true })).toHaveValue('关于旧问题的普通评论');
@@ -167,7 +191,7 @@ test('a retained pending reply outside the reopened timeline keeps its choices w
   const reference = page.getByRole('region', { name: '当前回复引用', exact: true });
   await expect(reference.locator('.ca-choices')).toHaveCount(0);
   await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(1);
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
   fixture.setTimeline([later]);
   await openAssistant(page);
   await expect(page.locator('[data-ca-item="publication-1"]')).toHaveCount(0);
@@ -237,52 +261,28 @@ test('six long question choices stay in the scroller and preserve the selected r
   assertClean(fixture);
 });
 
-test('explicit create, inspect, bind and enrollment stay synthetic and use current model/epoch', async ({ page }) => {
+test('role registration belongs to Cockpit; no manual UUID, create, bind or reception enrollment forms', async ({ page }) => {
   const fixture = await installFixture(page, { ready: false, items: [], hasOlder: false });
   await page.goto('/');
   await openAssistant(page);
-  await page.getByRole('button', { name: '展开设置' }).click();
-  const coordinator = page.getByRole('region', { name: '编排者设置', exact: true });
-  await coordinator.getByRole('textbox', { name: '新会话工作目录' }).fill('/synthetic/project');
-  await coordinator.getByRole('button', { name: '创建会话', exact: true }).click();
-  await expect(page.getByRole('article', { name: '创建编排者', exact: true })).toContainText('synthetic-created-coordinator');
-  expect(fixture.posts).toHaveLength(1);
-  expect(fixture.posts[0]).toMatchObject({ path: '/sessions', body: { cwd: '/synthetic/project', role: 'coordinator' } });
-  await coordinator.getByRole('textbox', { name: '已有会话编号' }).fill('synthetic-created-coordinator');
-  await coordinator.getByRole('button', { name: '检查会话', exact: true }).click();
-  await expect(coordinator).toContainText('实际模型（只读）');
-  await expect(coordinator).toContainText('synthetic-model');
-  await coordinator.getByRole('button', { name: '明确绑定为编排者' }).click();
-  await expect.poll(() => fixture.posts.length).toBe(2);
-  expect(fixture.posts[1]).toMatchObject({ path: '/roles/bind', body: {
-    role: 'coordinator', sessionId: 'synthetic-created-coordinator',
-    expectedModelId: 'synthetic-model', expectedEpoch: 0, definitionVersion: '1',
-  } });
-  const memory = page.getByRole('region', { name: '记忆者设置', exact: true });
-  await memory.getByRole('textbox', { name: '新会话工作目录' }).fill('/synthetic/project');
-  await memory.getByRole('button', { name: '创建会话', exact: true }).click();
-  await expect(page.getByRole('article', { name: '创建记忆者', exact: true })).toContainText('synthetic-created-memory');
-  await memory.getByRole('textbox', { name: '已有会话编号' }).fill('synthetic-created-memory');
-  await memory.getByRole('button', { name: '检查会话', exact: true }).click();
-  await memory.getByRole('button', { name: '明确绑定为记忆者' }).click();
-  await expect.poll(() => fixture.posts.length).toBe(4);
-  expect(fixture.posts[3]).toMatchObject({ path: '/roles/bind', body: {
-    role: 'memory', sessionId: 'synthetic-created-memory', expectedModelId: 'synthetic-model',
-    expectedEpoch: 0, definitionVersion: '1',
-  } });
-  const reception = page.getByRole('region', { name: '接待者设置', exact: true });
-  await reception.getByRole('textbox', { name: '已有会话编号' }).fill('synthetic-reception');
-  await reception.getByRole('button', { name: '检查会话', exact: true }).click();
-  await reception.getByRole('textbox', { name: '接待者名称' }).fill('我的接待者');
-  await reception.getByRole('button', { name: '明确接入接待者' }).click();
-  await expect(page.getByRole('article', { name: '接入接待者', exact: true })).toContainText('已接受');
-  expect(fixture.posts[4]).toMatchObject({ path: '/enrollment', body: {
-    sessionId: 'synthetic-reception', label: '我的接待者', kind: 'reception',
-  } });
-  const ids = fixture.posts.map(post => post.body.requestId);
-  expect(new Set(ids).size).toBe(5);
-  for (const id of ids) expect(id).toMatch(uuid);
-  expect(fixture.posts.every(post => !['/prompt', '/sessions/reload'].includes(post.path))).toBe(true);
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  const setup = page.getByRole('region', { name: '设置', exact: true });
+  await expect(setup).toContainText('在 Cockpit 创建会话或添加角色时选择 coordinator 或 memory');
+  await expect(setup).toContainText('所有普通会话都会自动观察，无需单独接入');
+  await expect(setup).toContainText('刷新只读取状态');
+  await expect(setup).toContainText('冷加载包含宿主正常的原生工具初始化');
+  await expect(setup).toContainText('不会额外修复资源、强制重载或自动启用被禁用的资源');
+  await expect(setup.locator('input,select,form')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /创建会话|绑定|接入接待者|检查会话/ })).toHaveCount(0);
+  await expect(page.locator('.ca-role-status strong')).toHaveText(['coordinator', 'memory']);
+  await expect(page.getByText(/编排者|记忆者|Assistant coordinator|Assistant memory/)).toHaveCount(0);
+  expect(fixture.posts).toEqual([]);
+  const ready = readiness();
+  ready.receptions = [];
+  fixture.setReadiness(ready);
+  await page.getByRole('button', { name: '刷新就绪状态' }).click();
+  await page.getByRole('textbox', { name: '消息', exact: true }).fill('无需配置接待会话');
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled();
   assertClean(fixture);
 });
 
@@ -301,7 +301,7 @@ test('unknown input never resends; receipt lookup uses the original ID and prese
   await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('状态未知');
   const requestId = String(fixture.posts[0]?.body.requestId);
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
   await draft.fill('不应被旧请求清空的新草稿');
   await draft.press('Enter');
@@ -313,41 +313,48 @@ test('unknown input never resends; receipt lookup uses the original ID and prese
   assertClean(fixture);
 });
 
-test('binding requires explicitly loaded sessions and known applied roles, without automatic repair', async ({ page }) => {
-  let inspection: { loaded: boolean; rolesNeedReload: boolean | null } = { loaded: false, rolesNeedReload: false };
+test('opening loads only bound unloaded carriers, preserves pending receipts and never repairs invalid roles', async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
   const fixture = await installFixture(page, { ready: false, items: [], hasOlder: false,
-    read: async (url, route) => {
-      if (!url.pathname.endsWith('/inspect')) return false;
-      await json(route, { sessionId: 'synthetic-coordinator', modelId: 'synthetic-model',
-        cwd: '/synthetic/project', status: 'idle', ...inspection });
+    post: async (post, route) => {
+      if (post.path !== '/roles/activate') return false;
+      await gate;
+      await json(route, { id: `activate:${post.body.requestId}`, fingerprint: 'synthetic',
+        state: 'accepted', result: { loaded: ['synthetic-coordinator'] } });
       return true;
     },
   });
+  const unloaded = readiness();
+  unloaded.canSend = false;
+  unloaded.roles[0]!.status = 'unloaded';
+  unloaded.roles[1]!.status = 'invalid';
+  unloaded.roles[1]!.detail = '角色已选择但尚未应用，请在 Cockpit 处理';
+  fixture.setReadiness(unloaded);
   await page.goto('/');
   await openAssistant(page);
-  await page.getByRole('button', { name: '展开设置' }).click();
-  const coordinator = page.getByRole('region', { name: '编排者设置', exact: true });
-  await coordinator.getByRole('textbox', { name: '已有会话编号' }).fill('synthetic-coordinator');
-  const inspect = coordinator.getByRole('button', { name: '检查会话', exact: true });
-  const bind = coordinator.getByRole('button', { name: '明确绑定为编排者' });
-  await inspect.click();
-  await expect(coordinator).toContainText('助手不会自动加载');
-  await expect(bind).toBeDisabled();
-  inspection = { loaded: true, rolesNeedReload: true };
-  await inspect.click();
-  await expect(coordinator).toContainText('助手不会自动修复');
-  await expect(bind).toBeDisabled();
-  inspection = { loaded: true, rolesNeedReload: null };
-  await inspect.click();
-  await expect(coordinator).toContainText('角色配置是否已应用尚不明确');
-  await expect(bind).toBeDisabled();
-  expect(fixture.posts).toEqual([]);
-  inspection = { loaded: true, rolesNeedReload: false };
-  await inspect.click();
-  await expect(bind).toBeEnabled();
-  await bind.click();
   await expect.poll(() => fixture.posts.length).toBe(1);
-  expect(fixture.posts[0]?.path).toBe('/roles/bind');
+  expect(fixture.posts[0]).toMatchObject({ path: '/roles/activate', body: { bindings: [
+    { role: 'coordinator', sessionId: 'synthetic-coordinator', epoch: 1 },
+    { role: 'memory', sessionId: 'synthetic-memory', epoch: 1 },
+  ] } });
+  expect(fixture.posts[0]!.body.requestId).toMatch(uuid);
+  const receipt = page.getByRole('article', { name: '加载内部角色会话', exact: true });
+  await expect(receipt).toContainText('处理中');
+  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await openAssistant(page);
+  await expect(receipt).toContainText('处理中');
+  const draft = page.getByRole('textbox', { name: '消息', exact: true });
+  await draft.fill('加载完成不得改变此草稿');
+  await expect(page.locator('.ca-role-status').last()).toContainText('角色已选择但尚未应用');
+  unloaded.roles[0]!.status = 'ready';
+  fixture.setReadiness(unloaded);
+  release();
+  await expect(receipt).toContainText('已接受');
+  await expect(page.locator('.ca-role-status').first()).toContainText('已就绪');
+  await expect(draft).toHaveValue('加载完成不得改变此草稿');
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
+  expect(fixture.posts).toHaveLength(1);
   assertClean(fixture);
 });
 
@@ -367,7 +374,7 @@ test('late POST completion after close/reopen cannot erase new typing or duplica
   await draft.fill('旧请求还在飞行中');
   await page.getByRole('button', { name: '发送', exact: true }).click();
   await expect.poll(() => fixture.posts.length).toBe(1);
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
   await draft.fill('关闭后重新输入的内容');
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
@@ -420,41 +427,42 @@ test('paging and duplicate/out-of-order SSE recover from the applied cursor with
   assertClean(fixture);
 });
 
-test('unknown create receipt stays inspectable after reopening and never creates twice', async ({ page }) => {
-  let createdId = '';
+test('unknown internal activation stays inspectable across reopen with no new-ID retry or guessed readiness', async ({ page }) => {
+  let activationId = '';
   const fixture = await installFixture(page, { ready: false, items: [], hasOlder: false,
     post: async (post, route) => {
-      if (post.path !== '/sessions') return false;
-      createdId = String(post.body.requestId);
-      await json(route, { state: 'unknown', result: { detail: 'Synthetic acknowledgement lost' } });
+      if (post.path !== '/roles/activate') return false;
+      activationId = String(post.body.requestId);
+      await json(route, { id: `activate:${activationId}`, fingerprint: 'synthetic',
+        state: 'unknown', result: { detail: 'Synthetic acknowledgement lost' } });
       return true;
     },
     read: async (url, route) => {
       if (!url.pathname.includes('/operations/')) return false;
-      await json(route, { id: `create:${createdId}`, fingerprint: 'synthetic', state: 'unknown',
+      await json(route, { id: `activate:${activationId}`, fingerprint: 'synthetic', state: 'unknown',
         result: { detail: 'Still not confirmed; do not repeat' } });
       return true;
     },
   });
+  const unloaded = readiness();
+  unloaded.canSend = false;
+  unloaded.roles[0]!.status = 'unloaded';
+  fixture.setReadiness(unloaded);
   await page.goto('/');
   await openAssistant(page);
-  await page.getByRole('button', { name: '展开设置' }).click();
-  const coordinator = page.getByRole('region', { name: '编排者设置', exact: true });
-  await coordinator.getByRole('textbox', { name: '新会话工作目录' }).fill('/synthetic/project');
-  await coordinator.getByRole('button', { name: '创建会话', exact: true }).click();
-  await expect(page.getByRole('article', { name: '创建编排者', exact: true })).toContainText('状态未知');
-  await expect(coordinator.getByRole('button', { name: '创建会话', exact: true })).toBeDisabled();
-  const memory = page.getByRole('region', { name: '记忆者设置', exact: true });
-  await memory.getByRole('textbox', { name: '新会话工作目录' }).fill('/synthetic/memory');
-  await expect(memory.getByRole('button', { name: '创建会话', exact: true })).toBeDisabled();
-  const reception = page.getByRole('region', { name: '接待者设置', exact: true });
-  await reception.getByRole('textbox', { name: '新会话工作目录' }).fill('/synthetic/reception');
-  await expect(reception.getByRole('button', { name: '创建会话', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  const receipt = page.getByRole('article', { name: '加载内部角色会话', exact: true });
+  await expect(receipt).toContainText('状态未知');
+  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  unloaded.roles[0]!.status = 'unknown';
+  fixture.setReadiness(unloaded);
   await openAssistant(page);
+  await expect(page.locator('.ca-role-status').first()).toContainText('状态未知');
   await page.getByRole('button', { name: '检查操作状态' }).click();
-  await expect(page.getByRole('article', { name: '创建编排者', exact: true })).toContainText('Still not confirmed');
+  await expect(receipt).toContainText('回执状态：unknown');
+  await receipt.getByRole('button', { name: '展开完整结果' }).click();
+  await expect(receipt).toContainText('Still not confirmed');
   expect(fixture.posts).toHaveLength(1);
-  expect(fixture.requests.some(request => decodeURIComponent(request.path) === `/operations/create:${createdId}`)).toBe(true);
+  expect(fixture.requests.some(request => decodeURIComponent(request.path) === `/operations/activate:${activationId}`)).toBe(true);
+  expect(fixture.requests.filter(request => request.path === '/readiness').length).toBeGreaterThanOrEqual(3);
   assertClean(fixture);
 });

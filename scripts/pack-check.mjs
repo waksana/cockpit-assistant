@@ -12,7 +12,7 @@ try {
   const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], { encoding: 'utf8' }));
   const files = new Set(pack.files.map(file => file.path));
   for (const path of [manifest.backend, manifest.frontend.entry, ...manifest.frontend.styles,
-    'cockpit.module.json', 'README.md', ...manifest.roles.map(role => role.instructions)]) {
+    'cockpit.module.json', 'README.md', 'licenses/lucide.txt', ...manifest.roles.map(role => role.instructions)]) {
     assert.ok(files.has(path), `Missing packaged file ${path}`);
   }
   assert.ok(![...files].some(path => path.startsWith('src/') || path.startsWith('node_modules/') || path.includes('.sqlite')));

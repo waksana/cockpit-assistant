@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const output = join(root, 'node_modules/.cache/assistant-browser');
-export const hostRevision = '985d18207694b4a795845194f525e3683e4f0d13';
+export const hostRevision = 'af4c8a227053640ae7c113c8849543a6731a5e19';
 const host = join(output, 'host');
 const require = createRequire(import.meta.url);
 const dependencyPaths = [root, ...(process.env.COCKPIT_BROWSER_DEPENDENCIES

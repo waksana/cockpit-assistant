@@ -83,7 +83,7 @@ export interface Binding {
   sessionId: string;
   epoch: number;
   definitionVersion: string;
-  modelId: string;
+  modelId: string | null;
   cwd: string;
   ready: boolean;
   evidence: unknown;

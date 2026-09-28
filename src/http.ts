@@ -7,8 +7,9 @@ import type { Runtime } from './runtime.ts';
 import type { AssistantService } from './service.ts';
 import { ref } from './service.ts';
 import { publicationStream } from './stream.ts';
+import { createTopicSession } from './topic-session.ts';
 import { inputReceipt, timeline, timelineItem } from './ui.ts';
-import { bindingSchema, claimSchema, configSchema, createSessionSchema, decisionSchema, enrollSchema,
+import { activateRolesSchema, bindingSchema, claimSchema, configSchema, createSessionSchema, createTopicSessionSchema, decisionSchema, enrollSchema,
   id, inputSchema, rememberSchema, role, roleReadSchema, text } from './schema.ts';
 import type { Delivery, Message, Table } from './types.ts';
 
@@ -94,6 +95,11 @@ const toolDefinitions = [
   { name: 'assistant_remember', schema: rememberSchema,
     description: 'Memory role only: commit sourced confirmed, reported, or inferred entries for your claimed memory work. '
       + 'Use a stable requestId and exact lease proof; every source must match the claimed version and assignment. Never infer user confirmation from a report.' },
+  { name: 'assistant_create_session', schema: createTopicSessionSchema,
+    description: 'Coordinator only: reserve one ordinary session creation for current leased unanchored user input when no suitable existing reception exists. '
+      + 'Provide an explicit absolute cwd supported by user/task context and explain that evidence in reason; clarify if unknown. '
+      + 'Uses the native default model, no internal roles, no automatic routing. Keep the exact request for replay; read receipts on uncertainty. '
+      + 'After creation, claim and read fresh state before assistant_decide. Never replace an uncertain creation with a new request.' },
 ];
 
 function knownError(error: unknown): { code: string; message: string; status: number; issues?: unknown } | null {
@@ -176,6 +182,7 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
         const work = db.must('work', value.workId);
         requireFact(work.role === value.role, 'SOURCE_SCOPE', 'Receipt belongs to a different role', 403);
         return { workId: work.id, state: work.state, epoch: work.epoch, inputVersion: work.inputVersion,
+          ...(value.role === 'coordinator' ? { sessionCreation: db.get('operations', `topic-create:${work.id}`) ?? null } : {}),
           result: work.state === 'done' ? work.result : null };
       }
       if (value.role === 'coordinator') {
@@ -327,6 +334,7 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
     api('POST', '/enrollment', request => runtime.enroll(enrollSchema.parse(request.body))),
     api('POST', '/sessions', request => runtime.create(createSessionSchema.parse(request.body))),
     api('POST', '/roles/bind', request => runtime.bind(bindingSchema.parse(request.body))),
+    api('POST', '/roles/activate', request => runtime.activateRoles(activateRolesSchema.parse(request.body))),
     api('POST', '/roles/verify', request => verify(verifySchema.parse(request.body))),
     api('POST', '/roles/:role/refresh', request => verify({
       ...refreshSchema.parse(request.body), role: z.strictObject({ role }).parse(request.params).role,
@@ -524,6 +532,11 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
                     const value = decisionSchema.parse(call.arguments);
                     await runtime.authorize(identity, 'coordinator', value.epoch);
                     output = service.decide(identity, value);
+                    wake();
+                    break;
+                  }
+                  case 'assistant_create_session': {
+                    output = await createTopicSession(service, runtime, identity, call.arguments);
                     wake();
                     break;
                   }

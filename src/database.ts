@@ -36,6 +36,14 @@ export class Database {
         ordinal INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
         document TEXT NOT NULL CHECK(json_valid(document)))`);
     }
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS publications_sequence
+      ON publications(json_extract(document, '$.sequence'))`);
+    this.sql.exec(`CREATE INDEX IF NOT EXISTS receptions_active_kind
+      ON receptions(json_extract(document, '$.enabled'), json_extract(document, '$.kind'), ordinal)`);
+    for (const table of ['questions', 'work', 'deliveries']) {
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS ${table}_message
+        ON ${table}(json_extract(document, '$.messageId'), ordinal)`);
+    }
     this.sql.exec('PRAGMA user_version=1');
   }
   transaction<T>(fn: () => T): T {
@@ -85,6 +93,41 @@ export class Database {
       if (!page.hasMore) return found;
       cursor = page.cursor;
     }
+  }
+  publication(sequence: number): Tables['publications'] | undefined {
+    const row = this.sql.prepare(`SELECT document FROM publications
+      WHERE json_extract(document, '$.sequence')=? LIMIT 1`).get(sequence);
+    return row ? JSON.parse(String(row.document)) as Tables['publications'] : undefined;
+  }
+  activeReceptions(): Tables['receptions'][] {
+    const rows = this.sql.prepare(`SELECT document FROM receptions
+      WHERE json_extract(document, '$.enabled')=1 AND json_extract(document, '$.kind')='reception'
+      ORDER BY ordinal LIMIT 100`).all();
+    return rows.map(row => JSON.parse(String(row.document)) as Tables['receptions']);
+  }
+  publicationPage(direction: 'before' | 'after', cursor: number | undefined, limit: number) {
+    requireFact((cursor === undefined || Number.isSafeInteger(cursor) && cursor >= 0)
+      && Number.isSafeInteger(limit) && limit >= 1 && limit <= 100,
+    'PAGINATION', 'Use a nonnegative cursor and limit 1..100', 400);
+    const watermarkRow = this.sql.prepare(`SELECT MAX(json_extract(document, '$.sequence')) AS maximum FROM publications`).get();
+    const watermark = Number(watermarkRow?.maximum ?? 0);
+    const forward = direction === 'after';
+    const rows = this.sql.prepare(`SELECT document FROM publications
+      WHERE json_extract(document, '$.sequence') ${forward ? '>' : cursor === undefined ? '<=' : '<'} ?
+      ORDER BY json_extract(document, '$.sequence') ${forward ? 'ASC' : 'DESC'} LIMIT ?`)
+      .all(cursor ?? (forward ? 0 : watermark), limit + 1);
+    const items = rows.slice(0, limit).map(row => JSON.parse(String(row.document)) as Tables['publications']);
+    if (!forward) items.reverse();
+    return { items, before: items[0]?.sequence ?? null, hasMore: rows.length > limit, watermark,
+      ...(forward ? { cursor: items.at(-1)?.sequence ?? cursor ?? 0 } : {}) };
+  }
+  forMessage<T extends 'work' | 'deliveries' | 'questions'>(table: T, messageId: string, limit = 100) {
+    requireFact(Number.isSafeInteger(limit) && limit >= 1 && limit <= 100,
+      'PAGINATION', 'Use limit 1..100', 400);
+    const rows = this.sql.prepare(`SELECT document FROM ${table}
+      WHERE json_extract(document, '$.messageId')=? ORDER BY ordinal DESC LIMIT ?`).all(messageId, limit + 1);
+    return { items: rows.slice(0, limit).reverse().map(row => JSON.parse(String(row.document)) as Tables[T]),
+      hasMore: rows.length > limit };
   }
   meta<T>(key: string, fallback: T): T {
     const row = this.sql.prepare('SELECT value FROM meta WHERE key=?').get(key);

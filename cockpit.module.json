@@ -2,8 +2,13 @@
   "apiVersion": 1,
   "id": "assistant",
   "name": "Assistant",
-  "version": "0.1.0",
+  "version": "0.0.0-dev",
   "backend": "dist/index.js",
+  "frontend": {
+    "entry": "dist/web/index.js",
+    "styles": ["dist/web/styles.css"],
+    "assets": ["dist/web"]
+  },
   "roles": [
     {
       "id": "coordinator",

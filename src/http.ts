@@ -7,6 +7,7 @@ import type { Runtime } from './runtime.ts';
 import type { AssistantService } from './service.ts';
 import { ref } from './service.ts';
 import { publicationStream } from './stream.ts';
+import { inputReceipt, timeline, timelineItem } from './ui.ts';
 import { bindingSchema, claimSchema, configSchema, createSessionSchema, decisionSchema, enrollSchema,
   id, inputSchema, rememberSchema, role, roleReadSchema, text } from './schema.ts';
 import type { Delivery, Message, Table } from './types.ts';
@@ -22,6 +23,10 @@ const operationPathSchema = z.strictObject({ id: z.string().min(1).max(512) });
 const messageVersionPathSchema = pathSchema.extend({ version: integerQuery.pipe(z.number().positive()) });
 const assignmentPathSchema = pathSchema.extend({ version: integerQuery });
 const streamQuerySchema = z.strictObject({ after: integerQuery.optional() });
+const timelineQuerySchema = z.strictObject({
+  before: integerQuery.optional(), after: integerQuery.optional(),
+  limit: integerQuery.pipe(z.number().min(1).max(100)).optional(),
+}).refine(value => value.before === undefined || value.after === undefined, 'before and after are mutually exclusive');
 const requestSchema = z.strictObject({ requestId: id });
 const focusSchema = requestSchema.extend({ topicId: id });
 const handoffSchema = focusSchema.extend({ evidence });
@@ -226,7 +231,49 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
   };
   const result: ModuleRoute[] = [
     api('GET', '/state', status), api('GET', '/status', status),
+    api('GET', '/timeline', request => {
+      const { before, after, limit } = timelineQuerySchema.parse(request.query);
+      return timeline(service, before, after, limit ?? (after === undefined ? 50 : 100));
+    }),
+    api('GET', '/timeline/items/:sequence', request => {
+      z.strictObject({}).parse(request.query);
+      const { sequence } = z.strictObject({ sequence: integerQuery.pipe(z.number().positive()) }).parse(request.params);
+      const publication = db.publication(sequence);
+      requireFact(publication, 'NOT_FOUND', 'Publication not found', 404);
+      return timelineItem(service, publication);
+    }),
+    api('GET', '/readiness', request => {
+      z.strictObject({}).parse(request.query);
+      return runtime.readiness();
+    }),
+    api('GET', '/sessions/:id/inspect', request => {
+      z.strictObject({}).parse(request.query);
+      return runtime.inspect(pathSchema.parse(request.params).id);
+    }),
+    api('GET', '/operations/:id', request => {
+      z.strictObject({}).parse(request.query);
+      return db.must('operations', operationPathSchema.parse(request.params).id);
+    }),
+    api('GET', '/inputs/:requestId', request => {
+      z.strictObject({}).parse(request.query);
+      return inputReceipt(service, requestSchema.parse(request.params).requestId);
+    }),
   ];
+  result.push({
+    method: 'GET', path: '/timeline/stream',
+    handler(request): ModuleResponse {
+      try {
+        const query = streamQuerySchema.parse(request.query);
+        const lastEventId = integerQuery.optional().parse(request.headers['last-event-id']);
+        return publicationStream(service, lastEventId ?? query.after ?? 0, request.signal,
+          publication => timelineItem(service, publication));
+      } catch (error) {
+        const known = knownError(error);
+        if (!known) throw error;
+        return { status: known.status, headers: jsonHeaders, body: { error: known } };
+      }
+    },
+  });
   for (const [path, table] of Object.entries({
     topics: 'topics', history: 'publications', publications: 'publications', messages: 'messages',
     events: 'publications', receptions: 'receptions', questions: 'questions', deliveries: 'deliveries',
@@ -276,7 +323,7 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
       z.strictObject({}).parse(request.query);
       return db.must('bindings', z.strictObject({ role }).parse(request.params).role);
     }),
-    api('POST', '/messages', request => service.accept(inputSchema.parse(request.body))),
+    api('POST', '/messages', request => runtime.acceptReady(inputSchema.parse(request.body))),
     api('POST', '/enrollment', request => runtime.enroll(enrollSchema.parse(request.body))),
     api('POST', '/sessions', request => runtime.create(createSessionSchema.parse(request.body))),
     api('POST', '/roles/bind', request => runtime.bind(bindingSchema.parse(request.body))),

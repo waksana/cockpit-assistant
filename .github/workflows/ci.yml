@@ -3,6 +3,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
 permissions:
   contents: read
   packages: read
@@ -10,7 +15,10 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -22,3 +30,5 @@ jobs:
       - run: npm run build
       - run: npm test
       - run: npm run pack:check
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser

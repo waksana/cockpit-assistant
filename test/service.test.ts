@@ -160,3 +160,46 @@ test('correcting an unprocessed input replaces its work without replaying delive
     assert.equal(f.db.list('deliveries').items.length, 1);
   } finally { f.close(); }
 });
+
+test('corrected sources resume the previously requested memory cycle without another topic switch', () => {
+  const f = fixture();
+  try {
+    for (const id of ['a', 'b']) f.db.put('topics', { id, title: id, domain: null, relatedTo: [],
+      pinned: false, archived: false, independent: true, version: 1, dirtyThrough: 0, memoryThrough: 0 });
+    const messages = f.db.transaction(() => Array.from({ length: 201 }, (_, i) =>
+      f.service.addMessage({ kind: 'reply', raw: `Result ${i}`, topicId: 'a', sessionId: 's1' })));
+    f.db.setMeta('foregroundTopic', 'a');
+    f.db.transaction(() => f.service.switchTopic('b'));
+    const first = f.service.claim(f.identities.memory, 'memory', 1)!;
+    f.service.correct(messages[0]!.id, 'Corrected result', 1, 'Source correction');
+    assert.equal(f.db.must('work', first.id).state, 'invalidated');
+    const replacement = f.service.claim(f.identities.memory, 'memory', 1)!;
+    assert.equal(replacement.sources[0]!.version, 2);
+    f.service.remember(f.identities.memory, { ...proof(replacement), entries: [] });
+    const last = f.service.claim(f.identities.memory, 'memory', 1)!;
+    f.service.remember(f.identities.memory, { ...proof(last), entries: [] });
+    assert.equal(f.db.must('topics', 'a').memoryThrough, messages[200]!.sequence);
+  } finally { f.close(); }
+});
+
+test('handoff and anchored exposure do not erase shared native topic context', () => {
+  const f = fixture();
+  try {
+    const submit = (requestId: string, topic: { id: string } | { title: string; independent: boolean },
+      sessionId: string, routeVersion: number) => {
+      const input = f.service.accept({ requestId, text: `Request ${requestId}` });
+      const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
+      f.service.decide(f.identities.coordinator, { ...proof(work), topic, reason: 'Explicit routing',
+        action: { kind: 'route', sessionIds: [sessionId], routeVersion } });
+      return f.db.must('messages', input.message.id).topicId!;
+    };
+    const a = submit('a', { title: 'A', independent: true }, 's1', 0);
+    submit('handoff', { id: a }, 's2', 1);
+    submit('b', { title: 'B', independent: true }, 's1', 0);
+    const risk = f.db.find('publications', p => p.type === 'risk')[0]!;
+    assert.ok(risk);
+    assert.match(risk.text, /A \/ B|B \/ A/);
+    assert.equal(f.db.list('deliveries').items.at(-1)!.supplement, risk.text);
+    assert.equal(f.db.find('exposures', item => item.sessionId === 's1').length, 2);
+  } finally { f.close(); }
+});

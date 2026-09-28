@@ -201,6 +201,21 @@ export class MemoryEngine {
     }
   }
 
+  resumeAffected(messageId: string): void {
+    const current = this.db.must('messages', messageId);
+    const topics = new Set(this.db.find('work', work => work.role === 'memory'
+      && work.sources.some(source => source.messageId === messageId)).flatMap(work => work.topicId ? [work.topicId] : []));
+    if (current.topicId) topics.add(current.topicId);
+    for (const topicId of topics) {
+      const topic = this.db.must('topics', topicId);
+      topic.memoryThrough = this.completedThrough(topicId);
+      this.db.put('topics', topic);
+      for (const kind of ['memory', 'handoff'] as const) {
+        if (this.db.meta(cycleKey(topicId, kind), 0) > 0) this.enqueue(topicId, kind);
+      }
+    }
+  }
+
   list(topicId: string, after = 0, limit = 100) {
     this.db.must('topics', topicId);
     const page = this.db.list('memories', after, limit);

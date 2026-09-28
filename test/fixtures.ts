@@ -34,6 +34,8 @@ export function fixture() {
   let onPrompt: (() => Promise<void>) | null = null;
   const host: ModuleHostApi = {
     resourcePreparationVersion: 1,
+    askResponseVersion: 1,
+    chatReadVersion: 1,
     async call<Name extends ModuleHostIntent>(name: Name, body: ModuleHostIntentBody<Name>): Promise<ModuleHostIntentResult<Name>> {
       calls.push({ name, body });
       const sessionId = 'sessionId' in body ? body.sessionId : '';
@@ -57,6 +59,15 @@ export function fixture() {
           if (failure) throw failure;
           result = { ok: true, queued: true }; break;
         case 'session/rename': result = { ok: true }; break;
+        case 'respondAsk':
+          if (failure) throw failure;
+          result = { ok: true }; break;
+        case 'session/chat': {
+          const page = pages.shift() ?? { events: [], cursor: '', liveCursor: '', cursorStatus: 'ok', hasMore: false };
+          result = { ...page, sessionId, source: 'live', direction: 'direction' in body ? body.direction : 'forward',
+            read: { rpc: 1, events: page.events.length } };
+          break;
+        }
         default: throw new Error(`Unexpected synthetic host call: ${name}`);
       }
       return result as ModuleHostIntentResult<Name>;

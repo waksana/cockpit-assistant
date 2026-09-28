@@ -74,6 +74,7 @@ export class Ingestion {
           prior.version++;
           prior.nativeEventId = event.id;
           db.put('messages', prior);
+          this.service.memory.resumeAffected(prior.id);
           this.service.addWork(prior);
           this.service.publish({ type: 'correction', messageId: prior.id, topicId: prior.topicId,
             text: 'A native source has a new complete revision; prior publications remain unchanged.' });

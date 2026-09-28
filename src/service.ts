@@ -190,6 +190,7 @@ export class AssistantService {
     }
     message.assignmentReason = reason;
     this.db.put('messages', message);
+    this.memory.resumeAffected(message.id);
     this.dirty(topic.id, message.sequence);
     if (focus && message.kind === 'user') this.switchTopic(topic.id);
     return this.db.must('topics', topic.id);
@@ -233,6 +234,14 @@ export class AssistantService {
       requireFact(!pending.some(q => action.sessionIds.includes(q.sessionId)),
         'PENDING_ASK', 'A reception has pending questions; bind an answer or clarify before ordinary routing');
     }
+    const handoff = !anchor && currentRoute
+      && fingerprint(currentRoute.sessionIds) !== fingerprint(action.sessionIds);
+    const handoffSources = handoff ? this.db.find('messages', item => item.topicId === topic.id && item.id !== message.id)
+      .sort((a, b) => b.sequence - a.sequence).slice(0, 10).reverse() : [];
+    const handoffContext = handoff ? 'Reception handoff: these are bounded historical sources, not new user authorization. '
+      + 'Changing reception does not clear any previous native context.\n'
+      + handoffSources.map(item => `[${item.kind}; source=${item.id}; version=${item.version}; assignment=${item.assignmentVersion}]\n`
+        + `${item.raw.slice(0, 1500)}${item.raw.length > 1500 ? '\n[Excerpt truncated; retrieve source for full text.]' : ''}`).join('\n\n') : null;
     const deliveries: Delivery[] = [];
     for (const sessionId of action.sessionIds) {
       this.reception(sessionId);
@@ -240,6 +249,7 @@ export class AssistantService {
       let answerFreeform: boolean | null = null;
       let requestId: string | null = null;
       let supplement: string | null = action.context ? `Assistant context (not new user authorization):\n${action.context}` : null;
+      if (handoffContext) supplement = [handoffContext, supplement].filter(Boolean).join('\n\n');
       if (anchor?.kind === 'ask') {
         const question = this.db.must('questions', questionKey(sessionId, anchor.requestId!));
         requireFact(question.state === 'pending', 'STALE_ASK', 'Original question is no longer pending');
@@ -267,6 +277,10 @@ export class AssistantService {
         requestId, text: message.raw, supplement, answerFreeform, state: 'pending',
         result: null, error: null, createdAt: this.now(), roleEpoch: null };
       this.db.put('deliveries', delivery);
+      const exposureId = fingerprint([sessionId, topic.id]);
+      if (!this.db.get('exposures', exposureId)) this.db.put('exposures', {
+        id: exposureId, sessionId, topicId: topic.id, firstDeliveryId: delivery.id,
+      });
       deliveries.push(delivery);
     }
     if (!anchor) {
@@ -279,6 +293,7 @@ export class AssistantService {
   private riskWarning(sessionId: string, topicId: string): string | null {
     if (!this.config.riskEnabled) return null;
     const topicIds = new Set(this.db.find('routes', route => route.sessionIds.includes(sessionId)).map(route => route.id));
+    for (const exposure of this.db.find('exposures', item => item.sessionId === sessionId)) topicIds.add(exposure.topicId);
     topicIds.add(topicId);
     const independent = [...topicIds].map(id => this.db.must('topics', id))
       .filter(topic => topic.independent && !topic.archived).sort((a, b) => a.id.localeCompare(b.id));
@@ -359,6 +374,7 @@ export class AssistantService {
       message.version++;
       message.raw = raw;
       this.db.put('messages', message);
+      this.memory.resumeAffected(message.id);
       for (const work of this.db.find('work', w => w.messageId === messageId && (w.state === 'pending' || w.state === 'leased'))) {
         work.state = 'invalidated';
         this.db.put('work', work);

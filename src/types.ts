@@ -150,6 +150,7 @@ export interface Operation {
   result: unknown;
 }
 export interface Tables {
+  exposures: { id: string; sessionId: string; topicId: string; firstDeliveryId: string };
   topics: Topic;
   receptions: Reception;
   messages: Message;

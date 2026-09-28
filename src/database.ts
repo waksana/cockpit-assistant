@@ -6,7 +6,7 @@ import type { Table, Tables } from './types.ts';
 import { requireFact } from './errors.ts';
 
 const tables: Table[] = ['topics', 'receptions', 'messages', 'anchors', 'questions', 'work',
-  'bindings', 'deliveries', 'publications', 'memories', 'risks', 'routes', 'native', 'operations'];
+  'bindings', 'deliveries', 'publications', 'memories', 'risks', 'routes', 'native', 'operations', 'exposures'];
 
 export function fingerprint(value: unknown): string {
   const canonical = (v: unknown): string => {

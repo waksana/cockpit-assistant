@@ -3,8 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.0.0" },
-  "files": ["dist", "roles", "cockpit.module.json", "README.md", "docs"],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "files": [
+    "dist",
+    "roles",
+    "cockpit.module.json",
+    "README.md",
+    "docs"
+  ],
   "scripts": {
     "build": "tsc --noEmit && node scripts/build.mjs",
     "test": "node --import tsx --test test/*.test.ts",
@@ -13,7 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "24.10.1",
-    "@waksana/cockpit-module-sdk": "0.3.0",
+    "@waksana/cockpit-module-sdk": "0.4.0",
     "esbuild": "0.25.12",
     "tsx": "4.21.0",
     "typescript": "5.9.3"

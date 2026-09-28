@@ -1,8 +1,9 @@
 # Cockpit Assistant
 
-Assistant is a trusted, backend-only Cockpit module for durable topic-based
+Assistant is a trusted Cockpit module for durable topic-based
 conversation across explicitly enrolled native sessions. It does not require
-Task, replace native history, or install a frontend.
+Task or replace native history. The global menu's **助手** action opens its
+session-independent conversation dialog, including on an empty Cockpit home.
 
 The coordinator classifies inputs and reception outputs; the program validates,
 persists, sends, and publishes them. A separate memory role extracts versioned,
@@ -19,19 +20,32 @@ npm ci --ignore-scripts
 npm run build
 npm test
 npm run pack:check
+npx playwright install chromium
+npm run test:browser
 ```
 
 Dependencies and the public SDK are pinned exactly. The backend is bundled into
 one ESM entry; the host does not install dependencies. Native SQLite and standard
 Node modules are provided by Node.js. Tests use temporary databases and synthetic
 native adapters, not production sessions.
+The browser harness builds pinned real Cockpit menu/runtime/global-component
+implementations against synthetic module HTTP fixtures; it never starts a native
+host or installs the module. Its checkout/cache stays under `node_modules/.cache`.
+
+The frontend uses the host's React and public module UI, not a separate React
+root. See [the interface guide](docs/interface.md) for setup, receipts, history,
+and browser lifecycle boundaries.
 
 See [API and role setup](docs/api.md) for host compatibility, initialization,
 HTTP/MCP payloads, and recovery; [architecture and reliability](docs/architecture.md)
 for the trust model; and the role protocols in
 [coordinator](roles/coordinator.md) and [memory](roles/memory.md).
 
-This repository does not automatically publish, install, deploy, or restart
-anything. Its CI is independent of Cockpit's other products' release pipelines.
+Merged main pull requests produce immutable Rolling Releases as described in
+[releases](docs/releases.md). Publication does not install, deploy, or restart
+anything; the external deployment service owns registration and safe rollout.
+Its CI is independent of Cockpit's other products' release pipelines.
 The initial backend implementation is tracked in
 [issue #1](https://github.com/waksana/cockpit-assistant/issues/1).
+The interface follow-up is tracked in
+[issue #3](https://github.com/waksana/cockpit-assistant/issues/3).

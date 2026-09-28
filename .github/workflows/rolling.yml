@@ -1,0 +1,53 @@
+name: Rolling
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+permissions:
+  contents: read
+# Permanent sequence authority. No concurrency group may displace a merged PR.
+jobs:
+  checks:
+    if: github.event.pull_request.merged == true
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_sha: ${{ github.event.pull_request.merge_commit_sha }}
+    permissions:
+      contents: read
+      packages: read
+  rolling:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      packages: read
+    env:
+      ROLLING_SEQUENCE: ${{ github.run_number }}
+      SOURCE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '24'
+          registry-url: https://npm.pkg.github.com
+          cache: npm
+      - name: Verify accepted main merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release.mjs source
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}
+      - run: npm run build
+      - run: npm run pack:check
+      - name: Package and verify immutable Rolling
+        run: node --import tsx scripts/release-package.mjs
+      - name: Publish verified assets once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/release.mjs publish

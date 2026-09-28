@@ -1,6 +1,6 @@
 {
   "name": "@waksana/cockpit-assistant",
-  "version": "0.1.0",
+  "version": "0.0.0-dev",
   "private": true,
   "type": "module",
   "engines": {
@@ -17,16 +17,25 @@
     "build": "tsc --noEmit && node scripts/build.mjs",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "tsc --noEmit",
+    "test:browser": "node scripts/browser-build.mjs && playwright test",
     "pack:check": "node scripts/pack-check.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "1.58.2",
     "@types/node": "24.10.1",
-    "@waksana/cockpit-module-sdk": "0.4.0",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@waksana/cockpit-module-sdk": "0.5.0",
     "esbuild": "0.25.12",
+    "lucide-react": "1.46.0",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "sass": "1.104.0",
     "tsx": "4.21.0",
     "typescript": "5.9.3"
   },
   "dependencies": {
+    "marked": "17.0.4",
     "zod": "4.1.13"
   }
 }

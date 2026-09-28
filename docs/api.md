@@ -1,20 +1,23 @@
 # API and role setup
 
-Assistant is a backend-only, trusted same-process Cockpit module: no frontend,
-standalone server, Task dependency, or OS sandbox. One activation owns one private
+Assistant is a trusted same-process Cockpit module with a global conversation UI:
+no standalone server, Task dependency, or OS sandbox. One activation owns one private
 Assistant space and its `dataRoot/assistant.sqlite`. Use Linux and Node.js 24
 with built-in `node:sqlite`.
 
 The installed public SDK dependency is pinned to
-`@waksana/cockpit-module-sdk@0.4.0`, including the native methods used here.
+`@waksana/cockpit-module-sdk@0.5.0`, including the native methods used here.
 The host compatibility reference is commit
-[`e85e49a01484372c0ed3e3212280936694fd5b7b`](https://github.com/waksana/cockpit/commit/e85e49a01484372c0ed3e3212280936694fd5b7b),
-release `v0.0.0-rolling.18`; see its fixed
-[public bridge contract](https://github.com/waksana/cockpit/blob/e85e49a01484372c0ed3e3212280936694fd5b7b/docs/module-contract.md#native-conversation-bridge).
+[`985d18207694b4a795845194f525e3683e4f0d13`](https://github.com/waksana/cockpit/commit/985d18207694b4a795845194f525e3683e4f0d13),
+release `v0.0.0-rolling.19`; see its fixed
+[public bridge contract](https://github.com/waksana/cockpit/blob/985d18207694b4a795845194f525e3683e4f0d13/docs/module-contract.md#native-conversation-bridge).
 Activation requires `serviceReadyVersion`, `chatReadVersion`,
 `askResponseVersion`, and `resourcePreparationVersion` all equal to `1`.
-This source delivery does not install or deploy anything, publish an Assistant
-module release, or establish production/native-model end-to-end verification.
+Frontend activation separately requires Web API `2`, `globalComponentVersion`,
+`menuVersion`, `uiVersion`, and `uiSurfaceVersion` all `1`, and host `createPortal`.
+Rolling publication is described in [releases](releases.md). Source merge and
+publication do not install/deploy or establish production/native-model
+end-to-end verification.
 
 ## Transport and scope
 
@@ -126,7 +129,7 @@ separate operator actions, not initialization side effects.
    availability. New ordinary sessions require their own explicit `/sessions`
    request followed by enrollment. There is no automatic creation/replacement.
 
-4. Submit user input through `POST /messages`:
+4. With both bound roles freshly ready, submit user input through `POST /messages`:
 
    ```json
    {"requestId":"input-1","text":"Review the project plan."}
@@ -137,6 +140,10 @@ separate operator actions, not initialization side effects.
    reception. The runtime queues an internal role wake. Only a committed
    coordinator decision publishes classified input and queues a delivery or
    clarification. Read `/deliveries` and the publication log for later outcomes.
+   New input now passively verifies both current roles at this boundary; an
+   unavailable role rejects with `ROLES_NOT_READY` before acceptance. An identical
+   already-durable request still returns its original result if readiness later
+   changes. Direct internal `service.accept` remains synchronous.
 
 `GET /status` exposes config, `stateVersion`, `foregroundTopic`, role bindings,
 and `publicationCursor`. `POST /roles/verify` (or role `/refresh`) rechecks an
@@ -151,6 +158,10 @@ Every write below requires `requestId`. Bracketed fields are optional; notation
 is descriptive, not literal JSON. `role` is `coordinator | memory`.
 
 ### Reads and pagination
+
+The UI's bounded recent/upward timeline, enriched stream, fresh readiness and
+exact receipts are documented in [interface API additions](interface.md#backend-additions).
+The table routes below retain their original forward-pagination semantics.
 
 | Method/path | Query and result |
 | --- | --- |

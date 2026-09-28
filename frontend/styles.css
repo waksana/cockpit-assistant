@@ -1,0 +1,81 @@
+.ca-dialog {
+  box-sizing: border-box;
+  width: calc(100vw - 2 * var(--ck-space));
+  height: calc(100dvh - 2 * var(--ck-space));
+  max-width: 90rem;
+  max-height: calc(100dvh - 2 * var(--ck-space));
+  padding: 0;
+  overflow: hidden;
+}
+.ca-dialog[open] { display: flex; flex-direction: column; }
+.ca-header, .ca-composer { flex: 0 0 auto; padding: calc(1.5 * var(--ck-space)); }
+.ca-header { display: flex; align-items: center; justify-content: space-between; gap: var(--ck-space); border-bottom: 1px solid var(--ck-color-border); }
+.ca-scroller { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; }
+.ca-content { padding: calc(2 * var(--ck-space)); }
+.ca-content > * + * { margin-top: calc(3 * var(--ck-space)); }
+.ca-composer { border-top: 1px solid var(--ck-color-border); }
+.ca-compose-row { display: flex; align-items: flex-end; gap: var(--ck-space); }
+.ca-draft { flex: 1 1 auto; min-width: 0; resize: none; max-height: 10rem; }
+.ca-composer p { margin: var(--ck-space) 0 0; }
+.ca-readiness { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ck-space) calc(2 * var(--ck-space)); }
+.ca-readiness > p { margin: 0; }
+.ca-role-status { display: flex; align-items: center; flex-wrap: wrap; gap: var(--ck-space); flex: 1 1 24rem; min-width: 0; }
+.ca-role-status > .ck-status-text { flex-basis: 100%; }
+.ca-settings:not([hidden]) { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 23rem), 1fr)); gap: calc(2 * var(--ck-space)); }
+.ca-setup-form { min-width: 0; border: 1px solid var(--ck-color-border); border-radius: var(--ck-radius); padding: calc(2 * var(--ck-space)); }
+.ca-form-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--ck-space); margin-top: calc(2 * var(--ck-space)); }
+.ca-field { display: flex; flex-direction: column; gap: var(--ck-space); flex: 1 1 12rem; min-width: 0; }
+.ca-field > input { width: 100%; box-sizing: border-box; }
+.ca-inspection { margin-top: calc(2 * var(--ck-space)); }
+.ca-inspection > .ca-field { margin: var(--ck-space) 0; }
+.ca-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--ck-space); margin: var(--ck-space) 0; }
+.ca-facts dt { color: var(--ck-color-muted); }
+.ca-facts dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.ca-wrap { overflow-wrap: anywhere; white-space: pre-wrap; }
+.ca-receptions { padding-inline-start: calc(2 * var(--ck-space)); }
+.ca-receptions p { margin: var(--ck-space) 0; }
+.ca-timeline-header, .ca-message-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--ck-space) calc(2 * var(--ck-space)); }
+.ca-timeline-header { margin-bottom: calc(2 * var(--ck-space)); }
+.ca-message { padding: var(--ck-space) 0 var(--ck-space) calc(2 * var(--ck-space)); border-inline-start: .2rem solid var(--ca-topic-color, var(--ck-color-accent)); min-width: 0; }
+.ca-message:has(> .ca-topic-heading) { margin-top: calc(3 * var(--ck-space)); }
+.ca-topic-heading { margin: 0 0 var(--ck-space); font-size: var(--ck-text-title); color: var(--ca-topic-color, var(--ck-color-text)); overflow-wrap: anywhere; }
+.ca-message-meta { color: var(--ck-color-muted); }
+.ca-message-meta strong { color: var(--ck-color-text); }
+.ca-markdown, .ca-plain-text { overflow-wrap: anywhere; }
+.ca-plain-text { white-space: pre-wrap; }
+.ca-markdown > :first-child { margin-top: var(--ck-space); }
+.ca-markdown > :last-child { margin-bottom: var(--ck-space); }
+.ca-markdown p { white-space: pre-wrap; }
+.ca-markdown pre, .ca-receipt { margin: var(--ck-space) 0; padding: var(--ck-space); border: 1px solid var(--ck-color-border); border-radius: var(--ck-radius); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; font-size: var(--ck-text-body); }
+.ca-markdown code { white-space: break-spaces; overflow-wrap: anywhere; }
+.ca-markdown a { color: var(--ck-color-accent); text-decoration: underline; overflow-wrap: anywhere; }
+.ca-markdown blockquote { border-inline-start: .2rem solid var(--ck-color-border); margin-inline: 0; padding-inline-start: calc(2 * var(--ck-space)); }
+.ca-markdown table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-block: calc(2 * var(--ck-space)); }
+.ca-markdown th, .ca-markdown td { border: 1px solid var(--ck-color-border); padding: var(--ck-space); overflow-wrap: anywhere; vertical-align: top; }
+.ca-markdown th { text-align: start; }
+.ca-markdown hr { border: 0; border-top: 1px solid var(--ck-color-border); }
+.ca-markdown h1, .ca-markdown h2 { font-size: 1.25rem; }
+.ca-markdown h3, .ca-markdown h4, .ca-markdown h5, .ca-markdown h6 { font-size: 1rem; }
+.ca-markdown ul, .ca-markdown ol, .ca-question-choices { padding-inline-start: calc(3 * var(--ck-space)); }
+.ca-task-state { color: var(--ck-color-muted); margin-inline-end: var(--ck-space); }
+.ca-operation { border-top: 1px solid var(--ck-color-border); padding-block: var(--ck-space); overflow-wrap: anywhere; }
+.ca-operation p { margin-block: var(--ck-space); }
+.ca-operation-title { font-weight: 600; }
+.ca-reply { padding-bottom: var(--ck-space); }
+.ca-reply-heading { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: var(--ck-space); }
+.ca-reply-heading strong { overflow-wrap: anywhere; }
+.ca-choices { display: flex; flex-wrap: wrap; gap: var(--ck-space); margin-top: var(--ck-space); }
+.ca-choices > button { white-space: normal; overflow-wrap: anywhere; text-align: start; max-width: 100%; }
+.ca-new-messages { margin-bottom: var(--ck-space); }
+@media (max-width: 40rem) {
+  .ca-dialog { width: 100vw; height: 100dvh; max-width: 100vw; max-height: 100dvh; margin: 0; border: 0; border-radius: 0; }
+  .ca-header, .ca-composer, .ca-content { padding: var(--ck-space); }
+  .ca-composer { padding-bottom: max(var(--ck-space), env(safe-area-inset-bottom)); }
+  .ca-facts { grid-template-columns: minmax(0, 1fr); gap: calc(.5 * var(--ck-space)); }
+  .ca-facts dd { margin-bottom: var(--ck-space); }
+  .ca-compose-row { align-items: stretch; }
+  .ca-message { padding-inline-start: var(--ck-space); }
+}
+@media (any-pointer: coarse) {
+  .ca-dialog input, .ca-dialog textarea { font-size: max(1rem, var(--ck-input-font-min)); }
+}

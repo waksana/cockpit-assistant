@@ -1,10 +1,11 @@
 import type { McpInvocationMeta, ModuleHostApi, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
 import { fingerprint } from './database.ts';
-import { errorText, requireFact } from './errors.ts';
+import { BusinessError, errorText, requireFact } from './errors.ts';
 import { Ingestion } from './ingestion.ts';
 import { AssistantService, questionKey } from './service.ts';
 import type { Binding, Delivery, Reception, Role } from './types.ts';
-import { bindingSchema, createSessionSchema, enrollSchema } from './schema.ts';
+import { bindingSchema, createSessionSchema, enrollSchema, inputSchema } from './schema.ts';
+import type { Readiness, RoleReadiness, SessionInspection } from './ui-types.ts';
 
 export interface HistoryPage {
   events: NativeChatEvent[];
@@ -97,6 +98,71 @@ export class Runtime {
   }
   private async meta(sessionId: string): Promise<PublicSessionMeta | null> {
     return (await this.native.host.call('session/get', { sessionId })).meta;
+  }
+  async inspect(sessionId: string): Promise<SessionInspection> {
+    const meta = await this.meta(sessionId);
+    requireFact(meta, 'SESSION_MISSING', 'Explicit session does not exist', 404);
+    requireFact(meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
+    return { sessionId, modelId: meta.currentModelId ?? null, cwd: meta.cwd,
+      loaded: meta.loaded, status: meta.status, rolesNeedReload: meta.rolesNeedReload ?? null };
+  }
+  async readiness(): Promise<Readiness> {
+    const roles = await Promise.all((['coordinator', 'memory'] as const).map(async role => {
+      const binding = this.service.db.get('bindings', role);
+      const result: RoleReadiness = { role, sessionId: binding?.sessionId ?? null,
+        epoch: binding?.epoch ?? 0, modelId: binding?.modelId ?? null, cwd: binding?.cwd ?? null,
+        status: binding ? 'unknown' : 'unbound', detail: null };
+      if (!binding) return result;
+      try {
+        await this.verifyBinding(binding);
+        result.status = 'ready';
+      } catch (error) {
+        result.status = error instanceof BusinessError
+          ? error.code === 'ROLE_UNLOADED' ? 'unloaded'
+            : ['ROLE_CONFIGURATION', 'ROLE_NOT_READY', 'SESSION_MISSING'].includes(error.code) ? 'invalid' : 'unknown'
+          : 'unknown';
+        result.detail = errorText(error);
+      }
+      return result;
+    }));
+    const receptions = await Promise.all(this.service.db.activeReceptions().map(async reception => {
+      let availability: Reception['availability'] = 'unknown';
+      try {
+        const meta = await this.meta(reception.id);
+        availability = !meta ? 'missing' : meta.sessionId !== reception.id ? 'unknown'
+          : meta.loaded === true ? 'loaded' : meta.loaded === false ? 'unloaded' : 'unknown';
+      } catch {
+        // A failed passive read is not evidence for the previously cached availability.
+      }
+      return { ...reception, availability };
+    }));
+    for (const result of roles) {
+      const current = this.service.db.get('bindings', result.role);
+      if (current?.sessionId !== (result.sessionId ?? undefined)
+        || (current?.epoch ?? 0) !== result.epoch
+        || current && (current.modelId !== result.modelId || current.cwd !== result.cwd)) {
+        Object.assign(result, { sessionId: current?.sessionId ?? null, epoch: current?.epoch ?? 0,
+          modelId: current?.modelId ?? null, cwd: current?.cwd ?? null,
+          status: current ? 'unknown' : 'unbound', detail: 'Role changed during readiness check; refresh required.' });
+      } else if (result.status === 'ready' && !current?.ready) {
+        result.status = 'unknown';
+        result.detail = 'A concurrent verification invalidated this role.';
+      }
+    }
+    return { roles, canSend: roles.every(item => item.status === 'ready'), receptions };
+  }
+  async acceptReady(input: unknown): Promise<ReturnType<AssistantService['accept']>> {
+    const value = inputSchema.parse(input);
+    if (this.service.db.get('operations', `input:${value.requestId}`)) return this.service.accept(value);
+    const readiness = await this.readiness();
+    // Another identical request may have committed while verification was awaiting the host.
+    if (this.service.db.get('operations', `input:${value.requestId}`)) return this.service.accept(value);
+    requireFact(readiness.canSend && readiness.roles.every(role => {
+      const current = this.service.db.get('bindings', role.role);
+      return current?.ready && current.epoch === role.epoch && current.sessionId === role.sessionId
+        && current.modelId === role.modelId && current.cwd === role.cwd;
+    }), 'ROLES_NOT_READY', 'Both current role sessions must be freshly verified before accepting input', 409);
+    return this.service.accept(value);
   }
   async enroll(input: unknown): Promise<unknown> {
     const value = enrollSchema.parse(input);
@@ -243,23 +309,47 @@ export class Runtime {
     }
   }
   async verifyBinding(binding: Binding): Promise<Binding> {
-    const meta = await this.meta(binding.sessionId);
-    requireFact(meta?.loaded && meta.currentModelId === binding.modelId && meta.cwd === binding.cwd,
-      'ROLE_CONFIGURATION', 'Role is unloaded or its native model/directory changed');
-    const readiness = await this.native.host.call('roles/readiness', { sessionId: binding.sessionId,
-      roles: [{ moduleId: 'assistant', roleId: binding.id }] });
-    requireFact(readiness.ready && readiness.loaded && !readiness.rolesNeedReload
-      && readiness.appliedRoles?.some(r => r.moduleId === 'assistant' && r.roleId === binding.id),
-    'ROLE_NOT_READY', 'Role capability or applied role assembly is not confirmed');
-    return this.service.db.transaction(() => {
-      const current = this.service.db.must('bindings', binding.id);
-      requireFact(current.epoch === binding.epoch && current.sessionId === binding.sessionId,
-        'STALE_ROLE', 'Role changed during native readiness read');
-      current.ready = true;
-      current.evidence = { readiness, modelId: meta.currentModelId, checkedAt: this.service.now() };
-      this.service.db.put('bindings', current);
-      return current;
-    });
+    const matches = (current: Binding | undefined): boolean => !!current
+      && current.epoch === binding.epoch && current.sessionId === binding.sessionId
+      && current.modelId === binding.modelId && current.cwd === binding.cwd
+      && current.definitionVersion === binding.definitionVersion;
+    const checkMeta = (meta: PublicSessionMeta | null): void => {
+      requireFact(meta, 'SESSION_MISSING', 'Bound role session no longer exists');
+      requireFact(meta.sessionId === binding.sessionId, 'ROLE_CONFIGURATION', 'Host returned a different session');
+      requireFact(meta.loaded === true, 'ROLE_UNLOADED', 'Bound role session is unloaded');
+      requireFact(meta.currentModelId === binding.modelId && meta.cwd === binding.cwd,
+        'ROLE_CONFIGURATION', 'Native role model or directory changed');
+      requireFact(meta.rolesNeedReload !== true, 'ROLE_NOT_READY', 'Native role assembly requires reload');
+    };
+    try {
+      const meta = await this.meta(binding.sessionId);
+      checkMeta(meta);
+      const readiness = await this.native.host.call('roles/readiness', { sessionId: binding.sessionId,
+        roles: [{ moduleId: 'assistant', roleId: binding.id }] });
+      requireFact(readiness.sessionId === binding.sessionId && readiness.ready === true
+        && readiness.loaded === true && readiness.rolesNeedReload === false
+        && readiness.appliedRoles?.some(r => r.moduleId === 'assistant' && r.roleId === binding.id),
+      'ROLE_NOT_READY', 'Role capability or applied role assembly is not confirmed');
+      checkMeta(await this.meta(binding.sessionId));
+      return this.service.db.transaction(() => {
+        const current = this.service.db.must('bindings', binding.id);
+        requireFact(matches(current), 'STALE_ROLE', 'Role changed during native readiness read');
+        current.ready = true;
+        current.evidence = { readiness, modelId: binding.modelId, checkedAt: this.service.now() };
+        this.service.db.put('bindings', current);
+        return current;
+      });
+    } catch (error) {
+      this.service.db.transaction(() => {
+        const current = this.service.db.get('bindings', binding.id);
+        if (current && matches(current)) {
+          current.ready = false;
+          current.evidence = { error: errorText(error), checkedAt: this.service.now() };
+          this.service.db.put('bindings', current);
+        }
+      });
+      throw error;
+    }
   }
   async authorize(identity: McpInvocationMeta, role: Role, epoch: number): Promise<void> {
     const binding = this.service.authorize(identity, role, epoch);

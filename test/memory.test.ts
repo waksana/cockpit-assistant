@@ -18,7 +18,7 @@ function fixture(t: TestContext) {
   };
   const message = (topicId: string, raw = 'Original evidence'): Message => db.transaction(() => {
     const sequence = db.next('messageSequence');
-    const value: Message = { id: `message-${sequence}`, kind: 'user', raw, version: 1, topicId,
+    const value: Message = { id: `message-${sequence}`, kind: 'user', raw, attachments: [], version: 1, topicId,
       assignmentVersion: 1, assignmentReason: 'Initial classification', sessionId: null,
       nativeEventId: null, nativeMessageId: null, nativeParentId: null, correlation: 'unknown',
       replyTo: null, historical: false, sequence, createdAt: sequence };

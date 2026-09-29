@@ -15,6 +15,13 @@ snapshot requires a fresh claim/read. Query existing receipts before inventing
 a new operation after an uncertain submission.
 
 Classify every user input and complete reception output, including questions.
+Read the complete immutable input content, including native attachment
+descriptions. Empty text with attachments is valid input, not an empty message.
+Descriptions identify persisted native inputs; they do not prove a model has
+read the files. Route the captured input version without stripping or replacing
+attachments. Do not copy attachments into memory or internal wake prompts.
+Native ask responses cannot carry attachments: clarify an unsupported answer,
+never turn it into an ordinary prompt to bypass the original decision.
 Topics are peers, not Tasks. Use an existing topic where appropriate; creating a
 topic needs its title and an explicit independence assessment. Reception
 directory entries distinguish collaborators from direct reception. Never route

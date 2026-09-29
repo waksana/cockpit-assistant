@@ -15,8 +15,6 @@
 .ca-content { padding: calc(2 * var(--ck-space)); }
 .ca-content > * + * { margin-top: calc(3 * var(--ck-space)); }
 .ca-composer { border-top: 1px solid var(--ck-color-border); }
-.ca-compose-row { display: flex; align-items: flex-end; gap: var(--ck-space); }
-.ca-draft { flex: 1 1 auto; min-width: 0; resize: none; max-height: 10rem; }
 .ca-composer p { margin: var(--ck-space) 0 0; }
 .ca-readiness { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ck-space) calc(2 * var(--ck-space)); }
 .ca-readiness > p { margin: 0; }
@@ -66,7 +64,6 @@
   .ca-composer { padding-bottom: max(var(--ck-space), env(safe-area-inset-bottom)); }
   .ca-facts { grid-template-columns: minmax(0, 1fr); gap: calc(.5 * var(--ck-space)); }
   .ca-facts dd { margin-bottom: var(--ck-space); }
-  .ca-compose-row { align-items: stretch; }
   .ca-message { padding-inline-start: var(--ck-space); }
 }
 @media (any-pointer: coarse) {

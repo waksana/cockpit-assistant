@@ -54,6 +54,22 @@ identities, classification versions, anchors, role epochs, leases, operation
 fingerprints, and effect/publication state are durable. Sequence cursors are
 database order, never UUID lexical order.
 
+User content includes native attachment descriptors alongside text. The
+immutable input receipt, message versions, work source and each delivery retain
+the same captured content, even if routing happens later or a target session
+does not yet exist when input is accepted. A correction/reclassification cannot
+silently replace pending attachments. Publication/timeline attachments come
+from the recorded content version, not a live draft. Native prompt dispatch
+passes those descriptors directly; preview URLs are not native paths.
+
+Attachment-only input is valid. The coordinator reads its descriptions through
+the existing work/message protocol; internal wakes and memory extraction do
+not receive copies of the files. Native ask answers reject attachments at both
+decision and dispatch boundaries, without stripping them or falling back to a
+prompt. Each target retains its independent delivery state, so another target's
+failure never replays an accepted one. Accepting a description is not proof a
+path remains readable or that a model supports or inspected its contents.
+
 There is deliberately no cross-system exactly-once claim. Before each native
 write, its fixed target and call intent are persisted:
 

@@ -2,6 +2,7 @@ import type { AssistantService } from './service.ts';
 import type { Message, Publication } from './types.ts';
 import type { InputReceipt, TimelineItem, TimelinePage } from './ui-types.ts';
 import { requireFact } from './errors.ts';
+import { inputSchema, withAttachments } from './attachments.ts';
 
 export function timelineItem(service: AssistantService, publication: Publication): TimelineItem {
   const { db } = service;
@@ -28,11 +29,17 @@ export function timeline(service: AssistantService, before: number | undefined,
 
 export function inputReceipt(service: AssistantService, requestId: string): InputReceipt {
   const operation = service.db.must('operations', `input:${requestId}`);
-  const original = operation.result as { message?: Message } | null;
+  const original = operation.result as { message?: Message; input?: unknown } | null;
   requireFact(original?.message?.id, 'INPUT_RECEIPT_INVALID', 'Input receipt has no durable message');
-  const message = service.db.must('messages', original.message.id);
+  const message = withAttachments(original.message);
   const work = service.db.forMessage('work', message.id);
   const deliveries = service.db.forMessage('deliveries', message.id);
-  return { requestId, message, work: work.items.filter(item => item.role === 'coordinator'),
+  // Older receipts saved only their original message snapshot, never the mutable current row.
+  const input = inputSchema.parse('input' in original ? original.input : {
+    requestId, text: message.raw, attachments: message.attachments,
+    ...(message.replyTo === null ? {} : { replyTo: message.replyTo }),
+    ...(message.topicId === null ? {} : { topicId: message.topicId }) });
+  requireFact(input.requestId === requestId, 'INPUT_RECEIPT_INVALID', 'Input receipt identity does not match');
+  return { requestId, input, message, work: work.items.filter(item => item.role === 'coordinator'),
     deliveries: deliveries.items, hasMore: { work: work.hasMore, deliveries: deliveries.hasMore } };
 }

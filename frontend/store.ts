@@ -1,8 +1,10 @@
 import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend';
 import { z } from 'zod';
-import type { InputReceipt, Readiness, SessionInspection, TimelineItem, TimelinePage } from '../src/ui-types.ts';
+import type { Readiness, SessionInspection, TimelineItem, TimelinePage } from '../src/ui-types.ts';
 import type { Operation, Role } from '../src/types.ts';
-import type { AssistantActions, SetupOperation, Snapshot, Submission } from './contracts.ts';
+import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts';
+import { createInput } from './input.ts';
+import { attachmentsSchema } from '../src/attachments.ts';
 
 const sequence = z.number().int().nonnegative().safe();
 const itemSchema = z.object({
@@ -15,6 +17,7 @@ const itemSchema = z.object({
   sessionId: z.string().nullable(),
   question: z.object({ state: z.enum(['pending', 'stale', 'answered', 'unknown']),
     choices: z.array(z.string()).optional(), allowFreeform: z.boolean().optional() }).nullable(),
+  attachments: attachmentsSchema.default([]),
 });
 const pageSchema = z.object({ items: z.array(itemSchema), before: sequence.nullable(),
   hasMore: z.boolean(), watermark: sequence, cursor: sequence.optional() });
@@ -78,14 +81,23 @@ export async function readPublications(response: Response, apply: (item: Timelin
   }
 }
 
-export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'signal' | 'report'>): AssistantActions {
+export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'signal' | 'report' | 'state'>): AssistantActions {
+  let notify = () => {};
+  const input = createInput(context, itemSchema, () => notify());
   let state: Snapshot = {
     open: false, items: [], hasOlder: false, loading: false, loadingOlder: false,
     stream: 'disconnected', error: null, readiness: null, checking: false, readinessError: null,
-    draft: { text: '', reply: null, revision: 0 }, submissions: [], setup: [],
+    draft: input.reference.getSnapshot(), reply: input.business().reply,
+    submissions: input.business().submissions, setup: [],
   };
   const listeners = new Set<() => void>();
   let disposed = false;
+  notify = () => {
+    if (disposed) return;
+    const { reply, submissions } = input.business();
+    state = { ...state, draft: input.reference.getSnapshot(), reply, submissions };
+    for (const listener of listeners) listener();
+  };
   let generation = 0;
   let readinessGeneration = 0;
   let lifetime: AbortController | null = null;
@@ -97,6 +109,9 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
   const update = (patch: Partial<Snapshot>) => {
     if (disposed) return;
     state = { ...state, ...patch };
+    input.update(state.open, !!state.readiness?.canSend && !state.checking && !state.readinessError
+      && (['coordinator', 'memory'] as const).every(role =>
+        state.readiness?.roles.some(entry => entry.role === role && entry.status === 'ready')), state.items);
     for (const listener of listeners) listener();
   };
   const current = (epoch: number) => !disposed && state.open && epoch === generation;
@@ -212,8 +227,6 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       if (current(epoch)) update({ loading: false, error: errorText(error) });
     }
   };
-  const setSubmission = (requestId: string, patch: Partial<Submission>) =>
-    update({ submissions: state.submissions.map(entry => entry.requestId === requestId ? { ...entry, ...patch } : entry) });
   const setOperation = (requestId: string, patch: Partial<SetupOperation>) =>
     update({ setup: state.setup.map(entry => entry.requestId === requestId ? { ...entry, ...patch } : entry) });
   const operate = async (path: string, prefix: string, label: string, value: Record<string, unknown>) => {
@@ -257,6 +270,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     if (state.open && !disposed) await refresh();
   };
   const store: AssistantActions = {
+    draft: input.reference,
     getSnapshot: () => state,
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
     open() {
@@ -270,52 +284,29 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       void refresh(true);
     },
     close() {
+      try { input.close(); }
+      catch (error) { update({ error: errorText(error) }); return; }
       ++generation;
       ++readinessGeneration;
       lifetime?.abort();
       stopStream();
       update({ open: false, checking: false, stream: 'disconnected' });
     },
-    edit(text) { update({ draft: { ...state.draft, text, revision: state.draft.revision + 1 } }); },
-    reply(item) { update({ draft: { ...state.draft, reply: item, revision: state.draft.revision + 1 } }); },
+    edit(text) {
+      try { input.edit(text); }
+      catch (error) { update({ error: errorText(error) }); }
+    },
+    reply(item) {
+      try { input.reply(item); }
+      catch (error) { update({ error: errorText(error) }); }
+    },
     async send() {
-      const draft = state.draft;
-      if (!draft.text.trim() || state.checking || !state.readiness?.canSend
-        || state.submissions.some(entry => entry.state === 'pending' || entry.state === 'unknown')) return;
-      const previous = state.submissions.find(entry => entry.revision === draft.revision && entry.state === 'error');
-      const requestId = previous?.requestId ?? id();
-      const submission: Submission = { requestId, revision: draft.revision, text: draft.text,
-        ...(draft.reply?.anchorId ? { replyTo: draft.reply.anchorId } : {}),
-        state: 'pending', detail: '正在保存输入；接受不代表会话已处理' };
-      if (previous) setSubmission(requestId, submission);
-      else update({ submissions: [...state.submissions, submission] });
-      try {
-        await post('/messages', { requestId, text: submission.text, ...(submission.replyTo ? { replyTo: submission.replyTo } : {}) });
-        setSubmission(requestId, { state: 'accepted', detail: '输入已持久保存，等待编排和投递；尚不代表完成' });
-        if (state.draft.revision === submission.revision) {
-          update({ draft: { text: '', reply: null, revision: state.draft.revision + 1 } });
-        }
-      } catch (error) {
-        setSubmission(requestId, { state: error instanceof RequestFailure && error.known ? 'error' : 'unknown',
-          detail: errorText(error) });
-        if (disposed) context.report(error);
-      }
+      try { await input.send(); }
+      catch (error) { update({ error: errorText(error) }); if (disposed) context.report(error); }
     },
     async inspectInput(requestId) {
-      const submission = state.submissions.find(entry => entry.requestId === requestId);
-      if (!submission) return;
-      try {
-        const receipt = await read<InputReceipt>(`/inputs/${encodeURIComponent(requestId)}`, context.signal);
-        setSubmission(requestId, { state: 'accepted', receipt, detail: receipt.deliveries.length
-          ? `输入已保存；投递：${receipt.deliveries.map(entry => entry.state).join('、')}（接受不代表完成）`
-          : '输入已保存，仍在等待编排或澄清；未观察到投递' });
-        if (state.draft.revision === submission.revision) {
-          update({ draft: { text: '', reply: null, revision: state.draft.revision + 1 } });
-        }
-      } catch (error) {
-        setSubmission(requestId, { detail: `回执暂不可确认：${errorText(error)}；保留原请求，不会重发` });
-        if (disposed) context.report(error);
-      }
+      try { await input.inspectInput(requestId); }
+      catch (error) { update({ error: errorText(error) }); if (disposed) context.report(error); }
     },
     async loadOlder() {
       if (!state.hasOlder || state.loadingOlder || !state.items.length) return;
@@ -359,7 +350,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
         return null;
       }
     },
-    dispose() { store.close(); disposed = true; listeners.clear(); },
+    dispose() { input.dispose(); store.close(); disposed = true; listeners.clear(); },
   };
   return store;
 }

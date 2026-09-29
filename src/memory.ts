@@ -79,6 +79,7 @@ export class MemoryEngine {
     if (duplicate) return duplicate;
     const work: Work = {
       id: randomUUID(), role: 'memory', kind, messageId: null, topicId,
+      attachments: [],
       inputVersion: this.db.meta(versionKey(topicId, kind), 0) + 1,
       stateVersion: this.db.meta('stateVersion', 0), sources, through,
       state: 'pending', epoch: null, token: null, leaseUntil: 0, result: null,

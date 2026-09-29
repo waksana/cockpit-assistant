@@ -6,11 +6,24 @@ import { MemoryEngine } from './memory.ts';
 import { configSchema, decisionSchema, inputSchema, rememberSchema } from './schema.ts';
 import type { Config, Decision, Proof } from './schema.ts';
 import type { Anchor, Binding, Delivery, Message, Publication, Question, Role, SourceRef, Topic, Work } from './types.ts';
+import { attachmentsSchema, withAttachments } from './attachments.ts';
+import type { NativeAttachment } from './attachments.ts';
 
 export const questionKey = (sessionId: string, requestId: string): string => fingerprint([sessionId, requestId]);
 export const ref = (message: Message): SourceRef => ({
   messageId: message.id, version: message.version, assignmentVersion: message.assignmentVersion,
 });
+
+export function askAnswer(request: AskRequest, text: string, attachments: NativeAttachment[]): boolean {
+  requireFact(attachments.length === 0, 'ASK_ATTACHMENTS_UNSUPPORTED',
+    'Native questions cannot accept attachments; choose a text answer or a different conversation');
+  const count = (request.choices ?? []).filter(choice => choice === text).length;
+  requireFact(count <= 1, 'AMBIGUOUS_CHOICE', 'Question has duplicate literal choices');
+  const freeform = count !== 1;
+  requireFact(!freeform || request.allowFreeform !== false,
+    'FREEFORM_FORBIDDEN', 'Answer must exactly match one original choice');
+  return freeform;
+}
 
 export class AssistantService {
   readonly memory: MemoryEngine;
@@ -35,19 +48,31 @@ export class AssistantService {
 
   accept(input: unknown): { message: Message; work: Work } {
     const value = inputSchema.parse(input);
-    return this.db.transaction(() => this.idempotent(`input:${value.requestId}`, value, () => {
+    // Empty descriptors have the same identity as pre-attachment text-only inputs.
+    const { attachments, ...textInput } = value;
+    const identity = attachments.length ? value : textInput;
+    const result = this.db.transaction(() => this.idempotent(`input:${value.requestId}`, identity, () => {
       if (value.replyTo) {
         const anchor = this.db.must('anchors', value.replyTo);
         this.reception(anchor.sessionId, true);
+        if (anchor.kind === 'ask') {
+          const question = this.db.must('questions', questionKey(anchor.sessionId, anchor.requestId!));
+          askAnswer(question.request, value.text, attachments);
+        } else if (attachments.length) {
+          requireFact(!this.db.find('questions', question => question.sessionId === anchor.sessionId
+            && question.state === 'pending').length, 'ASK_ATTACHMENTS_UNSUPPORTED',
+          'Native questions cannot accept attachments; do not bypass the pending question with a prompt');
+        }
       }
       if (value.topicId) this.db.must('topics', value.topicId);
       const message = this.addMessage({
-        kind: 'user', raw: value.text, topicId: value.topicId ?? null,
+        kind: 'user', raw: value.text, attachments, topicId: value.topicId ?? null,
         replyTo: value.replyTo ?? null,
       });
       const work = this.addWork(message);
-      return { message, work };
+      return { input: value, message, work };
     }));
+    return { message: withAttachments(result.message), work: withAttachments(result.work) };
   }
 
   addMessage(input: Partial<Message> & Pick<Message, 'kind' | 'raw'>): Message {
@@ -56,6 +81,7 @@ export class AssistantService {
       assignmentReason: null, sessionId: null, nativeEventId: null, nativeMessageId: null,
       nativeParentId: null, correlation: 'unknown', replyTo: null, historical: false,
       sequence: this.db.next('messageSequence'), createdAt: this.now(), ...input,
+      attachments: attachmentsSchema.parse('attachments' in input ? input.attachments : []),
     };
     this.db.put('messages', message);
     if (message.topicId) this.dirty(message.topicId, message.sequence);
@@ -65,6 +91,7 @@ export class AssistantService {
     const work: Work = {
       id: `message:${message.id}:${message.version}`, role: 'coordinator',
       kind: message.kind === 'user' ? 'input' : 'output', messageId: message.id,
+      attachments: attachmentsSchema.parse(message.attachments),
       topicId: message.topicId, inputVersion: message.version, stateVersion: this.version,
       sources: [ref(message)], through: message.sequence, state: 'pending', epoch: null,
       token: null, leaseUntil: 0, result: null,
@@ -76,6 +103,7 @@ export class AssistantService {
     const publication: Publication = {
       id: randomUUID(), sequence: this.db.next('publicationSequence'), messageId: null,
       topicId: null, anchorId: null, sources: [], createdAt: this.now(), ...input,
+      attachments: attachmentsSchema.parse('attachments' in input ? input.attachments : []),
     };
     this.db.put('publications', publication);
     return publication;
@@ -137,7 +165,7 @@ export class AssistantService {
         requireFact(message.version === work.inputVersion, 'STALE_INPUT', 'Message was corrected');
         const topic = this.classify(message, decision.topic, decision.reason, work.kind === 'input');
         if (work.kind === 'input') this.publish({ type: 'message', messageId: message.id,
-          topicId: topic.id, text: message.raw, sources: [ref(message)] });
+          topicId: topic.id, text: message.raw, attachments: message.attachments, sources: [ref(message)] });
         let result: unknown;
         switch (decision.action.kind) {
           case 'route':
@@ -214,6 +242,7 @@ export class AssistantService {
     let anchor: Anchor | undefined = message.replyTo ? this.db.must('anchors', message.replyTo) : undefined;
     if (action.answerQuestionId) {
       const question = this.db.must('questions', action.answerQuestionId);
+      askAnswer(question.request, message.raw, message.attachments);
       requireFact(!anchor || anchor.requestId === question.request.requestId && anchor.sessionId === question.sessionId,
         'ANCHOR_MISMATCH', 'Explicit reply anchor cannot be changed');
       if (!anchor) {
@@ -229,7 +258,7 @@ export class AssistantService {
       'ANCHOR_MISMATCH', 'Explicit replies stay bound to their original native object');
     const currentRoute = this.db.get('routes', topic.id);
     requireFact(action.routeVersion === (currentRoute?.version ?? 0), 'STALE_ROUTE', 'Topic reception route changed');
-    if (!anchor) {
+    if (anchor?.kind !== 'ask') {
       const pending = this.db.find('questions', q => q.state === 'pending');
       requireFact(!pending.some(q => action.sessionIds.includes(q.sessionId)),
         'PENDING_ASK', 'A reception has pending questions; bind an answer or clarify before ordinary routing');
@@ -253,12 +282,7 @@ export class AssistantService {
       if (anchor?.kind === 'ask') {
         const question = this.db.must('questions', questionKey(sessionId, anchor.requestId!));
         requireFact(question.state === 'pending', 'STALE_ASK', 'Original question is no longer pending');
-        const choices = question.request.choices ?? [];
-        const count = choices.filter(choice => choice === message.raw).length;
-        requireFact(count <= 1, 'AMBIGUOUS_CHOICE', 'Question has duplicate literal choices');
-        answerFreeform = count !== 1;
-        requireFact(!answerFreeform || question.request.allowFreeform !== false,
-          'FREEFORM_FORBIDDEN', 'Answer must exactly match one original choice');
+        answerFreeform = askAnswer(question.request, message.raw, message.attachments);
         requireFact(!this.db.find('deliveries', d => d.kind === 'ask' && d.sessionId === sessionId
           && d.requestId === anchor!.requestId && !['rejected', 'cancelled'].includes(d.state)).length,
         'ASK_IN_FLIGHT', 'An answer already exists for this native request');
@@ -275,6 +299,7 @@ export class AssistantService {
       }
       const delivery: Delivery = { id: randomUUID(), kind, messageId: message.id, sessionId,
         requestId, text: message.raw, supplement, answerFreeform, state: 'pending',
+        attachments: attachmentsSchema.parse(message.attachments),
         result: null, error: null, createdAt: this.now(), roleEpoch: null };
       this.db.put('deliveries', delivery);
       const exposureId = fingerprint([sessionId, topic.id]);
@@ -321,6 +346,7 @@ export class AssistantService {
     return this.publish({ type: message.kind === 'ask' ? 'question' : 'message',
       messageId: message.id, topicId: message.topicId,
       text: message.kind === 'ask' ? message.raw : text ?? message.raw,
+      attachments: message.attachments,
       anchorId: anchor.id, sources: [ref(message)] });
   }
   syncQuestions(sessionId: string, asks: AskRequest[], available: boolean): void {
@@ -361,11 +387,14 @@ export class AssistantService {
       });
     });
   }
-  correct(messageId: string, raw: string, expectedVersion: number, reason: string): Message {
+  correct(messageId: string, raw: string, expectedVersion: number, reason: string,
+    attachments?: NativeAttachment[]): Message {
     return this.db.transaction(() => {
       const message = this.db.must('messages', messageId);
       requireFact(message.version === expectedVersion, 'STALE_INPUT', 'Message version changed');
       requireFact(message.kind !== 'ask', 'NATIVE_ASK_IMMUTABLE', 'Native questions can only change through native control facts');
+      const corrected = inputSchema.parse({ requestId: messageId, text: raw,
+        attachments: attachments ?? message.attachments });
       const unfinished = this.db.find('work', w => w.messageId === messageId && (w.state === 'pending' || w.state === 'leased'));
       const hadDecision = this.db.find('work', w => w.messageId === messageId && w.state === 'done').length > 0;
       this.db.setMeta(`revision:${messageId}:${message.version}`, message);
@@ -373,6 +402,7 @@ export class AssistantService {
       this.memory.invalidate(messageId, reason);
       message.version++;
       message.raw = raw;
+      message.attachments = corrected.attachments;
       this.db.put('messages', message);
       this.memory.resumeAffected(message.id);
       for (const work of this.db.find('work', w => w.messageId === messageId && (w.state === 'pending' || w.state === 'leased'))) {

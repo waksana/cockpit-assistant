@@ -9,6 +9,7 @@ import { ref } from './service.ts';
 import { publicationStream } from './stream.ts';
 import { createTopicSession } from './topic-session.ts';
 import { inputReceipt, timeline, timelineItem } from './ui.ts';
+import { attachmentsSchema, withAttachments } from './attachments.ts';
 import { activateRolesSchema, bindingSchema, claimSchema, configSchema, createSessionSchema, createTopicSessionSchema, decisionSchema, enrollSchema,
   id, inputSchema, rememberSchema, role, roleReadSchema, text } from './schema.ts';
 import type { Delivery, Message, Table } from './types.ts';
@@ -52,7 +53,8 @@ const resolveSchema = requestSchema.extend({
 });
 const operationResolveSchema = resolveSchema.omit({ target: true });
 const retrySchema = requestSchema.extend({ evidence });
-const correctionSchema = requestSchema.extend({ expectedVersion: z.int().positive(), text, reason: evidence });
+const correctionSchema = requestSchema.extend({ expectedVersion: z.int().positive(),
+  text: z.string().max(100_000), attachments: attachmentsSchema.optional(), reason: evidence });
 const classifySchema = requestSchema.extend({
   expectedVersion: z.int().positive(), expectedAssignmentVersion: z.int().nonnegative(),
   topic: decisionSchema.shape.topic, reason: evidence,
@@ -313,7 +315,7 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
       const message = version === current.version ? current : db.meta<Message | null>(`revision:${messageId}:${version}`, null);
       requireFact(message, 'NOT_FOUND', 'Message version not found', 404);
       const correction = db.meta<{ reason: string; origin: string; at: number } | null>(`correction:${messageId}:${version}`, null);
-      return { message, correction };
+      return { message: withAttachments(message), correction };
     }),
     api('GET', '/messages/:id/assignments/:version', request => {
       z.strictObject({}).parse(request.query);
@@ -452,7 +454,7 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
       const messageId = pathSchema.parse(request.params).id;
       const value = correctionSchema.parse(request.body);
       return recorded('correct', value.requestId, { messageId, ...value },
-        () => service.correct(messageId, value.text, value.expectedVersion, value.reason));
+        () => service.correct(messageId, value.text, value.expectedVersion, value.reason, value.attachments));
     }),
     api('POST', '/messages/:id/reclassify', request => {
       const messageId = pathSchema.parse(request.params).id;

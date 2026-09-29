@@ -1,5 +1,5 @@
 import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend';
-import type { ComponentType, CSSProperties, FormEvent, KeyboardEvent } from 'react';
+import type { ComponentType, CSSProperties } from 'react';
 import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts';
 import type { Role } from '../src/types.ts';
 import type { TimelineItem } from '../src/ui-types.ts';
@@ -25,6 +25,9 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
   const { createElement: h, Fragment, useSyncExternalStore, useState, useRef, useLayoutEffect, useId } = context.react;
   const markdown = createMarkdown(context);
   const icon = createIcon(context);
+  const Composer = context.components.get('composer');
+  const PublicMessage = context.components.get('message');
+  const Attachment = context.components.get('attachment');
   const button = (text: string, onClick: () => void, disabled = false, extra: Record<string, unknown> = {}) =>
     h('button', { type: 'button', className: 'ck-button', onClick, disabled, ...extra }, text);
   const choices = (item: TimelineItem) => item.question?.state === 'pending' && item.question.choices?.length
@@ -92,7 +95,15 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
         h('strong', null, speaker),
         h('span', { className: 'ca-wrap' }, '来源：', item.sessionId ?? (item.speaker === 'user' ? '助手输入' : '系统')),
         h('time', { dateTime: validDate ? date.toISOString() : undefined }, validDate ? date.toLocaleString('zh-CN') : '时间未知')),
+      h(PublicMessage, { identity: { owner: 'assistant', id: item.id,
+        kind: 'message', role: item.speaker }, complete: true },
       markdown(item.text),
+      ...(item.attachments ?? []).map((attachment, index) => {
+        const label = attachment.displayName ?? (attachment.type === 'blob' ? attachment.mimeType
+          : attachment.type === 'selection' ? attachment.filePath : attachment.path);
+        return h(Attachment, { key: index, index, attachment, label,
+          children: h('p', { className: 'ca-wrap' }, label) });
+      })),
       item.question ? h('p', { className: 'ck-status-text' },
         '提问状态：', stateName(item.question.state),
         item.question.allowFreeform === false ? ' · 仅接受列出的选项' : null) : null,
@@ -108,7 +119,6 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
     const initialized = useRef(false);
     const previous = useRef<TimelineItem[]>([]);
     const anchor = useRef<{ id: string; offset: number } | null>(null);
-    const composing = useRef(false);
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [unread, setUnread] = useState(0);
     const id = useId();
@@ -179,18 +189,14 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
 
     const rolesReady = (['coordinator', 'memory'] as const).every(role =>
       snapshot.readiness?.roles.some(entry => entry.role === role && entry.status === 'ready'));
-    const unresolvedSend = snapshot.submissions.some(entry => entry.state === 'pending' || entry.state === 'unknown');
-    const pendingQuestion = snapshot.draft.reply?.question?.state === 'pending' ? snapshot.draft.reply.question : null;
+    const unresolvedSend = snapshot.draft.pending || snapshot.draft.unconfirmed;
+    const pendingQuestion = snapshot.reply?.question?.state === 'pending' ? snapshot.reply.question : null;
     const choiceRequired = pendingQuestion?.allowFreeform === false;
     const validAnswer = !choiceRequired || !!pendingQuestion?.choices?.includes(snapshot.draft.text);
     const canSend = !!snapshot.readiness?.canSend && rolesReady && !snapshot.checking
-      && !snapshot.readinessError && !unresolvedSend && !!snapshot.draft.text.trim() && validAnswer;
+      && !snapshot.readinessError && !unresolvedSend && snapshot.draft.hasContent && validAnswer
+      && snapshot.draft.submittable && !snapshot.draft.blocks.length;
     const send = () => { if (canSend) void store.send(); };
-    const keyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-      if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing || composing.current || event.keyCode === 229) return;
-      event.preventDefault();
-      send();
-    };
     const roleStatus = (role: Role) => {
       const readiness = snapshot.readiness?.roles.find(entry => entry.role === role);
       return h('div', { key: role, className: 'ca-role-status' },
@@ -246,32 +252,31 @@ export function createDialog(context: ModuleFrontendContext, store: AssistantAct
           !snapshot.loading && !snapshot.items.length && !snapshot.error ? h('p', { className: 'ck-text-secondary' }, '暂无对话。可先设置助手，输入内容会保留在草稿中。') : null,
           ...snapshot.items.map((item, index) => h(Message, { key: item.id, item,
             startsTopic: index === 0 || snapshot.items[index - 1]?.topicId !== item.topicId }))),
-        snapshot.draft.reply ? h('section', { className: 'ca-reply', 'aria-label': '当前回复引用' },
+        snapshot.reply ? h('section', { className: 'ca-reply', 'aria-label': '当前回复引用' },
           h('h3', { className: 'ck-heading' }, '正在回复：',
-            snapshot.draft.reply.topicId ? snapshot.draft.reply.topicTitle || '未命名话题' : '系统'),
-          h('p', { className: 'ck-status-text ca-wrap' }, '来源：', snapshot.draft.reply.sessionId ?? '系统',
-            ' · 引用：', snapshot.draft.reply.anchorId ?? snapshot.draft.reply.id),
-          markdown(snapshot.draft.reply.text),
-          !snapshot.items.some(item => item.id === snapshot.draft.reply?.id)
-            ? choices(snapshot.draft.reply) : null) : null,
+            snapshot.reply.topicId ? snapshot.reply.topicTitle || '未命名话题' : '系统'),
+          h('p', { className: 'ck-status-text ca-wrap' }, '来源：', snapshot.reply.sessionId ?? '系统',
+            ' · 引用：', snapshot.reply.anchorId ?? snapshot.reply.id),
+          markdown(snapshot.reply.text),
+          !snapshot.items.some(item => item.id === snapshot.reply?.id)
+            ? choices(snapshot.reply) : null) : null,
         snapshot.submissions.length ? h('section', { className: 'ca-operations', 'aria-label': '发送回执' },
           ...snapshot.submissions.map(submission => h(SubmissionCard, { key: submission.requestId, submission }))) : null)),
       h('footer', { className: 'ca-composer' },
         unread > 0 ? button(`${unread} 条新消息，查看最新`, bottom, false, { className: 'ck-button ca-new-messages' }) : null,
-        snapshot.draft.reply ? h('div', { className: 'ca-reply' },
+        snapshot.reply ? h('div', { className: 'ca-reply' },
           h('div', { className: 'ca-reply-heading' },
             h('strong', null, '已选择回复引用'),
             button('取消回复', () => store.reply(null))),
           choiceRequired ? h('p', { className: 'ck-input-hint' }, '此问题仅接受消息中列出的选项。') : null) : null,
-        h('form', { onSubmit: (event: FormEvent) => { event.preventDefault(); send(); } },
-          h('label', { htmlFor: `${id}-draft`, className: 'ck-input-hint' }, '消息'),
-          h('div', { className: 'ca-compose-row' },
-            h('textarea', { id: `${id}-draft`, className: 'ck-input ca-draft', rows: 3, value: snapshot.draft.text,
-              placeholder: '输入消息…', 'aria-describedby': `${id}-send-hint`,
-              onChange: (event: { currentTarget: HTMLTextAreaElement }) => store.edit(event.currentTarget.value),
-              onCompositionStart: () => { composing.current = true; }, onCompositionEnd: () => { composing.current = false; },
-              onKeyDown: keyDown }),
-            h('button', { type: 'submit', className: 'ck-button ck-primary', disabled: !canSend }, '发送')),
+        h('div', null,
+          choiceRequired ? h('div', { className: 'ca-choices' },
+            h('p', null, '已选：', validAnswer ? snapshot.draft.text : '请选择问题中的选项'),
+            button('发送选项', send, !canSend))
+            : h(Composer, { draft: store.draft, operation: 'prompt', disabled: !snapshot.draft.editable,
+              busy: snapshot.draft.pending, placeholder: '输入消息…', submitLabel: '发送',
+              sendBlocked: !snapshot.draft.submittable, onTextChange: store.edit, onSubmit: send }),
+          snapshot.draft.unconfirmed ? button('恢复原提交确认', () => { void store.inspectInput(''); }, snapshot.draft.pending) : null,
           h('p', { id: `${id}-send-hint`, className: 'ck-input-hint' },
             unresolvedSend ? '上次发送尚未确认，请检查发送回执；不会自动重发。'
               : !rolesReady || !snapshot.readiness?.canSend || snapshot.readinessError

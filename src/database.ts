@@ -4,9 +4,15 @@ import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import type { Table, Tables } from './types.ts';
 import { requireFact } from './errors.ts';
+import { withAttachments } from './attachments.ts';
 
 const tables: Table[] = ['topics', 'receptions', 'messages', 'anchors', 'questions', 'work',
   'bindings', 'deliveries', 'publications', 'memories', 'risks', 'routes', 'native', 'operations', 'exposures'];
+
+function record<T extends Table>(table: T, document: unknown): Tables[T] {
+  const value = JSON.parse(String(document)) as Tables[T];
+  return ['messages', 'work', 'deliveries', 'publications'].includes(table) ? withAttachments(value) : value;
+}
 
 export function fingerprint(value: unknown): string {
   const canonical = (v: unknown): string => {
@@ -70,7 +76,7 @@ export class Database {
   }
   get<T extends Table>(table: T, id: string): Tables[T] | undefined {
     const row = this.sql.prepare(`SELECT document FROM ${table} WHERE id=?`).get(id);
-    return row ? JSON.parse(String(row.document)) as Tables[T] : undefined;
+    return row ? record(table, row.document) : undefined;
   }
   must<T extends Table>(table: T, id: string): Tables[T] {
     const value = this.get(table, id);
@@ -87,7 +93,7 @@ export class Database {
     const rows = this.sql.prepare(`SELECT ordinal,document FROM ${table} WHERE ordinal>? ORDER BY ordinal LIMIT ?`)
       .all(after, limit + 1);
     const page = rows.slice(0, limit);
-    return { items: page.map(row => JSON.parse(String(row.document)) as Tables[T]),
+    return { items: page.map(row => record(table, row.document)),
       cursor: page.length ? Number(page[page.length - 1]!.ordinal) : after, hasMore: rows.length > limit };
   }
   find<T extends Table>(table: T, predicate: (item: Tables[T]) => boolean): Tables[T][] {
@@ -103,7 +109,7 @@ export class Database {
   publication(sequence: number): Tables['publications'] | undefined {
     const row = this.sql.prepare(`SELECT document FROM publications
       WHERE json_extract(document, '$.sequence')=? LIMIT 1`).get(sequence);
-    return row ? JSON.parse(String(row.document)) as Tables['publications'] : undefined;
+    return row ? record('publications', row.document) : undefined;
   }
   activeReceptions(): Tables['receptions'][] {
     const rows = this.sql.prepare(`SELECT document FROM receptions
@@ -124,7 +130,7 @@ export class Database {
     const field = messageId ? 'nativeMessageId' : 'nativeEventId';
     const row = this.sql.prepare(`SELECT document FROM messages WHERE json_extract(document, '$.sessionId')=?
       AND json_extract(document, '$.${field}')=? ORDER BY ordinal LIMIT 1`).get(sessionId, messageId ?? eventId);
-    return row ? JSON.parse(String(row.document)) as Tables['messages'] : undefined;
+    return row ? record('messages', row.document) : undefined;
   }
   publicationPage(direction: 'before' | 'after', cursor: number | undefined, limit: number) {
     requireFact((cursor === undefined || Number.isSafeInteger(cursor) && cursor >= 0)
@@ -137,7 +143,7 @@ export class Database {
       WHERE json_extract(document, '$.sequence') ${forward ? '>' : cursor === undefined ? '<=' : '<'} ?
       ORDER BY json_extract(document, '$.sequence') ${forward ? 'ASC' : 'DESC'} LIMIT ?`)
       .all(cursor ?? (forward ? 0 : watermark), limit + 1);
-    const items = rows.slice(0, limit).map(row => JSON.parse(String(row.document)) as Tables['publications']);
+    const items = rows.slice(0, limit).map(row => record('publications', row.document));
     if (!forward) items.reverse();
     return { items, before: items[0]?.sequence ?? null, hasMore: rows.length > limit, watermark,
       ...(forward ? { cursor: items.at(-1)?.sequence ?? cursor ?? 0 } : {}) };
@@ -147,7 +153,7 @@ export class Database {
       'PAGINATION', 'Use limit 1..100', 400);
     const rows = this.sql.prepare(`SELECT document FROM ${table}
       WHERE json_extract(document, '$.messageId')=? ORDER BY ordinal DESC LIMIT ?`).all(messageId, limit + 1);
-    return { items: rows.slice(0, limit).reverse().map(row => JSON.parse(String(row.document)) as Tables[T]),
+    return { items: rows.slice(0, limit).reverse().map(row => record(table, row.document)),
       hasMore: rows.length > limit };
   }
   meta<T>(key: string, fallback: T): T {

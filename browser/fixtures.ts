@@ -20,7 +20,7 @@ export function publication(sequence: number, text: string, patch: Partial<Timel
     id: `publication-${sequence}`, sequence, type: 'message', messageId: `message-${sequence}`,
     topicId: 'topic-a', topicTitle: '旅行计划 A', text, anchorId: `anchor-${sequence}`,
     sources: [], createdAt: 1_750_000_000_000 + sequence * 1000, speaker: 'assistant',
-    sessionId: 'synthetic-reception', question: null, ...patch,
+    sessionId: 'synthetic-reception', question: null, attachments: [], ...patch,
   };
 }
 export const older = [
@@ -85,7 +85,8 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
   await page.route('**/*', async route => {
     const url = new URL(route.request().url());
     const staticPath = ['/', '/host.js', '/host.css', '/_modules', '/favicon.ico'].includes(url.pathname)
-      || url.pathname.startsWith('/_modules/assets/assistant/');
+      || url.pathname.startsWith('/_modules/assets/assistant/')
+      || url.pathname.startsWith('/_modules/assets/synthetic-probe/');
     if (url.origin !== 'http://127.0.0.1:' + (process.env.ASSISTANT_BROWSER_PORT ?? '4179') || !staticPath) {
       seenUnexpected.push(url.href);
       await route.abort();
@@ -110,8 +111,10 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
         const requestId = String(body.requestId);
         receipts.set(requestId, {
           requestId,
+          input: structuredClone(body) as InputReceipt['input'],
           message: {
-            id: `input-${requestId}`, kind: 'user', raw: String(body.text), version: 1, topicId: null,
+            id: `input-${requestId}`, kind: 'user', raw: String(body.text), version: 1,
+            attachments: structuredClone(body.attachments ?? []) as InputReceipt['message']['attachments'], topicId: null,
             assignmentVersion: 0, assignmentReason: null, sessionId: null, nativeEventId: null,
             nativeMessageId: null, nativeParentId: null, correlation: 'unknown',
             replyTo: typeof body.replyTo === 'string' ? body.replyTo : null, historical: false,

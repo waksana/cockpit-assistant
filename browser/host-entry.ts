@@ -3,20 +3,28 @@ import { createRoot } from 'react-dom/client';
 import { ModuleRuntime } from '@fixture/runtime';
 import { ModuleRuntimeProvider, ModuleGlobalComponents } from '@fixture/components';
 import { AnchoredMenu } from '@fixture/menu';
+import { Composer } from '@fixture/composer';
+import { SessionDraft } from '@fixture/draft';
 
-const runtime = new ModuleRuntime({ report: error => {
+window.fixtureNativeSends = 0;
+const rejectNative = async () => {
+  window.fixtureNativeSends++;
+  throw new Error('Native submission must never handle an Assistant input');
+};
+const nativeDraft = new SessionDraft('synthetic-selected-session', localStorage);
+const runtime = new ModuleRuntime({ draftSubmission: { check: () => undefined, send: rejectNative }, report: error => {
   console.error(error);
   const report = document.createElement('p');
   report.setAttribute('role', 'alert');
   report.textContent = String(error);
   document.body.append(report);
 } });
+window.restartFixture = async () => { runtime.stop(); await runtime.start(); };
 
 function EmptyHomepage() {
   const trigger = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState(false);
   const [selected, setSelected] = useState(false);
-  const [draft, setDraft] = useState('');
   return h(ModuleRuntimeProvider, { runtime },
     h('header', { className: 'fixture-header' },
       h('strong', null, 'Cockpit'),
@@ -27,9 +35,11 @@ function EmptyHomepage() {
         moduleTarget: { menu: 'global' }, onClose: () => setMenu(false) }) : null),
     h('main', { 'data-testid': selected ? 'selected-session' : 'empty-homepage' },
       h('h1', null, selected ? '合成会话' : '没有选择会话'),
-      selected ? h('label', null, 'Cockpit 草稿',
-        h('textarea', { value: draft, onChange: (event: { currentTarget: HTMLTextAreaElement }) => setDraft(event.currentTarget.value) }))
-        : h('button', { type: 'button', className: 'ck-button', onClick: () => setSelected(true) }, '选择合成会话')),
+      selected ? h(Composer, { draft: nativeDraft, onSend: rejectNative })
+        : h('button', { type: 'button', className: 'ck-button', onClick: () => {
+          runtime.updateView({ sessionId: 'synthetic-selected-session', visible: true, connected: true });
+          setSelected(true);
+        } }, '选择合成会话')),
     h(ModuleGlobalComponents));
 }
 

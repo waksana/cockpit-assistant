@@ -1,4 +1,5 @@
 import type { AskRequest, NativeChatEvent } from '@waksana/cockpit-module-sdk/backend';
+import type { NativeAttachment } from './attachments.ts';
 
 export type Role = 'coordinator' | 'memory';
 export type EffectState = 'pending' | 'calling' | 'accepted' | 'rejected' | 'unknown' | 'cancelled';
@@ -34,6 +35,7 @@ export interface Message {
   id: string;
   kind: 'user' | 'reply' | 'ask' | 'system';
   raw: string;
+  attachments: NativeAttachment[];
   version: number;
   topicId: string | null;
   assignmentVersion: number;
@@ -67,6 +69,7 @@ export interface Work {
   role: Role;
   kind: 'input' | 'output' | 'memory' | 'handoff';
   messageId: string | null;
+  attachments: NativeAttachment[];
   topicId: string | null;
   inputVersion: number;
   stateVersion: number;
@@ -95,6 +98,7 @@ export interface Delivery {
   sessionId: string;
   requestId: string | null;
   text: string;
+  attachments: NativeAttachment[];
   supplement: string | null;
   answerFreeform: boolean | null;
   state: EffectState;
@@ -110,6 +114,7 @@ export interface Publication {
   messageId: string | null;
   topicId: string | null;
   text: string;
+  attachments: NativeAttachment[];
   anchorId: string | null;
   sources: SourceRef[];
   createdAt: number;
@@ -142,6 +147,7 @@ export interface NativeRecord {
   sessionId: string;
   event: NativeChatEvent;
   historical: boolean;
+  attachmentRetentionVersion?: 1;
 }
 export interface Operation {
   id: string;

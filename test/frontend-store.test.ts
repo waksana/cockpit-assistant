@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { setImmediate as turn } from 'node:timers/promises';
 import { createStore, readPublications } from '../frontend/store.ts';
 import type { Readiness, TimelineItem } from '../src/ui-types.ts';
+import { hostState } from './frontend-host.ts';
 
 const ready: Readiness = { canSend: true, roles: ['coordinator', 'memory'].map(role => ({
   role: role as 'coordinator' | 'memory', sessionId: role, epoch: 1, modelId: 'test', cwd: '/test',
@@ -13,7 +14,7 @@ const ready: Readiness = { canSend: true, roles: ['coordinator', 'memory'].map(r
 const item = (sequence: number, topicId = 'a'): TimelineItem => ({
   id: `p${sequence}`, sequence, type: 'message', text: `message ${sequence}`, messageId: `m${sequence}`,
   topicId, anchorId: `anchor${sequence}`, sources: [], createdAt: sequence * 1000,
-  topicTitle: topicId, speaker: 'assistant', sessionId: 'reception', question: null,
+  topicTitle: topicId, speaker: 'assistant', sessionId: 'reception', question: null, attachments: [],
 });
 const frame = (record: TimelineItem) =>
   `id: ${record.sequence}\nevent: publication\ndata: ${JSON.stringify(record)}\n\n`;
@@ -22,15 +23,22 @@ const deferred = <T>() => {
   const promise = new Promise<T>(yes => { resolve = yes; });
   return { promise, resolve };
 };
-function fixture(handler?: (path: string, init?: RequestInit) => Promise<Response> | Response | undefined) {
+async function fixture(handler?: (path: string, init?: RequestInit) => Promise<Response> | Response | undefined) {
   const requests: { path: string; init?: RequestInit }[] = [];
   const streams: ReadableStreamDefaultController<Uint8Array>[] = [];
   const errors: unknown[] = [];
   const controller = new AbortController();
-  const store = createStore({
+  const host = await hostState();
+  const inputs = new Map<string, unknown>();
+  const store = await host.activate(context => createStore({
+    state: context.state,
     signal: controller.signal, report: error => errors.push(error),
     request: async (path, init) => {
       requests.push({ path, init });
+      if (path === '/messages') {
+        const input = JSON.parse(String(init?.body));
+        inputs.set(input.requestId, input);
+      }
       const custom = handler?.(path, init);
       if (custom) return custom;
       if (path === '/readiness') return Response.json(ready);
@@ -40,14 +48,21 @@ function fixture(handler?: (path: string, init?: RequestInit) => Promise<Respons
       if (path.startsWith('/timeline')) return Response.json({
         items: [item(10)], before: 10, watermark: 10, hasMore: false,
       });
+      if (path.startsWith('/inputs/')) {
+        const requestId = path.split('/').at(-1)!;
+        return Response.json({ requestId, input: inputs.get(requestId), message: { id: `saved-${requestId}` },
+          work: [], deliveries: [], hasMore: { work: false, deliveries: false } });
+      }
       return Response.json({});
     },
-  });
+  }));
+  const dispose = store.dispose;
+  store.dispose = () => { dispose(); host.stop(); };
   return { store, requests, streams, errors, controller };
 }
 
 test('opening reads bounded tail and fresh readiness; closing aborts stream without clearing draft', async () => {
-  const f = fixture();
+  const f = await fixture();
   try {
     f.store.open(); await turn();
     assert.equal(f.store.getSnapshot().stream, 'connected');
@@ -66,7 +81,7 @@ test('opening reads bounded tail and fresh readiness; closing aborts stream with
 test('late read from a closed opening cannot replace current timeline or readiness', async () => {
   const pending = deferred<Response>();
   let first = true;
-  const f = fixture(path => {
+  const f = await fixture(path => {
     if (path === '/timeline?limit=50' && first) { first = false; return pending.promise; }
   });
   try {
@@ -79,7 +94,7 @@ test('late read from a closed opening cannot replace current timeline or readine
 });
 
 test('not-ready roles never post input and leave editing available', async () => {
-  const f = fixture(path => path === '/readiness' ? Response.json({ ...ready, canSend: false }) : undefined);
+  const f = await fixture(path => path === '/readiness' ? Response.json({ ...ready, canSend: false }) : undefined);
   try {
     f.store.open(); await turn(); f.store.edit('draft');
     await f.store.send();
@@ -90,7 +105,7 @@ test('not-ready roles never post input and leave editing available', async () =>
 
 test('accepted anchored send preserves edits made after capture, including across close and reopen', async () => {
   const pending = deferred<Response>();
-  const f = fixture(path => path === '/messages' ? pending.promise : undefined);
+  const f = await fixture(path => path === '/messages' ? pending.promise : undefined);
   try {
     f.store.open(); await turn(); f.store.reply(item(5, 'old-topic')); f.store.edit('old reply');
     const sending = f.store.send();
@@ -106,12 +121,8 @@ test('accepted anchored send preserves edits made after capture, including acros
 });
 
 test('network-unknown send keeps stable ID and text, blocks duplicate sends, and reconciles receipt', async () => {
-  const f = fixture(path => {
+  const f = await fixture(path => {
     if (path === '/messages') return Promise.reject(new Error('connection lost'));
-    if (path.startsWith('/inputs/')) return Response.json({
-      requestId: path.split('/').at(-1), message: { id: 'saved' }, work: [], deliveries: [],
-      hasMore: { work: false, deliveries: false },
-    });
   });
   try {
     f.store.open(); await turn(); f.store.edit('important');
@@ -128,22 +139,48 @@ test('network-unknown send keeps stable ID and text, blocks duplicate sends, and
   } finally { f.store.dispose(); }
 });
 
-test('known preflight rejection retries only the same logical ID without discarding draft', async () => {
-  const f = fixture(path => path === '/messages'
+test('known rejection preserves draft and only explicit new submission creates a new logical ID', async () => {
+  const f = await fixture(path => path === '/messages'
     ? Response.json({ error: { code: 'ROLES_NOT_READY', message: 'changed' } }, { status: 409 }) : undefined);
   try {
     f.store.open(); await turn(); f.store.edit('retry after refresh');
     await f.store.send(); await f.store.send();
     const requests = f.requests.filter(request => request.path === '/messages');
     assert.equal(requests.length, 2);
-    assert.equal(JSON.parse(String(requests[0]!.init!.body)).requestId,
+    assert.notEqual(JSON.parse(String(requests[0]!.init!.body)).requestId,
       JSON.parse(String(requests[1]!.init!.body)).requestId);
     assert.equal(f.store.getSnapshot().draft.text, 'retry after refresh');
   } finally { f.store.dispose(); }
 });
 
+test('a successful POST cannot ACK without a receipt matching the entire immutable input', async () => {
+  for (const field of ['missing-input', 'requestId', 'text', 'attachments', 'replyTo', 'topicId']) {
+    let captured!: Record<string, unknown>;
+    const f = await fixture((path, init) => {
+      if (path === '/messages') { captured = JSON.parse(String(init?.body)); return Response.json({ accepted: true }); }
+      if (!path.startsWith('/inputs/')) return;
+      const input = { ...captured };
+      if (field === 'attachments') input.attachments = [{ type: 'file', path: '/not-the-captured-file' }];
+      else if (field !== 'missing-input') input[field] = 'different';
+      return Response.json({ requestId: captured.requestId,
+        ...(field === 'missing-input' ? {} : { input }), message: { id: 'saved' }, deliveries: [] });
+    });
+    try {
+      f.store.open(); await turn();
+      f.store.reply(item(5)); f.store.edit('must survive');
+      await f.store.send();
+      assert.equal(f.store.getSnapshot().submissions[0]?.state, 'unknown', field);
+      assert.equal(f.store.getSnapshot().draft.text, 'must survive', field);
+      assert.equal(f.store.getSnapshot().reply?.anchorId, 'anchor5', field);
+      await f.store.inspectInput(String(captured.requestId));
+      await f.store.send();
+      assert.equal(f.requests.filter(request => request.path === '/messages').length, 1, field);
+    } finally { f.store.dispose(); }
+  }
+});
+
 test('binding HTTP rejection with unknown durable receipt cannot be repeated as a new operation', async () => {
-  const f = fixture(path => {
+  const f = await fixture(path => {
     if (path === '/roles/bind') return Response.json({ error: { code: 'ROLE_NOT_READY', message: 'preparation ran' } }, { status: 409 });
     if (path.startsWith('/operations/')) return Response.json({ id: decodeURIComponent(path.split('/').at(-1)!),
       state: 'unknown', fingerprint: 'x', result: null });
@@ -161,7 +198,7 @@ test('fresh opening captures bound role epochs before activation; late completio
   const pending = deferred<Response>();
   let readiness: Readiness = { ...ready, canSend: false,
     roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) };
-  const f = fixture(path => {
+  const f = await fixture(path => {
     if (path === '/readiness') return Response.json(readiness);
     if (path === '/roles/activate') return pending.promise;
   });
@@ -185,13 +222,13 @@ test('fresh opening captures bound role epochs before activation; late completio
     assert.equal(f.store.getSnapshot().setup[0]?.state, 'accepted');
     assert.equal(f.store.getSnapshot().readiness?.canSend, true);
     assert.equal(f.store.getSnapshot().draft.text, 'new draft');
-    assert.equal(f.store.getSnapshot().draft.reply?.topicId, 'retained-topic');
+    assert.equal(f.store.getSnapshot().reply?.topicId, 'retained-topic');
   } finally { f.store.dispose(); }
 });
 
 test('unknown activation never retries on refresh or reopen; exact receipt remains inspectable', async () => {
   let inspectionState = 'unknown';
-  const f = fixture((path, init) => {
+  const f = await fixture((path, init) => {
     if (path === '/readiness') return Response.json({ ...ready, canSend: false,
       roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
     if (path === '/roles/activate') return Response.json({ id: `activate:${JSON.parse(String(init?.body)).requestId}`,
@@ -219,7 +256,7 @@ test('unknown activation never retries on refresh or reopen; exact receipt remai
 test('stale readiness cannot activate a former carrier and unknown/invalid roles are not repaired', async () => {
   const delayed = deferred<Response>();
   let checks = 0;
-  const f = fixture(path => {
+  const f = await fixture(path => {
     if (path !== '/readiness') return;
     if (++checks === 1) return delayed.promise;
     return Response.json({ ...ready, canSend: false, roles: ready.roles.map((role, index) =>
@@ -239,7 +276,7 @@ test('stale readiness cannot activate a former carrier and unknown/invalid roles
 test('a confirmed carrier can be activated after a later unload without requiring the other role to be ready', async () => {
   const readiness: Readiness = { ...ready, canSend: false,
     roles: ready.roles.map((role, index) => ({ ...role, status: index ? 'invalid' : 'unloaded' })) };
-  const f = fixture((path, init) => {
+  const f = await fixture((path, init) => {
     if (path === '/readiness') return Response.json(readiness);
     if (path === '/roles/activate') {
       readiness.roles[0]!.status = 'ready';
@@ -261,7 +298,7 @@ test('a confirmed carrier can be activated after a later unload without requirin
 
 test('activation errors or malformed receipt IDs stay unknown when effect cannot be inspected', async () => {
   for (const malformed of [false, true]) {
-    const f = fixture(path => {
+    const f = await fixture(path => {
       if (path === '/readiness') return Response.json({ ...ready, canSend: false,
         roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
       if (path === '/roles/activate') return malformed
@@ -280,7 +317,7 @@ test('activation errors or malformed receipt IDs stay unknown when effect cannot
 });
 
 test('ready roles can submit with no separately enrolled receptions', async () => {
-  const f = fixture(path => path === '/readiness' ? Response.json({ ...ready, receptions: [] }) : undefined);
+  const f = await fixture(path => path === '/readiness' ? Response.json({ ...ready, receptions: [] }) : undefined);
   try {
     f.store.open(); await turn(); f.store.edit('automatic observation');
     await f.store.send();
@@ -290,7 +327,7 @@ test('ready roles can submit with no separately enrolled receptions', async () =
 
 test('SSE deduplicates applied publications and older pages merge without losing newly arrived messages', async () => {
   const older = deferred<Response>();
-  const f = fixture(path => {
+  const f = await fixture(path => {
     if (path === '/timeline?limit=50') return Response.json({ items: [item(10)], watermark: 10, before: 10, hasMore: true });
     if (path.startsWith('/timeline?before')) return older.promise;
   });
@@ -307,7 +344,7 @@ test('SSE deduplicates applied publications and older pages merge without losing
 });
 
 test('out-of-order SSE never advances cursor and reconnect backfills from last applied sequence', async () => {
-  const f = fixture(path => path === '/timeline?after=10&limit=100'
+  const f = await fixture(path => path === '/timeline?after=10&limit=100'
     ? Response.json({ items: [item(11), item(12)], watermark: 12, before: 11, hasMore: false, cursor: 12 }) : undefined);
   try {
     f.store.open(); await turn();

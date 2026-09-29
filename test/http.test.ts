@@ -481,7 +481,9 @@ test('explicit rejected wake retry creates one new logical delivery and preserve
     assert.equal(retry.kind, 'wake');
     assert.equal(retry.sessionId, original.sessionId);
     assert.equal(retry.roleEpoch, original.roleEpoch);
-    assert.equal(retry.text, original.text);
+    assert.ok(retry.text.includes(`wakeId=${retry.id}`));
+    assert.deepEqual(retry.wake, { claimedAt: null, leaseUntil: 0, drainedAt: null });
+    assert.equal(retry.preparation, undefined);
     assert.deepEqual(retry.result, { retryOf: original.id, evidence: value.evidence, requestId: value.requestId });
     assert.equal(retry.error, null);
     assert.deepEqual(f.db.must('deliveries', original.id), original);
@@ -495,6 +497,39 @@ test('explicit rejected wake retry creates one new logical delivery and preserve
     }, params)).status, 409);
     assert.deepEqual((f.db.must('operations', 'http:retry:retry-one').result as Delivery).result, retry.result);
     assert.equal(f.calls.length, 0);
+  } finally { f.close(); }
+});
+
+test('explicit preparation retry drains once and its predecessor cannot block future work', async () => {
+  const f = setup(true);
+  try {
+    const input = f.service.accept({ requestId: 'first', text: 'First' });
+    f.metas.get('coordinator')!.closing = true;
+    await f.runtime.wake();
+    f.advance(1001); await f.runtime.wake();
+    f.advance(2001); await f.runtime.wake();
+    const failed = f.db.find('deliveries', d => d.kind === 'wake')[0]!;
+    assert.equal(failed.state, 'rejected');
+    assert.equal(failed.preparation!.attempts, 3);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 0);
+    await f.runtime.wake();
+    assert.equal(f.db.find('deliveries', d => d.kind === 'wake').length, 1);
+    f.metas.get('coordinator')!.closing = false;
+    const response = await f.request('POST', '/effects/:id/retry',
+      { requestId: 'retry', evidence: 'Original carrier transition has completed; authorize one new notice' },
+      { params: { id: failed.id } });
+    const retry = response.body as Delivery;
+    await f.runtime.settled();
+    assert.equal(f.db.must('deliveries', retry.id).state, 'accepted');
+    assert.equal(f.db.must('deliveries', retry.id).preparation!.attempts, 1);
+    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id, retry.id)!;
+    f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'T', independent: true },
+      reason: 'Ambiguous goal', action: { kind: 'clarify', text: 'Which project?' } });
+    assert.equal(f.service.claim(f.identities.coordinator, 'coordinator', 1, undefined, retry.id), null);
+    f.service.accept({ requestId: 'later', text: 'Later work' });
+    await f.runtime.wake();
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 2);
+    assert.equal(f.db.must('deliveries', failed.id).state, 'rejected');
   } finally { f.close(); }
 });
 

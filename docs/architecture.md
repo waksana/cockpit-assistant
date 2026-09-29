@@ -36,6 +36,36 @@ input or complete the work. The coordinator reads the result and makes a separat
 validated route decision. Uncertain creation blocks another creation, including
 under a new request ID. Internal role sessions are never created automatically.
 
+## Coalesced role wakes
+
+Work records are the actual backlog; a wake only asks one role to drain it.
+Each `(role, bound session, epoch)` has at most one effective queued reminder.
+Pending, calling, accepted-but-unconsumed and unknown wakes occupy it even when
+the work set changes. Coordinator and memory slots are independent. No native
+queue is scanned, edited or cleared, and identical user text is not deduplicated.
+
+The notice carries its durable delivery ID as `wakeId`. The authenticated
+role passes it on `assistant_claim` and continues until an unfiltered claim
+returns null. That transaction releases only that exact notice while observing
+the work queue, closing the new-work/drain race. Native acceptance is not
+consumption. A claim without the ID still claims work but cannot release a
+queued reminder; this avoids mistaking an unrelated role turn for consumption.
+Only notices with recorded wake lifecycle facts participate in consumption.
+There is no old-data conversion, compatibility reminder, or native queue cleanup;
+unresolved native call uncertainty still prevents blind repetition.
+
+A nonempty claim refreshes a five-minute computational drain lease. If draining
+stops without an empty claim, the existing deadline timer can arrange one
+subsequent reminder for remaining work after that lease expires. An unconsumed
+accepted/unknown reminder still blocks further reminders; expiry never replays
+its native effect. A consumed unknown wake keeps its uncertain native receipt
+but has separate trusted consumption evidence. Old epoch claims cannot release
+new bindings. Stop/restart preserves the durable slot and drain facts.
+Pre-dispatch wake preparation is bounded like reception preparation but never
+automatically loads internal role carriers; exhausted or explicitly rejected
+wakes remain visible for the existing explicit wake recovery operation, rather
+than generating new reminder IDs on every event.
+
 ## Durable processing
 
 ```text
@@ -53,6 +83,34 @@ The database commit precedes an acceptance response. Message bodies, source
 identities, classification versions, historical anchors, role epochs, leases, operation
 fingerprints, and effect/publication state are durable. Sequence cursors are
 database order, never UUID lexical order.
+
+Routing commits an outbox decision, not successful delivery. For an ordinary
+target the outbox reads the exact native identity, uses existing-only
+`session/load` if unloaded, then rechecks identity, ordinary-role eligibility,
+loaded/closing state and the original native question. Loaded busy sessions use
+the existing `enqueue` path; preparation never reloads, interrupts, changes
+resources/models/cwd, or loads unrelated directory entries. A new reception's
+initial observation tail is established before dispatch when no prior gap exists.
+
+Each load attempt has a separate durable `delivery-load:<delivery>:<attempt>`
+operation. The delivery stays `pending` until the message call intent itself is
+committed. A lost load acknowledgment is not an unknown prompt: recovery first
+reads the same native ID and may continue the unsent message. Existing-only load
+can resume bounded preparation without creating a replacement. Transitions and
+unconfirmed preparation get at most three rounds, with persisted 1/2-second
+deadlines driven by the runtime's existing deadline timer. Restart preserves
+those facts. Shutdown stops further effects; an in-flight load may still finish.
+Missing, forbidden, non-reception or newly internal targets fail explicitly.
+
+Once all targets have definite terminal outcomes, a failed original input gets
+one computational recovery of the same work, with failed and accepted target
+facts. The coordinator can deliberately choose another valid target or clarify
+a genuine semantic restriction. Accepted targets are never resent, even if
+included in the new selection; pending/calling/unknown targets block rerouting.
+A second failed decision remains visible in the original input receipt, not an
+unbounded automatic decision loop. Changed input versions are not substituted
+for frozen deliveries. Local receipt inspection includes preparation and delivery
+errors without adding lifecycle chatter to the conversation.
 
 User content includes native attachment descriptors alongside text. The
 immutable input receipt, message versions, work source and each delivery retain
@@ -153,9 +211,10 @@ delivery as evidence and returns the same input work to pending with the observe
 question facts and their availability. A definitive native rejection
 also permits deliberate re-evaluation. Fresh lease/version checks and a new
 decision receipt are required; no automatic retarget or resend occurs. User
-publication is not duplicated by that recovery. Accepted, calling and unknown
-deliveries prevent rerouting the same message; unknown native effects never
-reopen work automatically. Ask text receives no risk warning or context suffix.
+publication is not duplicated by that recovery. Pending, calling and unknown
+deliveries prevent rerouting the same message; accepted destinations are skipped
+in an authorized partial-failure recovery. Unknown native effects never reopen
+work automatically. Ask text receives no risk warning or context suffix.
 
 There is no destructive migration. Historical `Message.replyTo`,
 `Publication.anchorId`, and anchors remain intact. New records retain null

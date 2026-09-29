@@ -5,7 +5,7 @@ import { fingerprint } from './database.ts';
 import { BusinessError, requireFact } from './errors.ts';
 import type { Runtime } from './runtime.ts';
 import type { AssistantService } from './service.ts';
-import { ref } from './service.ts';
+import { ref, wakeOccupies, wakeText } from './service.ts';
 import { publicationStream } from './stream.ts';
 import { createTopicSession } from './topic-session.ts';
 import { inputReceipt, timeline, timelineItem } from './ui.ts';
@@ -90,6 +90,7 @@ const toolDefinitions = [
       + 'Use your current bound role and epoch. Claim work first. Memory reads require a current leased workId and are restricted to its topic and versioned sources.' },
   { name: 'assistant_claim', schema: claimSchema,
     description: 'Claim one durable work item for the current ready main role and epoch. Save its token, inputVersion and stateVersion. '
+      + 'Pass the exact wakeId from your notice on each claim; drain with an unfiltered claim until null to release that notice. '
       + 'Read the input and relevant Assistant state, then submit one structured decision or memory result. Null means no work; do not invent work.' },
   { name: 'assistant_decide', schema: decisionSchema,
     description: 'Coordinator only: submit a structured classification and route, publish, clarify, or suppress decision for claimed work. '
@@ -434,14 +435,22 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
         const original = db.must('deliveries', effectId);
         requireFact(original.kind === 'wake' && original.state === 'rejected',
           'WAKE_RETRY_ONLY', 'Only explicitly rejected internal wakes can be retried');
-        requireFact(db.find('bindings', binding => binding.sessionId === original.sessionId
-          && binding.epoch === original.roleEpoch && binding.ready).length === 1,
+        const binding = db.find('bindings', binding => binding.sessionId === original.sessionId
+          && binding.epoch === original.roleEpoch && binding.ready)[0];
+        requireFact(binding,
         'STALE_ROLE', 'Wake no longer belongs to a ready current role session and epoch');
         requireFact(!db.meta<string | null>(`wakeRetry:${effectId}`, null),
           'WAKE_ALREADY_RETRIED', 'This rejected wake already has a successor; inspect that delivery instead');
-        const retry: Delivery = { ...original, id: `wake:retry:${randomUUID()}`, state: 'pending',
+        requireFact(!db.find('deliveries', delivery => delivery.kind === 'wake'
+          && delivery.sessionId === original.sessionId && delivery.roleEpoch === original.roleEpoch
+          && wakeOccupies(delivery, service.now())).length, 'WAKE_OCCUPIED', 'This role already has an effective wake');
+        const retryId = `wake:retry:${randomUUID()}`;
+        const retry: Delivery = { ...original, id: retryId, state: 'pending',
+          text: wakeText(binding.id, binding.epoch, retryId),
+          wake: { claimedAt: null, leaseUntil: 0, drainedAt: null },
           requestId: null, createdAt: service.now(), error: null,
           result: { retryOf: original.id, evidence: value.evidence, requestId: value.requestId } };
+        delete retry.preparation;
         db.put('deliveries', retry);
         db.setMeta(`wakeRetry:${effectId}`, retry.id);
         service.publish({ type: 'status', text: `Explicit wake retry ${retry.id} replaces rejected delivery ${original.id}. Evidence: ${value.evidence}` });
@@ -528,7 +537,7 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
                   case 'assistant_claim': {
                     const value = claimSchema.parse(call.arguments);
                     await runtime.authorize(identity, value.role, value.epoch);
-                    output = service.claim(identity, value.role, value.epoch, value.workId);
+                    output = service.claim(identity, value.role, value.epoch, value.workId, value.wakeId);
                     wake();
                     break;
                   }

@@ -257,10 +257,12 @@ test('recovered computation gets a new wake without replaying an earlier accepte
     const wakeCount = () => f.calls.filter(call => call.name === 'prompt'
       && (call.body as { sessionId: string }).sessionId === 'coordinator').length;
     assert.equal(wakeCount(), 1);
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
+    const wake = f.db.find('deliveries', d => d.kind === 'wake').at(-1)!;
+    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id, wake.id)!;
     f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'Project', independent: true },
       reason: 'Context selects this request', action: { kind: 'route', sessionIds: ['s1'],
         routeVersion: 0, answerQuestionId: q.id } });
+    assert.equal(f.service.claim(f.identities.coordinator, 'coordinator', 1, undefined, wake.id), null);
     f.metas.get('s1')!.ask = null;
     await f.runtime.wake();
     assert.equal(wakeCount(), 2);

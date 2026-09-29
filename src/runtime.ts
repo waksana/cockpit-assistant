@@ -2,10 +2,11 @@ import type { McpInvocationMeta, ModuleHostApi, NativeChatEvent, PublicSessionMe
 import { fingerprint } from './database.ts';
 import { BusinessError, errorText, requireFact } from './errors.ts';
 import { Ingestion } from './ingestion.ts';
-import { AssistantService, askAnswer, questionKey } from './service.ts';
+import { AssistantService, askAnswer, questionKey, wakeOccupies, wakeText } from './service.ts';
 import type { Binding, Delivery, Operation, Reception, Role } from './types.ts';
 import { activateRolesSchema, bindingSchema, createSessionSchema, enrollSchema, inputSchema } from './schema.ts';
 import type { Readiness, RoleReadiness, SessionInspection } from './ui-types.ts';
+import { recoverTopicObservations, topicObservationDeadlines } from './topic-session.ts';
 
 export interface HistoryPage {
   events: NativeChatEvent[];
@@ -44,7 +45,8 @@ export class Runtime {
       const page = await this.native.host.call('session/directory', { limit: 100, ...(cursor ? { cursor } : {}) });
       if (this.stopped) return;
       for (const session of page.sessions) {
-        await this.observe(session.sessionId);
+        try { await this.observe(session.sessionId); }
+        catch (error) { this.problem(`reception:${session.sessionId}`, error); }
         if (this.stopped) return;
         this.sessions.add(session.sessionId);
       }
@@ -91,6 +93,8 @@ export class Runtime {
           await this.consume(id);
         } catch (error) { this.problem(`reception:${id}`, error); }
       }
+      await recoverTopicObservations(this.service, this);
+      if (this.stopped) return;
       this.queueWorkers();
       for (const delivery of this.service.db.find('deliveries', d => d.state === 'pending')) {
         if (this.stopped) return;
@@ -106,6 +110,12 @@ export class Runtime {
     if (this.stopped) return;
     const deadlines = this.service.db.find('work', w => w.state === 'leased'
       && w.leaseUntil > this.service.now()).map(w => w.leaseUntil);
+    deadlines.push(...this.service.db.find('deliveries', d => d.state === 'pending'
+      && (d.preparation?.nextAttemptAt ?? 0) > 0).map(d => d.preparation!.nextAttemptAt));
+    deadlines.push(...this.service.db.find('deliveries', d => d.kind === 'wake'
+      && d.wake?.claimedAt !== null && d.wake?.drainedAt === null
+      && d.wake.leaseUntil > this.service.now()).map(d => d.wake!.leaseUntil));
+    deadlines.push(...topicObservationDeadlines(this.service));
     if (!deadlines.length) return;
     this.leaseTimer = setTimeout(() => {
       this.leaseTimer = null;
@@ -146,7 +156,7 @@ export class Runtime {
   }
   async observe(sessionId: string): Promise<void> {
     const meta = await this.meta(sessionId);
-    if (this.stopped) return;
+    requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before session observation');
     requireFact(!meta || meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
     const excluded = meta !== null && this.internal(meta);
     const { db } = this.service;
@@ -165,7 +175,7 @@ export class Runtime {
             delivery.state = 'cancelled';
             delivery.error = excluded ? 'Target is an internal role carrier' : 'Target no longer exists';
             db.put('deliveries', delivery);
-            this.recoverAnswerWork(delivery, delivery.error, null);
+            this.recoverDeliveryWork(delivery, null);
           }
           if (excluded) for (const work of db.find('work', item => item.state !== 'done'
             && !!item.messageId && db.get('messages', item.messageId)?.sessionId === sessionId)) {
@@ -675,6 +685,7 @@ export class Runtime {
       return existing;
     }
     db.transaction(() => {
+      requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before session creation');
       requireFact(db.find('operations', op => op.id.startsWith('create:')
         && (op.state === 'unknown' || op.state === 'calling')).length === 0,
         'UNRESOLVED_CREATE', 'Resolve uncertain native creation before creating another session');
@@ -691,6 +702,7 @@ export class Runtime {
         result: { error: errorText(error),
           ...('code' in detail && typeof detail.code === 'string' ? { code: detail.code } : {}),
           ...('sessionId' in detail && typeof detail.sessionId === 'string' ? { sessionId: detail.sessionId } : {}),
+          ...('createdId' in detail && typeof detail.createdId === 'string' ? { createdId: detail.createdId } : {}),
           ...('roleAssignment' in detail ? { roleAssignment: detail.roleAssignment } : {}) } }));
       throw error;
     }
@@ -702,45 +714,112 @@ export class Runtime {
         const pending = db.find('work', w => w.role === binding.id && (w.state === 'pending'
           || w.state === 'leased' && w.leaseUntil <= this.service.now()));
         if (!pending.length) continue;
-        const key = fingerprint([binding.id, binding.epoch, pending.map(w => [w.id, w.inputVersion,
-          w.state === 'leased' ? w.leaseUntil : 0,
-          ...(w.result && typeof w.result === 'object' && 'recovery' in w.result ? [fingerprint(w.result.recovery)] : [])])]);
-        const unresolved = db.find('deliveries', d => d.kind === 'wake' && d.sessionId === binding.sessionId
-          && d.roleEpoch === binding.epoch && (d.state === 'unknown' || d.state === 'calling'));
-        if (unresolved.length) continue;
-        if (db.get('deliveries', `wake:${key}`)) continue;
-        db.put('deliveries', { id: `wake:${key}`, kind: 'wake', messageId: null, sessionId: binding.sessionId,
+        const occupied = db.find('deliveries', d => d.kind === 'wake' && d.sessionId === binding.sessionId
+          && d.roleEpoch === binding.epoch && wakeOccupies(d, this.service.now()));
+        if (occupied.length) continue;
+        // A definite wake rejection is not permission to fill the native queue on every event.
+        const failed = db.find('deliveries', d => d.kind === 'wake' && d.sessionId === binding.sessionId
+          && d.roleEpoch === binding.epoch && d.state === 'rejected' && !d.wake?.claimedAt
+          && !db.meta<string | null>(`wakeRetry:${d.id}`, null));
+        if (failed.length) continue;
+        const id = `wake:${binding.id}:${binding.epoch}:${db.next('wakeSequence')}`;
+        db.put('deliveries', { id, kind: 'wake', messageId: null, sessionId: binding.sessionId,
           attachments: [],
-          requestId: null, text: `Assistant durable work is available. Role=${binding.id}, epoch=${binding.epoch}. `
-            + 'Use assistant_claim, read its input and current state, then submit through the role tool. '
-            + 'Drain pending work. This is an internal wake, not user authorization or a public reply.',
+          requestId: null, text: wakeText(binding.id, binding.epoch, id),
           supplement: null, answerFreeform: null, state: 'pending', result: null, error: null,
-          createdAt: this.service.now(), roleEpoch: binding.epoch });
+          createdAt: this.service.now(), roleEpoch: binding.epoch,
+          wake: { claimedAt: null, leaseUntil: 0, drainedAt: null } });
       }
     });
   }
-  private recoverAnswerWork(delivery: Delivery, reason: string, observed: PublicSessionMeta | null): void {
+  private recoverDeliveryWork(delivery: Delivery, observed: PublicSessionMeta | null): void {
     const { db } = this.service;
-    if (delivery.kind !== 'ask' || !delivery.messageId
-      || !['rejected', 'cancelled'].includes(delivery.state)) return;
+    if (delivery.kind === 'wake' || !delivery.messageId) return;
     const message = db.must('messages', delivery.messageId);
     const work = db.get('work', `message:${message.id}:${message.version}`);
-    if (!work || work.state !== 'done'
-      || db.find('deliveries', item => item.messageId === message.id
-        && !['rejected', 'cancelled'].includes(item.state)).length) return;
+    const outcomes = db.find('deliveries', item => item.messageId === message.id);
+    const failed = outcomes.filter(item => ['rejected', 'cancelled'].includes(item.state));
+    const recoveryKey = `delivery-recovery:${work?.id}`;
+    if (!work || work.state !== 'done' || work.kind !== 'input' || !failed.length
+      || db.meta(recoveryKey, false)
+      || outcomes.some(item => ['pending', 'calling', 'unknown'].includes(item.state))
+      || outcomes.some(item => (item.inputVersion ?? 1) !== message.version
+        || item.text !== message.raw || fingerprint(item.attachments) !== fingerprint(message.attachments))) return;
     const currentQuestions = observed?.decisions?.filter(item => item.kind === 'ask').map(item => item.request)
       ?? (observed?.ask ? [observed.ask] : []);
     work.state = 'pending';
     work.token = null;
     work.epoch = null;
     work.leaseUntil = 0;
-    work.result = { recovery: { deliveryId: delivery.id, reason,
+    work.result = { recovery: { deliveryId: delivery.id, reason: failed[0]!.error,
+      failures: failed.map(item => ({ deliveryId: item.id, sessionId: item.sessionId, reason: item.error, result: item.result })),
+      acceptedSessionIds: outcomes.filter(item => item.state === 'accepted').map(item => item.sessionId),
       questionObservation: observed?.loaded ? 'pre-dispatch' : 'unavailable', currentQuestions,
-      next: 'Read current questions and context, then decide again with a fresh lease and decision requestId. No native effect was accepted; do not automatically answer a replacement question.' } };
+      next: 'Preparation or dispatch definitively failed for the listed targets. Read the original input and current facts, then deliberately decide once with a fresh lease/requestId. Preserve accepted targets; never automatically answer a replacement question. Another failure remains visible without automatic routing loops.' } };
+    db.setMeta(recoveryKey, true);
     db.put('work', work);
     this.service.changed();
     this.sessions.add(delivery.sessionId);
     this.again = true;
+  }
+  private async prepareDelivery(delivery: Delivery): Promise<PublicSessionMeta | null> {
+    const { db } = this.service;
+    if (this.stopped || (delivery.preparation?.nextAttemptAt ?? 0) > this.service.now()) return null;
+    delivery.preparation = { attempts: (delivery.preparation?.attempts ?? 0) + 1,
+      nextAttemptAt: 0, error: null };
+    db.put('deliveries', delivery);
+    let meta = await this.meta(delivery.sessionId);
+    if (this.stopped) return null;
+    requireFact(meta, 'SESSION_MISSING', 'The selected session no longer exists; it was not recreated');
+    requireFact(meta.sessionId === delivery.sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
+    if (delivery.kind !== 'wake') {
+      requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Target now has an internal role identity');
+      this.service.reception(delivery.sessionId);
+    }
+    requireFact(!meta.closing, 'SESSION_TRANSITION', 'The selected session is closing');
+    if (!meta.loaded && delivery.kind !== 'wake') {
+      requireFact(delivery.preparation!.attempts <= 3, 'PREPARATION_EXHAUSTED', 'Bounded preparation attempts exhausted');
+      const key = `delivery-load:${delivery.id}:${delivery.preparation!.attempts}`;
+      const body = { sessionId: delivery.sessionId };
+      db.transaction(() => {
+        requireFact(db.must('deliveries', delivery.id).state === 'pending', 'EFFECT_CHANGED', 'Delivery changed during preparation');
+        delivery.preparation!.loadOperationId = key;
+        db.put('deliveries', delivery);
+        db.put('operations', { id: key, fingerprint: fingerprint(body), state: 'calling', result: null });
+      });
+      try {
+        const result = await this.native.host.call('session/load', body);
+        requireFact(result.ok && result.sessionId === delivery.sessionId,
+          'SESSION_MISMATCH', 'Load did not acknowledge the exact selected session');
+        db.put('operations', { id: key, fingerprint: fingerprint(body), state: 'accepted', result });
+      } catch (error) {
+        db.put('operations', { id: key, fingerprint: fingerprint(body), state: 'unknown',
+          result: { error: errorText(error), next: 'Read the exact session state before another existing-only load; no message call was made.' } });
+        throw error;
+      }
+      if (this.stopped) return null;
+      meta = await this.meta(delivery.sessionId);
+      if (this.stopped) return null;
+      requireFact(meta, 'SESSION_MISSING', 'The selected session disappeared during loading');
+      requireFact(meta.sessionId === delivery.sessionId, 'SESSION_MISMATCH', 'Host returned a different session after loading');
+      requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Target became an internal role carrier while loading');
+      this.service.reception(delivery.sessionId);
+    }
+    requireFact(meta.loaded && !meta.closing, 'SESSION_TRANSITION', 'The selected session is not yet loaded and available');
+    if (delivery.kind !== 'wake') {
+      const reception = this.service.reception(delivery.sessionId);
+      if (!reception.baseline && !reception.gap) {
+        await this.consume(delivery.sessionId);
+        if (this.stopped) return null;
+        meta = await this.meta(delivery.sessionId);
+        if (this.stopped) return null;
+        requireFact(meta?.sessionId === delivery.sessionId, 'SESSION_MISSING', 'Target disappeared while preparing observation');
+        requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Target changed role while preparing observation');
+        requireFact(meta.loaded && !meta.closing, 'SESSION_TRANSITION', 'Target changed availability while preparing observation');
+      }
+      db.put('receptions', { ...this.service.reception(delivery.sessionId), availability: 'loaded' });
+    }
+    return meta;
   }
   private async send(id: string): Promise<void> {
     const db = this.service.db;
@@ -755,7 +834,7 @@ export class Runtime {
       } else if (delivery.kind === 'ask') {
         const ask = asks.find(q => q.requestId === delivery.requestId);
         const stored = db.must('questions', questionKey(delivery.sessionId, delivery.requestId!));
-        requireFact(ask && stored.state === 'pending' && fingerprint(ask) === fingerprint(stored.request),
+        requireFact(ask && ['pending', 'unknown'].includes(stored.state) && fingerprint(ask) === fingerprint(stored.request),
           'STALE_ASK', 'The exact original native question is no longer pending');
         requireFact(askAnswer(ask, delivery.text, delivery.attachments) === delivery.answerFreeform,
           'ANSWER_CHANGED', 'Frozen answer mode does not match the original native question');
@@ -766,9 +845,9 @@ export class Runtime {
       }
     };
     try {
-      const meta = await this.meta(delivery.sessionId);
+      const meta = await this.prepareDelivery(delivery);
+      if (!meta) return;
       observed = meta;
-      requireFact(meta?.loaded && !meta.closing, 'SESSION_UNAVAILABLE', 'Native target is missing, unloaded, or closing');
       if (delivery.kind === 'wake') {
         const binding = db.find('bindings', b => b.sessionId === delivery.sessionId && b.epoch === delivery.roleEpoch)[0];
         requireFact(binding, 'STALE_ROLE', 'Wake belongs to a retired role epoch');
@@ -776,6 +855,8 @@ export class Runtime {
       } else {
         requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Target now has an internal role identity');
         this.service.reception(delivery.sessionId);
+        if (delivery.kind === 'prompt') db.transaction(() => this.service.syncQuestions(delivery.sessionId,
+          meta.decisions?.filter(item => item.kind === 'ask').map(item => item.request) ?? (meta.ask ? [meta.ask] : []), true));
       }
       validateAnswer(meta);
       if (this.stopped) return;
@@ -791,9 +872,25 @@ export class Runtime {
         db.put('deliveries', delivery);
       });
     } catch (error) {
+      if (this.stopped) return;
       db.transaction(() => {
         delivery = db.must('deliveries', id);
         if (delivery.state !== 'pending') return;
+        const code = error !== null && typeof error === 'object' && 'code' in error ? error.code : null;
+        const permanent = ['SESSION_MISSING', 'SESSION_MISMATCH', 'INTERNAL_TARGET', 'NOT_FOUND',
+          'RECEPTION_DISABLED', 'NOT_RECEPTION', 'FORBIDDEN', 'UNAUTHORIZED', 'EACCES', 'EPERM',
+          'STALE_ROLE', 'ROLE_CONFIGURATION', 'STALE_ASK', 'PENDING_ASK',
+          'ANSWER_CHANGED', 'FREEFORM_FORBIDDEN', 'INTERNAL_ATTACHMENTS',
+          'ASK_ATTACHMENTS_UNSUPPORTED', 'AMBIGUOUS_CHOICE',
+          'ATTACHMENTS_NOT_SUPPORTED', 'PREPARATION_EXHAUSTED'];
+        // Only preparation is retried. A calling/unknown message is never returned here.
+        if (!permanent.includes(String(code))
+          && delivery.preparation && delivery.preparation.attempts < 3) {
+          delivery.preparation.nextAttemptAt = this.service.now() + 1000 * delivery.preparation.attempts;
+          delivery.preparation.error = errorText(error);
+          db.put('deliveries', delivery);
+          return;
+        }
         delivery.state = 'rejected'; delivery.error = errorText(error);
         db.put('deliveries', delivery);
         if (delivery.kind === 'ask' && error instanceof BusinessError && error.code === 'STALE_ASK') {
@@ -803,7 +900,7 @@ export class Runtime {
             db.put('questions', question);
           }
         }
-        this.recoverAnswerWork(delivery, delivery.error, observed);
+        this.recoverDeliveryWork(delivery, observed);
         this.service.publish({ type: 'status', messageId: delivery.messageId, text: delivery.error });
       });
       return;
@@ -826,6 +923,8 @@ export class Runtime {
       state = 'unknown'; result = null; error = errorText(failure);
     }
     db.transaction(() => {
+      // A native tool call may have claimed/drained this wake before prompt returned.
+      delivery = db.must('deliveries', id);
       delivery.state = state; delivery.result = result; delivery.error = error;
       db.put('deliveries', delivery);
       if (delivery.kind === 'ask') {
@@ -833,9 +932,10 @@ export class Runtime {
         if (state === 'accepted') question.state = 'answered';
         if (state === 'unknown') question.state = 'unknown';
         db.put('questions', question);
-        if (state === 'rejected') this.recoverAnswerWork(delivery,
-          'Native answer was explicitly rejected; recheck the original request before deciding.', observed);
       }
+      if (state === 'rejected') delivery.error = `Native ${delivery.kind} explicitly rejected the original input`;
+      db.put('deliveries', delivery);
+      this.recoverDeliveryWork(delivery, observed);
       this.service.publish({ type: 'status', messageId: delivery.messageId,
         text: `Native ${delivery.kind} ${state}${error ? `: ${error}` : ''}. Acceptance is not proof the model read it.` });
     });

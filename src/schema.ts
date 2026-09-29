@@ -6,7 +6,7 @@ export const id = z.string().min(1).max(200);
 export const text = z.string().min(1).max(100_000);
 export const role = z.enum(['coordinator', 'memory']);
 export const source = z.strictObject({ messageId: id, version: z.int().positive(), assignmentVersion: z.int().nonnegative() });
-export const claimSchema = z.strictObject({ role, epoch: z.int().positive(), workId: id.optional() });
+export const claimSchema = z.strictObject({ role, epoch: z.int().positive(), workId: id.optional(), wakeId: id.optional() });
 export const proofSchema = z.strictObject({
   requestId: id, workId: id, epoch: z.int().positive(), token: id,
   inputVersion: z.int().positive(), stateVersion: z.int().nonnegative(),

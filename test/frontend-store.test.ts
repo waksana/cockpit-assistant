@@ -121,6 +121,31 @@ test('ordinary input omits replyTo and preserves newer edits across page navigat
   } finally { f.store.dispose(); }
 });
 
+test('input receipt inspection exposes preparation and delivery failures without resending input', async () => {
+  let input: Record<string, unknown>;
+  let failed = false;
+  const f = await fixture((path, init) => {
+    if (path === '/messages') input = JSON.parse(String(init?.body));
+    if (path.startsWith('/inputs/')) return Response.json({
+      requestId: input.requestId, input, message: { id: 'saved' },
+      deliveries: [failed
+        ? { state: 'rejected', error: 'The selected session no longer exists' }
+        : { state: 'pending', error: null, preparation: { error: 'The selected session is closing' } }],
+    });
+  });
+  try {
+    f.store.open(); await turn(); f.store.edit('Original');
+    await f.store.send();
+    const submission = f.store.getSnapshot().submissions[0]!;
+    assert.equal(submission.state, 'accepted', 'input persistence is distinct from native delivery');
+    assert.match(submission.detail, /closing/);
+    failed = true;
+    await f.store.inspectInput(submission.requestId);
+    assert.match(f.store.getSnapshot().submissions[0]!.detail, /no longer exists/);
+    assert.equal(f.requests.filter(request => request.path === '/messages').length, 1);
+  } finally { f.store.dispose(); }
+});
+
 test('a displayed choice-only question does not bind new natural input or disable its attachments', async () => {
   const question = { ...item(10), type: 'question', question: {
     state: 'pending', stateVersion: 1, choices: ['Proceed', 'Wait'], allowFreeform: false,

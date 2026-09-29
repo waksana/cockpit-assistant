@@ -1,15 +1,19 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { test } from 'node:test';
 import type { McpInvocationMeta } from '@waksana/cockpit-module-sdk/backend';
+import { Database } from '../src/database.ts';
 import { BusinessError } from '../src/errors.ts';
 import { routes } from '../src/http.ts';
-import type { Runtime } from '../src/runtime.ts';
+import { Runtime } from '../src/runtime.ts';
 import { activateRolesSchema, createTopicSessionSchema } from '../src/schema.ts';
+import { AssistantService } from '../src/service.ts';
 import { createTopicSession } from '../src/topic-session.ts';
 import { fixture, proof } from './fixtures.ts';
 
-function setup() {
-  const f = fixture();
+function setup(path = ':memory:') {
+  const f = fixture(path);
   const accepted = f.service.accept({ requestId: 'input', text: 'Start a new project in /synthetic/project' });
   const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, accepted.work.id)!;
   const input = { ...proof(work, 'creation'), cwd: '/synthetic/project',
@@ -81,25 +85,184 @@ test('uncertain native effects retain their original receipt and never recreate'
     assert.match(JSON.stringify(receipt.result), /Acknowledgement lost/);
     f.fail(null);
     assert.deepEqual(await f.create(), receipt);
+    f.service.recover();
+    f.db.put('bindings', { ...f.db.must('bindings', 'coordinator'), ready: true });
+    assert.deepEqual(await f.create(), receipt);
+    assert.equal(f.calls.filter(call => call.name === 'session/get').length, 0);
     await assert.rejects(f.create({ ...f.input, requestId: 'retry-unknown' }), { code: 'WORK_CREATE_RESERVED' });
     assert.equal(f.creates().length, 1);
   } finally { f.close(); }
 });
 
 test('partial native created IDs survive errors and observation failures never erase creation', async () => {
-  for (const partial of [false, true]) {
+  for (const partial of [null, 'createdId', 'sessionId'] as const) {
     const f = setup();
     try {
-      if (partial) f.fail(Object.assign(new Error('Created but later native step failed'), { createdId: 'new-synthetic' }));
+      if (partial) f.fail(Object.assign(new Error('Created but later native step failed'), { [partial]: 'new-synthetic' }));
       f.runtime.observe = async () => { throw new Error('Metadata unavailable'); };
       const receipt = await f.create();
       assert.equal(receipt.state, partial ? 'unknown' : 'accepted');
       assert.match(JSON.stringify(receipt.result), /"createdId":"new-synthetic"/);
       assert.match(JSON.stringify(receipt.result), /Metadata unavailable/);
       assert.deepEqual(await f.create(), receipt);
+      f.fail(null);
+      f.runtime.observe = f.actualRuntime.observe.bind(f.actualRuntime);
+      f.advance(1001);
+      const recovered = await f.create();
+      assert.equal(recovered.state, partial ? 'unknown' : 'accepted');
+      assert.deepEqual((recovered.result as { observation: unknown }).observation,
+        { state: 'observed', eligible: true, attempts: 2, nextAttemptAt: 0 });
+      assert.deepEqual(f.calls.filter(call => call.name === 'session/get').map(call => call.body),
+        [{ sessionId: 'new-synthetic' }]);
+      assert.deepEqual(f.db.must('operations', `topic-create-request:${f.input.requestId}`),
+        { ...recovered, id: `topic-create-request:${f.input.requestId}` });
+      assert.deepEqual(await f.create(), recovered);
+      assert.equal(f.db.must('work', f.input.workId).state, 'leased');
+      assert.equal(f.db.find('deliveries', () => true).length, 0);
       await assert.rejects(f.create({ ...f.input, requestId: 'recreate' }), { code: 'WORK_CREATE_RESERVED' });
       assert.equal(f.creates().length, 1);
     } finally { f.close(); }
+  }
+});
+
+test('concurrent observation recovery shares one read of the original created ID', async () => {
+  const f = setup();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let started!: () => void;
+  const observing = new Promise<void>(resolve => { started = resolve; });
+  try {
+    f.runtime.observe = async () => { throw new Error('Metadata unavailable'); };
+    await f.create();
+    f.advance(1001);
+    const observed: string[] = [];
+    f.runtime.observe = async sessionId => {
+      observed.push(sessionId);
+      started();
+      await gate;
+      await f.actualRuntime.observe(sessionId);
+    };
+    const first = f.create();
+    await observing;
+    const second = f.create();
+    await assert.rejects(f.create({ ...f.input, requestId: 'different' }), { code: 'WORK_CREATE_RESERVED' });
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.deepEqual(a, b);
+    assert.deepEqual(observed, ['new-synthetic']);
+    assert.equal(f.creates().length, 1);
+    assert.deepEqual((a.result as { observation: unknown }).observation,
+      { state: 'observed', eligible: true, attempts: 2, nextAttemptAt: 0 });
+  } finally { release(); f.close(); }
+});
+
+test('runtime deadline observes the original created ID without coordinator replay or another input', async () => {
+  const f = setup();
+  try {
+    let fail = true;
+    f.onGet(async id => {
+      if (id === 'new-synthetic' && fail) throw new Error('Temporary metadata failure');
+    });
+    await f.create();
+    assert.equal(f.db.get('receptions', 'new-synthetic'), undefined);
+    await f.actualRuntime.wake();
+    fail = false;
+    f.advance(1001);
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await f.actualRuntime.settled();
+    assert.equal(f.db.must('receptions', 'new-synthetic').enabled, true);
+    const receipt = f.db.must('operations', `topic-create:${f.input.workId}`);
+    assert.deepEqual((receipt.result as { observation: unknown }).observation,
+      { state: 'observed', eligible: true, attempts: 2, nextAttemptAt: 0 });
+    assert.equal(f.creates().length, 1);
+    assert.equal(f.db.must('work', f.input.workId).state, 'leased');
+    assert.equal(f.db.find('deliveries', d => d.kind !== 'wake').length, 0);
+  } finally { f.close(); }
+});
+
+test('created-session observation is bounded without fabricating eligibility or a second creation', async () => {
+  const f = setup();
+  try {
+    f.onGet(async id => {
+      if (id === 'new-synthetic') throw new Error('Persistent metadata failure');
+    });
+    await f.create();
+    await f.actualRuntime.wake();
+    f.advance(1001); await f.actualRuntime.wake();
+    f.advance(2001); await f.actualRuntime.wake();
+    f.advance(100_000); await f.actualRuntime.wake();
+    await f.create();
+    const observation = (f.db.must('operations', `topic-create:${f.input.workId}`).result as {
+      observation: { state: string; attempts: number; nextAttemptAt: number };
+    }).observation;
+    assert.equal(observation.state, 'failed');
+    assert.equal(observation.attempts, 3);
+    assert.equal(observation.nextAttemptAt, 0);
+    assert.equal(f.db.get('receptions', 'new-synthetic'), undefined);
+    assert.equal(f.creates().length, 1);
+  } finally { f.close(); }
+});
+
+test('restart hydrates incomplete topic receipts from durable native identity across reauthorization', async () => {
+  for (const topicState of ['calling', 'unknown'] as const) {
+    for (const nativeState of ['accepted', 'unknown'] as const) {
+      const path = `test/.topic-session-${randomUUID()}.db`;
+      const f = setup(path);
+      let originalClosed = false;
+      let db: Database | undefined;
+      let runtime: Runtime | undefined;
+      try {
+        if (nativeState === 'unknown') {
+          f.fail(Object.assign(new Error('Partial native acknowledgement'), { createdId: 'new-synthetic' }));
+        }
+        f.runtime.observe = async () => { throw new Error('Metadata unavailable'); };
+        const receipt = await f.create();
+        const result = receipt.result as Record<string, unknown>;
+        for (const id of [receipt.id, `topic-create-request:${f.input.requestId}`]) {
+          f.db.put('operations', { ...receipt, id, state: topicState,
+            result: { requestId: f.input.requestId, workId: f.input.workId, cwd: f.input.cwd,
+              reason: f.input.reason, nativeOperationId: result.nativeOperationId,
+              replayFingerprint: result.replayFingerprint, createdId: null,
+              observation: 'not_started', retryAllowed: false } });
+        }
+        f.fail(null);
+        f.close();
+        originalClosed = true;
+        db = new Database(path);
+        const service = new AssistantService(db, () => 1_001_000);
+        service.recover();
+        db.put('bindings', { ...db.must('bindings', 'coordinator'), ready: true, epoch: 2 });
+        runtime = new Runtime(service, f.native, () => {}, () => {});
+        const observed: string[] = [];
+        const recoveryRuntime: Pick<Runtime, 'authorize' | 'create' | 'observe'> = {
+          async authorize(identity, role, epoch) { service.authorize(identity, role, epoch); },
+          async create() { assert.fail('Recovery must never create another session'); },
+          async observe(sessionId) { observed.push(sessionId); await runtime!.observe(sessionId); },
+        };
+        const recover = (input = { ...f.input, epoch: 2 }) =>
+          createTopicSession(service, recoveryRuntime, f.identities.coordinator, input);
+        await assert.rejects(recover(f.input), { code: 'STALE_ROLE' });
+        await assert.rejects(recover({ ...f.input, epoch: 2, cwd: '/changed' }), { code: 'IDEMPOTENCY_CONFLICT' });
+        await assert.rejects(recover({ ...f.input, epoch: 2, token: 'changed' }), { code: 'IDEMPOTENCY_CONFLICT' });
+        const recovered = await recover();
+        assert.equal(recovered.state, nativeState);
+        assert.equal((recovered.result as { createdId: string }).createdId, 'new-synthetic');
+        assert.deepEqual((recovered.result as { observation: unknown }).observation,
+          { state: 'observed', eligible: true, attempts: 1, nextAttemptAt: 0 });
+        assert.deepEqual(await recover(), recovered);
+        assert.deepEqual(observed, ['new-synthetic']);
+        assert.equal(db.must('receptions', 'new-synthetic').enabled, true);
+        assert.equal(db.must('work', f.input.workId).state, 'leased');
+        assert.equal(db.find('deliveries', () => true).length, 0);
+        assert.equal(f.creates().length, 1);
+        await assert.rejects(recover({ ...f.input, epoch: 2, requestId: 'replacement' }), { code: 'WORK_CREATE_RESERVED' });
+      } finally {
+        if (!originalClosed) f.close();
+        runtime?.stop();
+        db?.close();
+        for (const suffix of ['', '-shm', '-wal']) rmSync(`${path}${suffix}`, { force: true });
+      }
+    }
   }
 });
 

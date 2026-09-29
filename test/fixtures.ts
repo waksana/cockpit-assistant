@@ -5,8 +5,8 @@ import { Runtime } from '../src/runtime.ts';
 import type { HistoryPage, NativeAccess } from '../src/runtime.ts';
 import type { Role } from '../src/types.ts';
 
-export function fixture() {
-  const db = new Database(':memory:');
+export function fixture(path = ':memory:') {
+  const db = new Database(path);
   let now = 1_000_000;
   const service = new AssistantService(db, () => now);
   const identities: Record<Role, McpInvocationMeta> = {
@@ -36,6 +36,9 @@ export function fixture() {
   const calls: { name: string; body: unknown }[] = [];
   let failure: Error | null = null;
   let onPrompt: (() => Promise<void>) | null = null;
+  let onLoad: ((sessionId: string) => Promise<void>) | null = null;
+  let onGet: ((sessionId: string) => Promise<void>) | null = null;
+  let onReadiness: ((sessionId: string) => Promise<void>) | null = null;
   const host: ModuleHostApi = {
     resourcePreparationVersion: 1,
     askResponseVersion: 1,
@@ -50,6 +53,7 @@ export function fixture() {
       switch (name) {
         case 'session/directory': result = { sessions: [...metas.values()] }; break;
         case 'session/load': {
+          if (onLoad) await onLoad(sessionId);
           if (failure) throw failure;
           const meta = metas.get(sessionId);
           if (!meta) throw new Error('Synthetic session does not exist');
@@ -57,8 +61,12 @@ export function fixture() {
           result = { sessionId, ok: true };
           break;
         }
-        case 'session/get': result = { meta: metas.get(sessionId) ?? null }; break;
-        case 'roles/readiness': result = {
+        case 'session/get':
+          if (onGet) await onGet(sessionId);
+          result = { meta: metas.get(sessionId) ?? null }; break;
+        case 'roles/readiness':
+          if (onReadiness) await onReadiness(sessionId);
+          result = {
           sessionId, ready: true, loaded: true, reasons: [], rolesNeedReload: false,
           roles: [{ moduleId: 'assistant', roleId: sessionId, moduleName: 'Assistant', name: sessionId }],
           appliedRoles: metas.get(sessionId)?.appliedRoles
@@ -108,6 +116,9 @@ export function fixture() {
     advance(ms: number) { now += ms; },
     fail(error: Error | null) { failure = error; },
     onPrompt(fn: (() => Promise<void>) | null) { onPrompt = fn; },
+    onReadiness(fn: ((sessionId: string) => Promise<void>) | null) { onReadiness = fn; },
+    onLoad(fn: ((sessionId: string) => Promise<void>) | null) { onLoad = fn; },
+    onGet(fn: ((sessionId: string) => Promise<void>) | null) { onGet = fn; },
     close() { runtime.stop(); db.close(); },
   };
 }

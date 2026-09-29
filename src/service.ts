@@ -25,6 +25,19 @@ export function askAnswer(request: AskRequest, text: string, attachments: Native
   return freeform;
 }
 
+export function wakeOccupies(delivery: Delivery, now: number): boolean {
+  return delivery.state === 'pending' || delivery.state === 'calling'
+    || delivery.state === 'unknown' && !delivery.wake
+    || ['accepted', 'unknown'].includes(delivery.state) && !!delivery.wake
+      && delivery.wake.drainedAt === null && (delivery.wake.claimedAt === null || delivery.wake.leaseUntil > now);
+}
+
+export function wakeText(role: Role, epoch: number, id: string): string {
+  return `Assistant durable work is available. Role=${role}, epoch=${epoch}. `
+    + `Use assistant_claim with wakeId=${id}, read its input and current state, then submit through the role tool. `
+    + 'Drain pending work. This is an internal wake, not user authorization or a public reply.';
+}
+
 export class AssistantService {
   readonly memory: MemoryEngine;
   constructor(readonly db: Database, readonly now: () => number = Date.now) {
@@ -111,12 +124,23 @@ export class AssistantService {
       'STALE_ROLE', 'Caller is not the ready current role epoch', 403);
     return binding;
   }
-  claim(identity: McpInvocationMeta, role: Role, epoch: number, workId?: string): Work | null {
+  claim(identity: McpInvocationMeta, role: Role, epoch: number, workId?: string, wakeId?: string): Work | null {
     return this.db.transaction(() => {
       this.authorize(identity, role, epoch);
+      const wake = wakeId ? this.db.must('deliveries', wakeId) : undefined;
+      if (wake) requireFact(wake.kind === 'wake' && wake.wake && wake.sessionId === identity.sessionId && wake.roleEpoch === epoch
+        && ['calling', 'accepted', 'unknown'].includes(wake.state),
+      'STALE_WAKE', 'Wake must belong to this exact role session and epoch, with a native call intent');
       const work = workId ? this.db.must('work', workId)
         : this.db.find('work', item => item.role === role && (item.state === 'pending'
           || (item.state === 'leased' && (item.epoch !== epoch || item.leaseUntil <= this.now()))))[0];
+      if (wake) {
+        requireFact(!work || wake.wake?.drainedAt == null, 'STALE_WAKE', 'This wake was already drained; use the current notice');
+        const now = this.now();
+        wake.wake = { claimedAt: wake.wake?.claimedAt ?? now, leaseUntil: now + 300_000,
+          drainedAt: !work && !workId ? now : wake.wake?.drainedAt ?? null };
+        this.db.put('deliveries', wake);
+      }
       if (!work) return null;
       requireFact(work.role === role && (work.state === 'pending'
         || (work.state === 'leased' && (work.epoch === epoch || work.leaseUntil <= this.now()))),
@@ -239,14 +263,19 @@ export class AssistantService {
     'ANCHOR_MISMATCH', 'Historical input retains its original native target');
     if (question) requireFact(action.sessionIds.length === 1 && action.sessionIds[0] === question.sessionId,
       'QUESTION_TARGET_MISMATCH', 'A native answer must target only the selected question session');
-    requireFact(!this.db.find('deliveries', delivery => delivery.messageId === message.id
-      && !['rejected', 'cancelled'].includes(delivery.state)).length,
+    const previous = this.db.find('deliveries', delivery => delivery.messageId === message.id);
+    const recovering = this.db.meta(`delivery-recovery:message:${message.id}:${message.version}`, false);
+    requireFact(!previous.some(delivery => ['pending', 'calling', 'unknown'].includes(delivery.state))
+      && (recovering || !previous.some(delivery => delivery.state === 'accepted')),
     'INPUT_ALREADY_ROUTED', 'Existing pending, accepted or uncertain deliveries must not be sent again');
+    const acceptedTargets = new Set(previous.filter(delivery => delivery.state === 'accepted').map(delivery => delivery.sessionId));
+    const targets = action.sessionIds.filter(sessionId => !acceptedTargets.has(sessionId));
+    requireFact(targets.length > 0, 'INPUT_ALREADY_ROUTED', 'All selected targets already accepted this input');
     const currentRoute = this.db.get('routes', topic.id);
     requireFact(action.routeVersion === (currentRoute?.version ?? 0), 'STALE_ROUTE', 'Topic reception route changed');
     if (!question) {
       const pending = this.db.find('questions', q => q.state === 'pending');
-      requireFact(!pending.some(q => action.sessionIds.includes(q.sessionId)),
+      requireFact(!pending.some(q => targets.includes(q.sessionId)),
         'PENDING_ASK', 'This reception has a pending native question; select its actual question when answering, otherwise wait or explain the target restriction');
     }
     const handoff = !legacyAnchor && !question && currentRoute
@@ -258,7 +287,7 @@ export class AssistantService {
       + handoffSources.map(item => `[${item.kind}; source=${item.id}; version=${item.version}; assignment=${item.assignmentVersion}]\n`
         + `${item.raw.slice(0, 1500)}${item.raw.length > 1500 ? '\n[Excerpt truncated; retrieve source for full text.]' : ''}`).join('\n\n') : null;
     const deliveries: Delivery[] = [];
-    for (const sessionId of action.sessionIds) {
+    for (const sessionId of targets) {
       this.reception(sessionId);
       let kind: Delivery['kind'] = 'prompt';
       let answerFreeform: boolean | null = null;
@@ -285,7 +314,7 @@ export class AssistantService {
       const delivery: Delivery = { id: randomUUID(), kind, messageId: message.id, sessionId,
         requestId, text: message.raw, supplement, answerFreeform, state: 'pending',
         attachments: attachmentsSchema.parse(message.attachments),
-        result: null, error: null, createdAt: this.now(), roleEpoch: null };
+        result: null, error: null, createdAt: this.now(), roleEpoch: null, inputVersion: message.version };
       this.db.put('deliveries', delivery);
       const exposureId = fingerprint([sessionId, topic.id]);
       if (!this.db.get('exposures', exposureId)) this.db.put('exposures', {

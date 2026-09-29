@@ -82,6 +82,18 @@ message/request IDs, literal `text`, optional `supplement`, `answerFreeform`,
 `unknown`, or `cancelled`. `accepted` means observed acceptance, not model reading,
 completion, or successful work.
 
+Deliveries retain `inputVersion` and the immutable input/attachment snapshot.
+Optional `preparation` records `attempts`, `nextAttemptAt`, `error`, and the
+latest `loadOperationId`; the exact `delivery-load:<deliveryId>:<attempt>`
+operation records loading separately from message dispatch. Existing ordinary
+targets are loaded only when needed and then rechecked for identity, roles and
+pending questions. Preparation is bounded to three attempts; its pending
+deadline is resumed by the runtime, not another user input. An uncertain
+message call remains `unknown` and is never automatically resent.
+Internal wake deliveries additionally record
+`wake:{claimedAt,leaseUntil,drainedAt}`; these are role-consumption facts, not
+native acceptance or queue inspection.
+
 ### Native attachment inputs
 
 `POST /messages` accepts SDK-native `file`, `directory`, `selection`, and `blob`
@@ -378,7 +390,8 @@ previous result; it does not call native APIs, roll back, or independently prove
 what happened. An unresolved creation blocks further creation. No automatic or
 API retry exists for business prompts/answers, including rejected ones.
 `/effects/:id/retry` accepts only a `wake` in `rejected` state for the same ready
-current role/epoch; each original gets at most one successor. It cannot retry
+current role/epoch with no other effective wake; each original gets at most one
+successor with fresh preparation and its own wake ID. It cannot retry
 accepted/unknown wakes or revive retired carriers.
 
 ## MCP role workflow
@@ -421,7 +434,12 @@ The result includes `createdId`, `nativeOperationId`, original native result,
 are separate facts: observation failure never erases a created session or permits
 recreation. Unknown and in-flight creations cannot be retried under a new ID.
 Only an explicit known rejection before native intent was reserved can permit
-a corrected request. Stable replay preserves the original receipt.
+a corrected request. Stable replay preserves the creation identity and may
+refresh its observation receipt when due, never issue another native create.
+Known created IDs are observed by the runtime using up to three durable
+attempts with existing deadline wakeups; this does not depend on coordinator
+replay. The observation records `attempts` and `nextAttemptAt` separately from
+native creation acceptance. Exhaustion preserves the ID and visible failure.
 
 Creation does not route input or complete work. Read the receipt through
 `assistant_read {resource:"receipts",workId,...}` (`sessionCreation`), then
@@ -430,11 +448,22 @@ The original work/epoch and native receipt remain auditable.
 
 ### Claim, read, and proof
 
-`assistant_claim` accepts `{role,epoch,[workId]}` and returns a work item or
+`assistant_claim` accepts `{role,epoch,[workId],[wakeId]}` and returns a work item or
 null. A claim lasts five minutes and includes `id`, `token`, `inputVersion`,
 `stateVersion`, `epoch`, `messageId`/`topicId`, frozen `sources`, and `through`.
 Reclaiming refreshes the token/snapshot; never reuse old proof afterward.
 Null means no claimable work, not delivery completion.
+
+Use the notice's `wakeId` on every claim in its drain, including the final
+unfiltered claim that returns null. The final empty claim atomically releases
+only that notice, so newly arriving work either joins the current drain or
+receives one later reminder. Claims without a wake ID remain valid but cannot
+release a possibly queued notice. Each role/session/epoch has at most one
+effective queued reminder; pending, calling, and unconsumed accepted/unknown
+receipts occupy it. Only a trusted claim starts the five-minute drain lease.
+Its expiry can schedule one follow-up, not repeated guesses about whether an
+unconsumed native prompt was delivered. This protocol does not migrate old
+notice records or infer their consumption.
 
 `assistant_read` accepts:
 
@@ -451,7 +480,8 @@ Coordinator work reads expose only its current unexpired leases; other resource
 reads cover Assistant-owned state. Memory reads require a current leased
 `workId` and allow only that work, its topic, exact current source messages, and
 valid memories whose sources fit the frozen set. Other resources are forbidden
-to memory except receipts. Filtered pages may be empty while `hasMore` is true:
+to memory except receipts.
+Filtered pages may be empty while `hasMore` is true:
 continue with the returned cursor.
 
 Receipt reads require exact `workId`, but not a live lease:

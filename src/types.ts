@@ -108,6 +108,15 @@ export interface Delivery {
   error: string | null;
   createdAt: number;
   roleEpoch: number | null;
+  inputVersion?: number;
+  wake?: { claimedAt: number | null; leaseUntil: number; drainedAt: number | null };
+  /** Preparation never implies that prompt/respondAsk was invoked. */
+  preparation?: {
+    attempts: number;
+    nextAttemptAt: number;
+    error: string | null;
+    loadOperationId?: string;
+  };
 }
 export interface Publication {
   id: string;

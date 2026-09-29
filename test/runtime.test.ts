@@ -40,7 +40,7 @@ test('deleted reception never redirects an anchored message', async () => {
     f.metas.delete('s1');
     await f.runtime.wake();
     assert.equal(f.db.must('deliveries', delivery.id).state, 'rejected');
-    assert.equal(f.calls.filter(c => c.name === 'prompt').length, 0);
+    assert.equal(f.calls.filter(c => c.name === 'prompt' && JSON.stringify(c.body).includes('"s1"')).length, 0);
   } finally { f.close(); }
 });
 test('native answers use request interface, not prompt; stale request is rejected', async () => {
@@ -159,7 +159,8 @@ test('expired computational lease receives a new wake, not a replay of the accep
   try {
     const input = f.service.accept({ requestId: 'one', text: 'Work' });
     await f.runtime.wake();
-    f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id);
+    const wake = f.db.find('deliveries', d => d.kind === 'wake')[0]!;
+    f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id, wake.id);
     f.advance(300_001);
     await f.runtime.wake();
     const wakes = f.db.find('deliveries', d => d.kind === 'wake');

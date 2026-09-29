@@ -6,7 +6,11 @@ send native user messages, create sessions, answer questions, write files or
 storage, use shell tools, or publish prose. These instructions are behavioral
 constraints, not an operating-system sandbox.
 
-Claim work using the epoch from the internal wake. The backend freezes topic,
+Claim work using the epoch and exact `wakeId` from the internal wake. Keep that
+ID on every claim, including the final unfiltered claim returning null, then
+stop. This acknowledges and drains only that notice; new work is merged while
+you are processing. Never invent a new wake.
+Claims without wakeId do not acknowledge queued notices. The backend freezes topic,
 source message IDs, content/assignment versions, extraction boundary, and work
 version. Read only that work's allowed source set. Submit one atomic batch with
 the returned lease token and exact proof fields; cite exact supplied source

@@ -6,17 +6,19 @@ Assistant space and its `dataRoot/assistant.sqlite`. Use Linux and Node.js 24
 with built-in `node:sqlite`.
 
 The installed public SDK dependency is pinned to
-`@waksana/cockpit-module-sdk@0.7.0`, including the native methods used here.
+`@waksana/cockpit-module-sdk@0.9.0`, including the native methods used here.
 The host compatibility reference is commit
-[`0dcfd6688b4c01b3f29776ee804b901612a6ae9b`](https://github.com/waksana/cockpit/commit/0dcfd6688b4c01b3f29776ee804b901612a6ae9b),
-release `v0.0.0-rolling.21`; see its fixed
-[module contract](https://github.com/waksana/cockpit/blob/0dcfd6688b4c01b3f29776ee804b901612a6ae9b/docs/module-contract.md).
+[`4c1b9e31911e7a121faff13521552135b712f93f`](https://github.com/waksana/cockpit/commit/4c1b9e31911e7a121faff13521552135b712f93f),
+release `v0.0.0-rolling.23`;
+see its fixed
+[module contract](https://github.com/waksana/cockpit/blob/4c1b9e31911e7a121faff13521552135b712f93f/docs/module-contract.md).
 Activation requires `serviceReadyVersion`, `chatReadVersion`,
 `askResponseVersion`, `resourcePreparationVersion`, `roleAssignmentVersion`,
 `sessionDirectoryVersion`, and `sessionLoadVersion` all equal to `1`.
 Frontend activation separately requires Web API `3`, `publicComponentsVersion`
-and `draftOwnerVersion` `1`, `draftSubmissionVersion` `2`, `globalComponentVersion`,
-`menuVersion`, `uiVersion`, and `uiSurfaceVersion` all `1`, and host `createPortal`.
+and `draftOwnerVersion` `1`, `draftSubmissionVersion` `2`, `pageVersion`, `messagePresentationVersion`,
+`menuVersion`, `uiVersion`, and `uiSurfaceVersion` all `1`. The page is registered
+as `main` at `/modules/assistant/main`; navigation uses the public host bridge.
 Rolling publication is described in [releases](releases.md). Source merge and
 publication do not install/deploy or establish production/native-model
 end-to-end verification.
@@ -100,7 +102,9 @@ size or current readability of a referenced file or directory. Native loading
 can still reject a missing/inaccessible path or unsupported content.
 
 `GET /inputs/:requestId` includes `input`, the immutable normalized original
-`{requestId,text,attachments,replyTo?,topicId?}`. Reclassification/correction
+`{requestId,text,attachments,topicId?}`, with `replyTo?` retained only for
+historical accepted inputs. New `POST /messages` rejects `replyTo`, including
+null. Reclassification/correction
 cannot change that receipt. Compare the complete input before reconciling an
 uncertain browser submission; never repost or replace its ID. Native ask
 answers cannot contain attachments, including when a route attempts to answer
@@ -196,7 +200,7 @@ the normal role setup flow:
    second enrollment. All ordinary sessions are direct reception targets under
    the current policy; legacy disabled/collaborator state is normalized when
    that session is observed again. No ordinary session is loaded just to observe
-   it. A coordinator can request an ordinary session for a current unanchored
+   it. A coordinator can request an ordinary session for a current ordinary
    input using the dedicated creation tool; it cannot create internal carriers.
 
 4. With both bound roles freshly ready, submit user input through `POST /messages`:
@@ -232,6 +236,41 @@ is descriptive, not literal JSON. `role` is `coordinator | memory`.
 The UI's bounded recent/upward timeline, enriched stream, fresh readiness and
 exact receipts are documented in [interface API additions](interface.md#backend-additions).
 The table routes below retain their original forward-pagination semantics.
+
+The enriched `/timeline`, `/timeline/items/:sequence`, and `/timeline/stream`
+project current conversation content without rewriting publication history.
+For a `message`, `question`, `correction`, or `status` with an existing source
+message, `TimelineItem` includes optional
+`revision: {version: number, text: string, attachments: NativeAttachment[]}`.
+This is the current content version, not a new publication or native effect.
+An ordinary message whose content version exceeds its matching publication
+source version projects the current original text and attachments. Otherwise
+its published text remains intact, including a coordinator summary; assignment
+changes alone do not replace a summary. A question projects the native
+`request.question`, with choices and freeform restrictions retained in the
+separate `question` metadata, not appended as internal template text.
+That metadata includes `stateVersion: number`, independent of content
+`revision.version` and publication sequence. Compare question snapshots by
+`stateVersion`: a freshly read older publication can contain a newer question
+state than a cached later status item. Newly stored questions start at 1; each
+actual state transition increments the persisted counter atomically. Saving
+the same state does not increment it, and caller-supplied stale counters cannot
+roll it back. Legacy questions with no counter read as 0 without a GET write or
+schema migration; their next state transition advances from 0. This adds no
+publication, wake, or native behavior.
+
+Correction/status items retain their own notification text while their
+`revision` allows a chat-only client to update an older visible message, even
+when that message is loaded later through pagination. A same-version snapshot
+must not overwrite a newer published summary. Clarifications have no `revision`
+and retain their own question text rather than their source user's wording.
+Known coordinator/memory carrier sources and system messages project as
+`speaker: "system"`; ordinary reception history is not relabeled simply because
+its reception is disabled or missing. These projections do not filter sequence
+records or change watermarks, work, deliveries, or wake behavior. Clients must
+consume hidden system records while rendering only conversation content.
+The plain `/publications`, `/history`, `/events`, and `/events/stream` remain
+the immutable publication log, without these projection fields.
 
 | Method/path | Query and result |
 | --- | --- |
@@ -304,7 +343,7 @@ editing installed config does not overwrite the initialized store on restart.
 
 | Method/path | Body besides `requestId` |
 | --- | --- |
-| `POST /messages` | `text`, `[attachments]` (native descriptors), `[replyTo]` (publication anchor ID), `[topicId]` (existing topic). |
+| `POST /messages` | `text`, `[attachments]` (native descriptors), `[topicId]` (existing topic context hint). `replyTo` is rejected. |
 | `POST /messages/:id/correct` | `expectedVersion`, `text`, `reason`; returns an operation receipt. |
 | `POST /messages/:id/reclassify` | `expectedVersion`, `expectedAssignmentVersion`, `topic` (schema below), `reason`. |
 | `POST /receptions/:id/recover` | `maxPages` (1–10), `acknowledgeGap:true`, `evidence`. |
@@ -368,8 +407,10 @@ and rechecked native model/directory/role readiness.
 
 `assistant_create_session` accepts the same current coordinator work proof as a
 decision, plus an explicit absolute `cwd` and nonempty `reason`. It is limited
-to a claimed ordinary user input: no historical/native output, anchored reply,
-or possible literal answer to a pending native question. If the required
+to a claimed ordinary user input, not historical/native output or a historical
+anchored input. Matching a pending question's option does not establish that
+the input answers it. The coordinator must not create a new recipient to bypass
+an identified question or its actual restrictions. If the required
 directory is unknown, the coordinator asks a clarification rather than inventing
 one. Native creation uses the host default model and no internal roles.
 
@@ -402,7 +443,10 @@ Null means no claimable work, not delivery completion.
 ```
 
 Resources are `work`, `receipts`, `topics`, `routes`, `receptions`, `messages`,
-`questions`, `memories`, and `deliveries`; optional `workId` selects scoped work.
+`questions`, `publications`, `memories`, and `deliveries`; optional `workId`
+selects scoped work. Publications include prior destination clarifications with
+their source message/topic, allowing the next natural input to continue that
+exchange without a user-selected anchor.
 Coordinator work reads expose only its current unexpired leases; other resource
 reads cover Assistant-owned state. Memory reads require a current leased
 `workId` and allow only that work, its topic, exact current source messages, and
@@ -464,10 +508,11 @@ most 20 existing topic IDs.
 
 Read routes through `assistant_read(resource:"routes")` or management
 `GET /routes`: each record is `{id:<topicId>,sessionIds,version,evidence}`.
-An absent route has version zero. An unanchored route decision records the
-targets and increments version; there is no separate route-update endpoint.
-Explicit replies retain their original target and do not replace the topic
-route. Changing reception schedules handoff work and includes bounded,
+An absent route has version zero. A new route decision records the targets and
+increments version; there is no separate route-update endpoint. A topic route
+is context, not a permanent target for future input. Historical accepted anchored
+inputs retain their frozen target rather than rewriting that old intent.
+Changing reception schedules handoff work and includes bounded,
 source-attributed historical context; it is not a topic switch or new user
 authorization. Background output classification never changes foreground.
 
@@ -481,19 +526,21 @@ work described succeeded; delivery/reply correlation remains unknown.
 
 Read `/questions` or scoped MCP questions for the exact native request:
 `requestId`, `question`, optional literal string `choices`, and `allowFreeform`.
-Published question text includes those choices and the free-text rule, and
-`anchorId` identifies the original question/session. Submit an answer as normal
-user input with that anchor:
+Published question text includes those choices and the free-text rule. Submit
+an answer, reservation, or follow-up as ordinary input without `replyTo`:
 
 ```json
-{"requestId":"answer-1","text":"Proceed","replyTo":"QUESTION_ANCHOR_ID"}
+{"requestId":"answer-1","text":"I agree with the approach; will it remain in the same application?"}
 ```
 
-The coordinator routes to that one original reception with the current topic
-route version. For unanchored input, `answerQuestionId` is an Assistant question
-record ID, not the native request ID, and is allowed only for one uniquely
-matching pending literal choice. Otherwise clarify; never guess authorization.
-Ordinary unanchored routing to a session with pending questions is rejected.
+The coordinator uses messages, recent topics, source sessions, publications and
+pending asks to select the recipient. `answerQuestionId` is the real Assistant
+question record ID, not a native request ID or invented user reply anchor. It
+selects that question and its one session even when the input is not an option
+or several questions coexist. Only a genuinely ambiguous destination calls for
+one short target clarification; do not re-ask business authorization or rewrite
+the user's opinion. A new topic is not bound to another session's pending ask.
+Ordinary prompts to the same session still respect its pending question.
 
 An exact unique choice sets native `wasFreeform:false`; other text sets true
 only if `allowFreeform !== false`. Duplicate literal choices are rejected.
@@ -501,6 +548,11 @@ Answers use native `respondAsk`, never a prompt, and retain literal text without
 context/risk suffixes. The runtime rechecks the original request immediately
 before answering; missing, changed, or stale questions cannot redirect to a new
 request. Acceptance is not proof of the subsequent model outcome.
+If dispatch rejects before an effect is accepted, the rejected delivery remains
+evidence and the original work returns to pending with recovery facts. A fresh
+lease and deliberate decision are required; the program does not automatically
+answer a replacement request, duplicate publication or discard the input.
+Accepted, calling and unknown native effects do not reopen for rerouting.
 
 ### Memory result
 

@@ -93,12 +93,14 @@ const toolDefinitions = [
       + 'Read the input and relevant Assistant state, then submit one structured decision or memory result. Null means no work; do not invent work.' },
   { name: 'assistant_decide', schema: decisionSchema,
     description: 'Coordinator only: submit a structured classification and route, publish, clarify, or suppress decision for claimed work. '
-      + 'Use the exact lease proof, a stable requestId, and current routeVersion. Explicit reply anchors cannot be redirected; native effects are queued durably, never blindly retried.' },
+      + 'Choose a topic/session or answerQuestionId from conversation context, not literal-choice matching. Read publications for earlier target clarifications. '
+      + 'Only clarify a genuinely uncertain recipient, never re-ask business authorization. Preserve the original text and attachments. '
+      + 'Use the exact lease proof, stable requestId and current routeVersion. Native effects are queued durably, never blindly retried.' },
   { name: 'assistant_remember', schema: rememberSchema,
     description: 'Memory role only: commit sourced confirmed, reported, or inferred entries for your claimed memory work. '
       + 'Use a stable requestId and exact lease proof; every source must match the claimed version and assignment. Never infer user confirmation from a report.' },
   { name: 'assistant_create_session', schema: createTopicSessionSchema,
-    description: 'Coordinator only: reserve one ordinary session creation for current leased unanchored user input when no suitable existing reception exists. '
+    description: 'Coordinator only: reserve one ordinary session creation for current leased user input when no suitable existing reception exists. Never bypass an identified native answer. '
       + 'Provide an explicit absolute cwd supported by user/task context and explain that evidence in reason; clarify if unknown. '
       + 'Uses the native default model, no internal roles, no automatic routing. Keep the exact request for replay; read receipts on uncertainty. '
       + 'After creation, claim and read fresh state before assistant_decide. Never replace an uncertain creation with a new request.' },
@@ -185,7 +187,7 @@ export function routes(service: AssistantService, runtime: Runtime): ModuleRoute
         requireFact(work.role === value.role, 'SOURCE_SCOPE', 'Receipt belongs to a different role', 403);
         return { workId: work.id, state: work.state, epoch: work.epoch, inputVersion: work.inputVersion,
           ...(value.role === 'coordinator' ? { sessionCreation: db.get('operations', `topic-create:${work.id}`) ?? null } : {}),
-          result: work.state === 'done' ? work.result : null };
+          result: work.result };
       }
       if (value.role === 'coordinator') {
         if (resource === 'work') {

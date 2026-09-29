@@ -165,6 +165,7 @@ export class Runtime {
             delivery.state = 'cancelled';
             delivery.error = excluded ? 'Target is an internal role carrier' : 'Target no longer exists';
             db.put('deliveries', delivery);
+            this.recoverAnswerWork(delivery, delivery.error, null);
           }
           if (excluded) for (const work of db.find('work', item => item.state !== 'done'
             && !!item.messageId && db.get('messages', item.messageId)?.sessionId === sessionId)) {
@@ -702,7 +703,8 @@ export class Runtime {
           || w.state === 'leased' && w.leaseUntil <= this.service.now()));
         if (!pending.length) continue;
         const key = fingerprint([binding.id, binding.epoch, pending.map(w => [w.id, w.inputVersion,
-          w.state === 'leased' ? w.leaseUntil : 0])]);
+          w.state === 'leased' ? w.leaseUntil : 0,
+          ...(w.result && typeof w.result === 'object' && 'recovery' in w.result ? [fingerprint(w.result.recovery)] : [])])]);
         const unresolved = db.find('deliveries', d => d.kind === 'wake' && d.sessionId === binding.sessionId
           && d.roleEpoch === binding.epoch && (d.state === 'unknown' || d.state === 'calling'));
         if (unresolved.length) continue;
@@ -717,10 +719,34 @@ export class Runtime {
       }
     });
   }
+  private recoverAnswerWork(delivery: Delivery, reason: string, observed: PublicSessionMeta | null): void {
+    const { db } = this.service;
+    if (delivery.kind !== 'ask' || !delivery.messageId
+      || !['rejected', 'cancelled'].includes(delivery.state)) return;
+    const message = db.must('messages', delivery.messageId);
+    const work = db.get('work', `message:${message.id}:${message.version}`);
+    if (!work || work.state !== 'done'
+      || db.find('deliveries', item => item.messageId === message.id
+        && !['rejected', 'cancelled'].includes(item.state)).length) return;
+    const currentQuestions = observed?.decisions?.filter(item => item.kind === 'ask').map(item => item.request)
+      ?? (observed?.ask ? [observed.ask] : []);
+    work.state = 'pending';
+    work.token = null;
+    work.epoch = null;
+    work.leaseUntil = 0;
+    work.result = { recovery: { deliveryId: delivery.id, reason,
+      questionObservation: observed?.loaded ? 'pre-dispatch' : 'unavailable', currentQuestions,
+      next: 'Read current questions and context, then decide again with a fresh lease and decision requestId. No native effect was accepted; do not automatically answer a replacement question.' } };
+    db.put('work', work);
+    this.service.changed();
+    this.sessions.add(delivery.sessionId);
+    this.again = true;
+  }
   private async send(id: string): Promise<void> {
     const db = this.service.db;
     let delivery = db.must('deliveries', id);
     if (delivery.state !== 'pending') return;
+    let observed: PublicSessionMeta | null = null;
     const validateAnswer = (meta: PublicSessionMeta): void => {
       const asks = meta.decisions?.filter(d => d.kind === 'ask').map(d => d.request) ?? (meta.ask ? [meta.ask] : []);
       if (delivery.kind === 'wake') {
@@ -741,6 +767,7 @@ export class Runtime {
     };
     try {
       const meta = await this.meta(delivery.sessionId);
+      observed = meta;
       requireFact(meta?.loaded && !meta.closing, 'SESSION_UNAVAILABLE', 'Native target is missing, unloaded, or closing');
       if (delivery.kind === 'wake') {
         const binding = db.find('bindings', b => b.sessionId === delivery.sessionId && b.epoch === delivery.roleEpoch)[0];
@@ -769,6 +796,14 @@ export class Runtime {
         if (delivery.state !== 'pending') return;
         delivery.state = 'rejected'; delivery.error = errorText(error);
         db.put('deliveries', delivery);
+        if (delivery.kind === 'ask' && error instanceof BusinessError && error.code === 'STALE_ASK') {
+          const question = db.must('questions', questionKey(delivery.sessionId, delivery.requestId!));
+          if (question.state === 'pending') {
+            question.state = 'stale';
+            db.put('questions', question);
+          }
+        }
+        this.recoverAnswerWork(delivery, delivery.error, observed);
         this.service.publish({ type: 'status', messageId: delivery.messageId, text: delivery.error });
       });
       return;
@@ -798,6 +833,8 @@ export class Runtime {
         if (state === 'accepted') question.state = 'answered';
         if (state === 'unknown') question.state = 'unknown';
         db.put('questions', question);
+        if (state === 'rejected') this.recoverAnswerWork(delivery,
+          'Native answer was explicitly rejected; recheck the original request before deciding.', observed);
       }
       this.service.publish({ type: 'status', messageId: delivery.messageId,
         text: `Native ${delivery.kind} ${state}${error ? `: ${error}` : ''}. Acceptance is not proof the model read it.` });

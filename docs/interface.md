@@ -3,29 +3,32 @@
 ## Entry and setup
 
 On a compatible host, choose **助手** in the global hamburger menu. This opens a
-near-viewport native dialog (full-screen layout on mobile), not browser
-Fullscreen mode. A public global component stays in the host React tree outside
-session routes; the menu only changes the module-owned visibility service.
+namespaced module page in Cockpit's existing SPA and React tree. The URL supports
+direct entry, refresh, and browser forward/back navigation. It is not a dialog,
+portal overlay, separate site, or second React root.
 The frontend uses a public owner draft, not a native-session draft or prompt
 sender. Its Composer, Message and Attachment components come from the same
-`context.components` entry as the host. The left arrow closes
-the native dialog and returns to the existing Cockpit view; it never navigates
-browser history or changes the selected host session. The single gear on the
-right toggles settings. Both actions use exact Lucide 1.46.0 nodes through host
-React, public `ck-icon-button` targets and `ck-icon ck-icon-lg` sizing, with
-accessible names and tooltips. The package includes the upstream Lucide license.
+`context.components` entry as the host. The left arrow navigates explicitly to
+Cockpit's home/session list; it never blindly goes back to an external history
+entry. Header controls use exact Lucide 1.46.0 nodes through host React, public
+`ck-icon-button` targets and `ck-icon ck-icon-lg` sizing. The package includes the
+upstream Lucide license.
 
 Each opening freshly checks the registered **coordinator** and **memory**
 sessions. Display names are exactly these role identifiers. Status distinguishes
-checking, unbound, unloaded, invalid, unknown and ready. History and draft editing
-remain available while sending is disabled.
+checking, unbound, unloaded, invalid, unknown and ready. Each role has a separate
+icon control with an accessible name and tooltip; keyboard or touch activation
+opens compact status details and passive refresh. The independent connection icon
+reports only SSE state, never role readiness. Normal status sentences do not
+occupy the reading area. History and draft editing remain available while
+sending is disabled.
 
 Choose coordinator or memory when creating a session or adding roles in Cockpit.
 The host's saved-role callback registers the carrier even when the role is not
-ready yet. Registration does not prove application or readiness. Settings explain
-this workflow and show status and receipts, not manual session-ID, creation,
-binding, reception-enrollment or default-scope forms. Existing explicit backend
-binding APIs remain available for recovery.
+ready yet. Registration does not prove application or readiness. There is no
+settings panel or manual session-ID, creation, binding, reception-enrollment or
+default-scope form. Unbound status details explain the normal role workflow.
+Existing explicit backend binding APIs remain available for recovery.
 
 When the fresh opening snapshot identifies an already-bound unloaded carrier,
 the frontend makes a separate `/roles/activate` mutation with a stable request ID
@@ -42,69 +45,105 @@ not ready.
 Unknown load state is not treated as unloaded or ready. Ordinary sessions are
 observed automatically; no reception enrollment is required.
 
-Activation retains the exact `activate:<requestId>` receipt through close/reopen.
+Activation retains the exact `activate:<requestId>` receipt through page navigation.
 Pending and unknown operations block a fresh automatic activation request.
-Receipt inspection uses `GET /operations/:id`, not another mutation. A completed
+Role status details expose receipt inspection through `GET /operations/:id`, not
+another mutation. A completed
 receipt is not readiness: the UI refreshes the passive readiness endpoint.
 Refresh itself never activates. An attempted binding vector is not automatically
 retried until its originally unloaded roles have subsequently been observed ready.
 
 ## Conversation
 
-Messages follow durable publication sequence, displaying the source speaker,
-session and recorded timestamp. Consecutive publications with the same topic
-form one titled block. A, B, A are three blocks, with the same stable topic
-accent for both A blocks. Titles, not color alone, identify topics. System
-publications without topics remain unassigned.
+An empty timeline is blank. There is no duplicate conversation heading, empty
+state paragraph, static message label, or permanent composer help text. Necessary
+loading indicators, actionable errors, questions, and their original options remain.
 
-Markdown is rendered as React elements with raw HTML kept as text. Script/data
-links are not navigation; images are represented as explicit links instead of
-unsolicited remote fetches. Fenced code, tables, lists and long text remain
-readable in both themes.
+The reading area is ordinary conversation, using the host's shared message
+presentation for user bubbles, assistant bodies, Markdown, timestamps and
+attachments. Topic and source-session metadata remain available to the backend,
+not displayed as titled blocks, colored borders or UUID labels.
 
-Use a message's reply action to select its immutable anchor; cancel the reference
-to return to an unanchored input. Native question choices and free-text limits
-remain visible. The backend rechecks the original question before answering.
-Topic changes never retarget an anchor. The shared Composer owns keyboard/IME
-behavior: desktop Enter submits, Shift+Enter inserts a line break; touch input
-keeps Enter for typing and supports the explicit send button. Choice-only
-questions expose selection controls instead of a free-text editor.
+Only user speech, user-facing assistant answers and necessary questions appear
+in the main flow. Internal role output, wake receipts, lifecycle status, risk and
+correction notices are not chat bubbles. Their durable records are not deleted.
+Corrections update the affected visible body and attachments in place; a later
+publication of the same source replaces its presentation without duplicating
+the message. Destination clarifications remain independent assistant questions.
+
+Markdown uses Chat's shared host renderer rather than an Assistant-specific
+parser or stylesheet. Fenced code, tables, lists and long text use the same
+semantics and presentation in both themes.
+
+Every new input is an ordinary message, without quote selection or `replyTo`.
+The coordinator uses recent conversation, topics, source sessions and actual
+pending questions to choose a recipient. It asks a short destination clarification
+only when the target is genuinely ambiguous, not to renegotiate the user's
+business decision. A topic change does not force a reply to an unrelated question.
+
+Native questions retain their recorded options and free-text limits. Choosing an
+option fills its exact text into the same Composer; it does not bind the next
+message to a hidden anchor or send it automatically. Other comments and follow-up
+questions can be entered normally. When routing to a native ask, the backend
+checks its real session/request identity and pending state, preserves the user's
+wording and respects native freeform/attachment restrictions. Accepting new input
+does not establish that a selected native route supports it.
+
+The shared Composer owns keyboard/IME behavior: desktop Enter submits,
+Shift+Enter inserts a line break; touch input keeps Enter for typing and supports
+the explicit send button. The editor remains the public Composer even when a
+displayed question accepts only listed options.
 
 The input is sent through Assistant's `/messages`, never the background native
 Chat. Public File/Speech enhancements attach to this same host-issued draft;
 Assistant does not import their stores, implement upload/recording UI, or
 fabricate a session ID. Text and attachment-only submissions follow the same
-adapter for buttons and captured Speech sends. Native questions disable
-attachments, and the backend also checks the decision and native send boundary.
+adapter for buttons and captured Speech sends. New messages can carry attachments
+before their destination is known. A native ask cannot receive attachments; the
+backend rejects that route without dropping attachments or silently sending a
+normal prompt instead.
 The backend freshly verifies both role bindings before accepting new input.
 Saved input waits for coordinator classification and durable dispatch. Accepted
 is neither proof of delivery nor proof the receiver completed its work. Receipt
 controls inspect current work/delivery state. Failures preserve input and IDs;
 unknown sends block another send until the original receipt is reconciled.
+The header receipt control exposes complete receipts and explicit inspection;
+unconfirmed failures also provide a visible recovery action.
 
 ## History and lifecycle
 
 Opening loads the latest 50 publications, then connects enriched full-message SSE
 from the loaded watermark. Earlier history is explicit bounded upward paging.
+When a history page contains only hidden diagnostic records, the same read
+continues through bounded older pages until conversation is found or history
+ends. An entirely diagnostic history leaves the conversation area blank.
 Duplicate stream records are ignored; an out-of-order record is not applied past
 the last known sequence. Reconnection reads ordered missing pages before resuming
-the stream. This never uses host chat history or reloads every table per message.
+the stream. Hidden publications still advance the raw sequence cursor, including
+system-only catch-up pages. This never uses host chat history or reloads every
+table per message.
 
 There is one main reading scroller. It initially positions at the latest content,
 preserves position when older items are prepended, and follows new messages only
 while the reader stays at the bottom. Otherwise a new-message action lets the
-reader choose to return. Refresh does not move keyboard focus.
+reader choose to return. Only newly visible conversation increments that count,
+not system records, corrections or repeated publications of an existing message.
+Refresh does not move keyboard focus.
 
-Closing aborts reads and the stream, not accepted writes, and does not retire
+Leaving the page aborts reads and the stream, not accepted writes, and does not retire
 the owner. It invalidates captured sends by advancing the business action
-revision. Changing the reply anchor also invalidates prior consent. Late results
-clear only captured text/field versions and a matching reply action revision;
-new text, attachments and reply selections survive.
+revision. The page's editor and enhancements unmount instead of hiding behind an
+overlay; a background Chat editor cannot receive its keyboard or captured sends.
+Late results clear only captured text/field versions; new text and attachments
+survive.
 
 The host persists the request ID, submission ID, complete immutable payload,
 schema checkpoints and settlement journal before network dispatch. Assistant's
-non-projecting business schema retains the reply and receipt index, not another
-text/revision store. Reload restores the original transaction as uncertain.
+non-projecting business schema retains lifecycle revision and receipt indices,
+not another text/revision store or a reply target. Old business drafts restore
+their text, attachments, lifecycle revision and receipts but discard the obsolete
+selected-reply UI state. Historical records and original accepted/unknown input
+identities are not rewritten. Reload restores the original transaction as uncertain.
 **Recover original submission** queries `/inputs/:requestId`, proves the complete
 original input, then settles the original transaction without another POST.
 Missing/mismatched receipts stay unknown. A failed field ACK is an incomplete
@@ -138,11 +177,14 @@ These module-relative routes supplement, not replace, existing `/history`,
 `before` and `after` cannot be combined. Limits are 1 through 100. `watermark`
 is the global highest publication sequence at that read, not proof the user read
 it. `TimelineItem` extends `Publication` with `topicTitle`, `speaker`, `sessionId`,
-native `attachments` and nullable `question` (`state`, optional `choices` and
-`allowFreeform`). Public message presentation uses an Assistant-owned identity;
+native `attachments`, a current source `revision` when available, and nullable
+`question` (`state`, `stateVersion`, optional `choices` and `allowFreeform`).
+Question snapshots merge by their durable state version rather than publication
+order, so newly read older pages cannot be overridden by a cached stale status.
+Public message presentation uses an Assistant-owned identity;
 it never uses a publication ID as a native message ID. Topic
-titles and question state are current enrichment, not edits to immutable
-publication text or anchors. Exact lookup and a fresh page can observe later
+titles, source revisions and question state are current enrichment, not edits
+to immutable publication text or anchors. Exact lookup and a fresh page can observe later
 question state; SSE is a publication log, not a general mutable-record change feed.
 
 `Readiness` contains role session IDs, expected epochs/models/directories,

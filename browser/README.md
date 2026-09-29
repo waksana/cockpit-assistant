@@ -1,107 +1,152 @@
 # Assistant browser integration tests
 
-These tests serve the **production `dist/web` module** in a test-only browser
-fixture. They never install the Assistant into a running Cockpit, read native
-session history, or start a native host service.
+The browser loads the production `dist/web` Assistant bundle through the real
+host module runtime. Nothing is installed into a running host. Native sessions,
+module HTTP services, audio devices and model connections are synthetic.
 
 ## Run
 
-Use Node 24 and the repository's development dependencies, including
-`@playwright/test`, `esbuild`, `react`, `react-dom`, `sass@1.104.0`, and
-`lucide-react@1.46.0`.
+Use Node 24, pnpm 10.34.5 and the repository's development dependencies:
 
 ```sh
-npm ci
+npm ci --ignore-scripts
 npm run build
-npx playwright install --with-deps chromium
+npx playwright install chromium
 node scripts/browser-build.mjs
 npx playwright test
 ```
 
-The build fetches the public `waksana/cockpit` repository at the immutable
-revision recorded in `scripts/browser-build.mjs`. It refuses a dirty or
-unexpected fixture checkout. Generated files, the isolated checkout, traces,
-synthetic screenshots, and browser temporary files live under the ignored
-`node_modules/.cache/assistant-browser` directory. Nothing in this directory
-or `browser/` belongs in the module package.
+The host revision is pinned to
+`4c1b9e31911e7a121faff13521552135b712f93f` (merged host PR #271) in
+`scripts/browser-build.mjs`. A clean cached checkout is required.
+When its web dependencies are absent, the fixture prepares the pinned host's
+web dependency closure with `pnpm --filter @cockpit/web... install --prod
+--frozen-lockfile --ignore-scripts`; dependency files stay ignored and tracked
+host source must remain clean. The host's Markdown dependency graph is bundled
+from that checkout, not copied into the Assistant package manifest.
+`COCKPIT_FIXTURE_SOURCE=/path/to/cockpit` uses a local Git
+object database, but still checks the pinned revision. For coordinated host API
+development only, `COCKPIT_FIXTURE_HOST=/path/to/host-worktree` explicitly opts
+into an **unpinned** local implementation and prints a warning. That run is not
+evidence against the final immutable host pin.
 
-After the test server and browsers have stopped, the disposable cache can be
-removed at **`node_modules/.cache/assistant-browser`**. This removes only the
-harness's isolated Git checkout, generated host bundle/styles, reports, runtime
-scratch files, and optional project-local browser downloads. It does not remove
-the module's `dist/web` output or any existing host checkout. Rebuild the fixture
-(and reinstall Chromium if its project-local download was removed) before the
-next run. Do not remove the cache while tests are running.
+`COCKPIT_BROWSER_DEPENDENCIES=/path/to/cockpit/apps/web` can resolve the host's
+existing development dependencies, including `react-router-dom`. React and
+React DOM are always deduplicated to the Assistant fixture's runtime.
+`ASSISTANT_BROWSER_PORT` selects a free loopback port (default 4179); an existing
+server is never reused.
 
-For an existing local host object database, set
-`COCKPIT_FIXTURE_SOURCE=/path/to/cockpit`; the requested revision is still checked.
-`COCKPIT_BROWSER_DEPENDENCIES=/path/to/cockpit/apps/web` optionally resolves the
-host's existing Sass/icon development dependencies. CI should use the ordinary
-repository dependencies and public Git fetch instead.
+Generated bundles, checkouts, verified release metadata, browser scratch files,
+traces and synthetic screenshots stay below the ignored directory
+`node_modules/.cache/assistant-browser`. To keep browser downloads there too,
+set `PLAYWRIGHT_BROWSERS_PATH="$PWD/node_modules/.cache/assistant-browser/browsers"`
+for both install and test. Remove that cache only after the browser/server have
+stopped. No fixture is part of the module package.
 
-To keep browser downloads project-local, use the same
-`PLAYWRIGHT_BROWSERS_PATH="$PWD/node_modules/.cache/assistant-browser/browsers"`
-for the install and test commands. `ASSISTANT_BROWSER_PORT` selects a free
-loopback port (default 4179); existing servers are never reused.
+## Real host routing boundary
 
-## Integration boundary
+- The pinned host's **actual `App.tsx`**, `BrowserRouter`, route table,
+  `ModulePages`, `ModuleRuntime`, navigation wiring, route-based chat ownership,
+  module view observer, error boundaries and complete SCSS run unchanged.
+- Native `net/store` is replaced by isolated observable synthetic state.
+  `Workspace`/`ManageWorkspace` presentation is replaced with a no-session home
+  and a selected Chat reference containing the real public `Composer`,
+  `SessionDraft` and the exact `ComposerSurface`/`ComposerCard` used by Chat.
+  The opt-in `?transcript=1` reference additionally renders the real
+  `ThreadTranscript` and its `TranscriptMessages` with synthetic conversation
+  data, under the native Chat layout. No message bubbles, Markdown renderer,
+  timestamps or attachment markup are reimplemented in the fixture.
+  The real `AnchoredMenu` invokes the registered global action.
+  There is no replacement router, proxy module owner, second React root or
+  Assistant dialog.
+- HTTP navigation requests to `/modules/*` receive the fixture's index document
+  as the ordinary SPA fallback. The browser retains the requested URL; the real
+  host App parses, owns and renders it. This interception does **not** exercise
+  the production server's fallback whitelist; the host's real HTTP regression
+  tests must independently cover direct navigation and reload responses.
+- Leaving Chat unmounts its reference Composer. Leaving Assistant unmounts the
+  page and closes its owner, while draft persistence remains runtime-owned.
+  Native transport entry points throw and are counted.
+- Playwright mocks Assistant timeline, readiness, POST and immutable receipt
+  APIs. A loopback server provides idle SSE; tests also exercise controlled
+  failure, cursor catch-up, duplicates and out-of-order events. Unexpected host,
+  module and external HTTP requests fail.
 
-- The pinned host's unmodified `ModuleRuntime`, `ModuleRuntimeProvider`,
-  `ModuleGlobalComponents`, `AnchoredMenu`, `useRegisteredMenu`, menu buttons,
-  public Composer/Message/Attachment components, draft owners/schemas, error
-  boundaries, and complete host SCSS are bundled only for testing.
-- The real runtime fetches a synthetic module manifest and dynamically imports
-  the production module bundle; it owns registration and invokes the real
-  Assistant global-menu action. The renderer and menu share one React tree and
-  runtime. The homepage initially has no selected session; a synthetic selected
-  Chat uses the real host `Composer` and `SessionDraft`. Both background Chat and
-  Assistant traverse the same public Composer middleware chain, with distinct
-  draft references. Closing Assistant preserves the host view and native draft.
-- Only the host `net/store` import is replaced with an empty session snapshot.
-  Native draft submission throws instead of making a request. The fixture does
-  not import the host App or initialize its networking/authentication.
-- `?probes=1` activates a test-only API-v3 module. Synthetic File/Speech controls
-  use the published SDK's real `registerDraft`, `bindDraft`, persistence,
-  projection, item/version ACK and captured-send APIs. They operate only on
-  Assistant; background native controls are deliberately disabled. There is no
-  microphone, upload, actual File/Speech product, native transport, or external
-  service. All native send entry points throw and are counted.
-- Playwright supplies deterministic timeline, readiness, internal activation,
-  and POST/receipt responses. A loopback-only server supplies idle synthetic SSE;
-  tests inject duplicate/out-of-order publications and catch-up responses.
-  Unexpected module requests, host API requests, and external requests fail.
-- POST fixtures retain a deep copy of the full original input, including native
-  attachment descriptors; GET receipts return that immutable input independently
-  of message/work state. A successful POST alone is not acceptance proof.
+## Genuine File and Speech release bundles
 
-This is a public-module/real-host-component integration test, not a deployed-host
-smoke test. It does not claim to test native session creation or real delivery.
+`browser/release-fixtures.mjs` pins **File rolling17** and **Speech rolling2** by
+the SHA-256 of each release's build inventory, then verifies every served
+frontend/shared asset against that inventory. By default it downloads the
+specific release archive using `gh release download`; it never runs module
+backend code or changes the module repositories.
 
-## Matrix and evidence
+To read already installed packages instead, supply their package roots:
 
-Every scenario runs in desktop/mobile Chromium with light/dark themes. Tests
-cover complete Markdown and A/B/A topic segments, fixed composer visibility,
-immediate settings visibility even when initial history is delayed,
-readiness-gated sending with editable drafts, exact role names and Cockpit role
-registration guidance without manual registration or reception forms, public
-arrow/gear icons with native dialog return and preserved host selection/draft,
-captured role/session/epoch activation, pending and unknown load receipts across
-reopen without new-ID retries or invalid-role repair, reply anchors and question
-choices (including six 120-character choices without hiding the mobile composer),
-retained question choices outside the reopened timeline without duplicate controls,
-stable uncertain request identities, late writes after close/reopen,
-older-message paging, SSE recovery/deduplication, reading-position preservation,
-and unread-message navigation. The draft-owner matrix additionally covers
-attachment-only sends and historical attachments, public identity without invented
-native origins, all four native attachment descriptor types, retained edits and
-reply changes during ACK, unknown and pending recovery after reload without POST
-replay, field ACK failures, revoked schema generations and rehydration, expired
-captured consent, choice-only/attachment-forbidden asks, and real input IME guards.
-Mobile Enter retains the host's newline behavior. Screenshots contain synthetic
-data only.
+```sh
+ASSISTANT_FILE_FIXTURE=/path/to/file/package \
+ASSISTANT_SPEECH_FIXTURE=/path/to/speech/package \
+node scripts/browser-build.mjs
+```
 
-`test/frontend-host.ts` also bundles the same pinned runtime for store orchestration
-tests. It activates the store using real public state registration and isolated
-in-memory draft storage; it does not substitute an owner implementation. A cold
-`npm test` therefore fetches the pinned host fixture if absent. No browser or
-production `dist` build is required for these Node tests.
+The same pinned inventory and asset verification applies to local packages.
+Tests serve those exact JavaScript/CSS bytes and register the genuine modules
+through the host manifest. Their public component middleware, upload/paste/drop
+handlers, File preview surface, draft schemas, Speech target arbitration,
+button/F8/pointer-hold/touch-hold capture, cancellation and captured-send
+implementation are real.
+
+Only IO is replaced: uploads and image metadata/content are synthetic HTTP
+responses; microphone permission, AudioContext, AudioWorkletNode and WebSocket
+are in-memory test doubles. Worklet PCM is zero-filled synthetic data. No actual
+microphone, credential, Azure connection or model request is used. File's own
+preview may open a native dialog; Assistant itself must never do so.
+
+`?probes=1` independently activates `browser/probe.ts` for destructive schema,
+ACK and consent edge cases. This synthetic probe is **not** claimed as File or
+Speech coverage. It uses genuine public draft APIs but different test-only
+middleware and is absent from real-module scenarios.
+
+## Matrix
+
+Scenarios run on desktop/mobile Chromium in light/dark themes:
+
+- Home global menu, actual route URL, direct entry, reload, back/forward,
+  deterministic home return, unavailable page and runtime revocation.
+- Background Chat unmount, draft isolation and native-send denial.
+- Named role buttons with icon-only status, independent connection state, checking and
+  error details, compact focus/Escape handling and readiness-gated sending.
+- Long Markdown and six long choices on narrow screens, fixed visible
+  Composer, ordinary text quick-fill without reply targets, paging and
+  reading-position/SSE recovery.
+- Public Composer computed styles/control geometry compared with Chat.
+- Complete public message presentation compared with the native
+  `ThreadTranscript`: user bubbles, assistant document body, Markdown,
+  same-speaker/speaker-change spacing, timestamps and attachment-only rows.
+  Unsafe links, raw HTML and unsupported media are compared against the same
+  native renderer, with no script execution or external media request.
+- A separately registered, late-activating passthrough `messageList` middleware
+  is removed through the real runtime's module unregister path. Both viewport
+  replacements must retain the off-bottom reading anchor and live draft.
+  After returning to bottom, subsequent same-message body growth must still
+  follow via the rebound resize observer, without new-message unread counts.
+- Natural user/assistant order across hidden status, wake, risk and correction
+  publications; correction replaces the right body without counting as unread.
+  System-only pages stay blank and multi-page system-only history is traversed
+  to reach earlier dialogue. Hidden SSE still advances raw watermarks, catches
+  gaps, reconnects and deduplicates; only new dialogue increments unread.
+- Genuine File upload, clipboard paste, drag/drop, preview and attachment-only
+  send/ACK; genuine Speech microphone/F8, real browser touch/pointer hold,
+  foreground target and cancellation.
+- Concurrent edits during late ACK, immutable attachment descriptors, unknown
+  receipts after reload without POST replay, revoked schemas, captured consent,
+  unbound historical choice-only asks and IME/mobile Enter behavior via the
+  separate probe. Legacy request-v1 recovery preserves its frozen `replyTo` for
+  GET comparison, while business-v1 selected-reply migration drops only the old
+  selection and preserves draft text. New payloads never contain `replyTo`.
+
+`test/frontend-host.ts` also bundles the pinned real runtime for store tests,
+using isolated in-memory draft storage. A cold Node test may fetch the pinned
+host and prepare its locked web dependencies; it does not require a browser or
+a production module build. Only the test process's React/ReactDOM and existing
+Zod 3 compatibility entry remain external; real Markdown code is bundled and
+metafile checks reject extra React runtimes or leaked parser dependencies.

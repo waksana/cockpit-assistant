@@ -1,28 +1,44 @@
 import { execFileSync } from 'node:child_process';
 import { build } from 'esbuild';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend';
 
 // Bundle the pinned real runtime; no production import reaches into host internals.
 execFileSync(process.execPath, ['scripts/browser-build.mjs', '--host-only'], { cwd: resolve('.') });
-const host = resolve('node_modules/.cache/assistant-browser/host');
+const host = resolve(process.env.COCKPIT_FIXTURE_HOST ?? 'node_modules/.cache/assistant-browser/host');
 const outfile = resolve('node_modules/.cache/assistant-browser/store-runtime.mjs');
-await build({
+const bundled = await build({
   entryPoints: [`${host}/apps/web/src/lib/moduleRuntime.ts`], outfile,
-  bundle: true, platform: 'node', format: 'esm', packages: 'external',
+  bundle: true, platform: 'node', format: 'esm', jsx: 'automatic', metafile: true,
+  mainFields: ['module', 'main'],
+  external: ['react', 'react/*', 'react-dom', 'react-dom/*'],
   alias: {
-    '@cockpit/module-api': resolve('node_modules/@waksana/cockpit-module-sdk'),
-    '@cockpit/protocol': `${host}/packages/protocol/src/index.ts`,
+    '@cockpit/module-api': `${host}/packages/module-api/src`,
+    '@cockpit/protocol': `${host}/packages/protocol/src`,
   },
   plugins: [{
     name: 'synthetic-network-only',
     setup(builder) {
-      builder.onResolve({ filter: /(^|\/)net\/store$/ }, () => ({ path: resolve('browser/host-state.ts') }));
+      builder.onResolve({ filter: /(^|\/)store(?:\.ts)?$/ }, args => {
+        if (resolve(dirname(args.importer), args.path).replace(/\.ts$/, '') === `${host}/apps/web/src/net/store`) {
+          return { path: resolve('browser/host-state.ts') };
+        }
+      });
       builder.onResolve({ filter: /^zod$/ }, () => ({ path: 'zod/v3', external: true }));
     },
   }],
 });
+for (const output of Object.values(bundled.metafile.outputs)) {
+  for (const dependency of output.imports.filter(value => value.external)) {
+    if (!/^(?:react(?:-dom)?(?:\/|$)|zod\/v3$|node:)/.test(dependency.path)) {
+      throw new Error(`Host fixture leaked an unbundled non-React dependency: ${dependency.path}`);
+    }
+  }
+}
+if (Object.keys(bundled.metafile.inputs).some(path => /node_modules\/(?:\.pnpm\/[^/]+\/node_modules\/)?react(?:-dom)?\//.test(path))) {
+  throw new Error('Store fixture must reuse the test process React runtime');
+}
 const { ModuleRuntime } = await import(pathToFileURL(outfile).href);
 
 export async function hostState() {

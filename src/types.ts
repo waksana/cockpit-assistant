@@ -45,6 +45,7 @@ export interface Message {
   nativeMessageId: string | null;
   nativeParentId: string | null;
   correlation: 'unknown';
+  /** Historical input provenance only; new input always stores null. */
   replyTo: string | null;
   historical: boolean;
   sequence: number;
@@ -63,6 +64,7 @@ export interface Question {
   request: AskRequest;
   messageId: string;
   state: 'pending' | 'stale' | 'answered' | 'unknown';
+  stateVersion?: number;
 }
 export interface Work {
   id: string;
@@ -115,6 +117,7 @@ export interface Publication {
   topicId: string | null;
   text: string;
   attachments: NativeAttachment[];
+  /** Historical publication provenance only; new publications do not create anchors. */
   anchorId: string | null;
   sources: SourceRef[];
   createdAt: number;

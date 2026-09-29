@@ -5,16 +5,24 @@ async function openAssistant(page: Page) {
   await page.getByRole('button', { name: '全局菜单', exact: true }).click();
   await expect(page.getByRole('menu', { name: '全局菜单', exact: true })).toHaveClass('btn-menu');
   await page.getByRole('menuitem', { name: '助手', exact: true }).click();
-  await expect(page.getByRole('dialog', { name: '助手', exact: true })).toBeVisible();
+  await expect(page.locator('.ca-page')).toBeVisible();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(page.getByRole('region', { name: '对话记录', exact: true })).toHaveAttribute('aria-busy', 'false');
+}
+async function detail(page: Page, name: string | RegExp) {
+  const control = page.getByRole('button', { name, exact: typeof name === 'string' });
+  await expect(control).toBeVisible();
+  if (await control.getAttribute('aria-expanded') !== 'true') await control.click();
 }
 function assertClean(fixture: Awaited<ReturnType<typeof installFixture>>) {
   expect(fixture.consoleErrors).toEqual([]);
   expect(fixture.seenUnexpected).toEqual([]);
+  expect(fixture.posts.filter(post => post.path === '/messages')
+    .every(post => !Object.hasOwn(post.body, 'replyTo'))).toBe(true);
 }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-test('real host global menu opens on an empty homepage; complete Markdown, A/B/A and public theme', async ({ page }, info) => {
+test('real host global menu opens on an empty homepage; complete conversation and public theme without provenance cards', async ({ page }, info) => {
   const fixture = await installFixture(page);
   await page.goto('/');
   await expect(page.getByTestId('empty-homepage').getByRole('heading')).toHaveText('没有选择会话');
@@ -25,20 +33,19 @@ test('real host global menu opens on an empty homepage; complete Markdown, A/B/A
   await expect(messages).toHaveCount(timeline.length);
   expect(await messages.evaluateAll(elements => elements.map(element => element.getAttribute('data-ca-item'))))
     .toEqual(timeline.map(item => item.id));
-  const headings = page.locator('.ca-topic-heading');
-  await expect(headings).toHaveText(['旅行计划 A', '代码审查 B', '旅行计划 A']);
-  const colors = await messages.evaluateAll(elements => elements.slice(0, 3).map(element =>
-    (element as HTMLElement).style.getPropertyValue('--ca-topic-color')));
-  expect(colors[0]).toBe(colors[2]);
-  expect(colors[0]).not.toBe(colors[1]);
+  await expect(page.locator('.ca-topic-heading')).toHaveCount(0);
+  await expect(messages.first()).toContainText('A：先讨论旅行计划');
+  await expect(messages.nth(1)).toContainText('B：现在讨论代码审查');
+  await expect(messages.nth(2)).toContainText('A：继续刚才的旅行计划');
+  await expect(page.getByRole('region', { name: '对话记录', exact: true }))
+    .not.toContainText(/来源：|synthetic-reception|旅行计划 A|代码审查 B/);
   const long = page.locator('[data-ca-item="publication-9"]');
   await expect(long.getByRole('heading', { name: '完整 Markdown 回答' })).toBeVisible();
   await expect(long.getByRole('table')).toContainText('已确认');
   await expect(long.locator('pre')).toContainText('const result');
   await expect(long.getByText('长回答结束标记', { exact: true })).toBeVisible();
-  await expect(messages.first()).toContainText('来源：synthetic-reception');
   await expect(messages.first().locator('time')).toHaveAttribute('datetime', /2025-/);
-  const measurements = await page.getByRole('dialog').evaluate(element => {
+  const measurements = await page.locator('.ca-page').evaluate(element => {
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
     return {
@@ -56,32 +63,42 @@ test('real host global menu opens on an empty homepage; complete Markdown, A/B/A
   expect(measurements.bottom).toBeLessThanOrEqual(measurements.height + 1);
   expect(measurements.scrollWidth).toBeLessThanOrEqual(measurements.clientWidth + 1);
   expect(measurements.token).not.toBe('');
-  expect(measurements.background).not.toBe('rgba(0, 0, 0, 0)');
   expect(measurements.dark).toBe(info.project.name.endsWith('dark'));
   await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toBeInViewport();
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeInViewport();
   await page.screenshot({ path: info.outputPath('synthetic-assistant.png') });
-  const back = page.getByRole('button', { name: '返回 Cockpit', exact: true });
-  const settings = page.getByRole('button', { name: '设置', exact: true });
-  await expect(page.locator('.ca-header button')).toHaveCount(2);
-  for (const [control, title] of [[back, '返回 Cockpit'], [settings, '设置']] as const) {
-    await expect(control).toHaveClass('ck-icon-button');
+  const back = page.getByRole('link', { name: '返回 Cockpit', exact: true });
+  const coordinator = page.getByRole('button', { name: 'coordinator：已就绪', exact: true });
+  const memory = page.getByRole('button', { name: 'memory：已就绪', exact: true });
+  const connection = page.getByRole('button', { name: '实时连接：已连接', exact: true });
+  await expect(page.locator('.ca-header button')).toHaveCount(3);
+  await expect(page.getByRole('button', { name: '设置', exact: true })).toHaveCount(0);
+  for (const [control, title] of [[back, '返回 Cockpit'], [coordinator, 'coordinator：已就绪'],
+    [memory, 'memory：已就绪'], [connection, '实时连接：已连接']] as const) {
+    await expect(control).toHaveClass(title.startsWith('coordinator') || title.startsWith('memory')
+      ? /ck-button/ : 'ck-icon-button');
     await expect(control).toHaveAttribute('title', title);
-    await expect(control.locator('svg')).toHaveClass('ck-icon ck-icon-lg');
+    await expect(control.locator('svg')).toHaveClass(/ck-icon/);
     await expect(control.locator('svg')).toHaveAttribute('aria-hidden', 'true');
     await expect(control.locator('svg')).toHaveAttribute('focusable', 'false');
     const rect = await control.boundingBox();
     expect(rect!.width).toBeGreaterThanOrEqual(info.project.name.startsWith('mobile') ? 44 : 40);
     expect(rect!.height).toBeGreaterThanOrEqual(info.project.name.startsWith('mobile') ? 44 : 40);
   }
-  expect((await back.boundingBox())!.x).toBeLessThan((await settings.boundingBox())!.x);
+  expect((await back.boundingBox())!.x).toBeLessThan((await coordinator.boundingBox())!.x);
   await expect(back.locator('path').first()).toHaveAttribute('d', 'm12 19-7-7 7-7');
-  await settings.click();
-  const setup = page.getByRole('region', { name: '设置', exact: true });
-  // These read-only assertions cannot scroll hidden settings into view.
-  await expect(setup.getByRole('heading', { name: '角色设置', exact: true })).toBeInViewport({ ratio: 1 });
-  await expect(setup).toContainText('选择 coordinator 或 memory');
-  await expect(page.locator('.ca-scroller')).toHaveJSProperty('scrollTop', 0);
+  await expect(coordinator).toHaveText('coordinator');
+  await expect(memory).toHaveText('memory');
+  await expect(connection).toHaveText('');
+  await coordinator.click();
+  const setup = page.getByRole('region', { name: '状态详情', exact: true });
+  await expect(setup).toBeInViewport({ ratio: 1 });
+  await expect(setup).toContainText('synthetic-coordinator');
+  await expect(setup).not.toContainText('synthetic-memory');
+  await setup.getByRole('button', { name: '刷新就绪状态' }).focus();
+  await page.keyboard.press('Escape');
+  await expect(setup).toHaveCount(0);
+  await expect(coordinator).toBeFocused();
   expect(fixture.posts).toEqual([]);
   assertClean(fixture);
 });
@@ -91,26 +108,28 @@ test('not-ready users can edit and preserve drafts but cannot send, then refresh
   await page.goto('/');
   await page.getByRole('button', { name: '选择合成会话', exact: true }).click();
   await page.getByTestId('selected-session').getByRole('textbox', { name: '消息输入', exact: true }).fill('保留宿主草稿');
-  await page.evaluate(() => history.pushState({}, '', '/#synthetic-selected-session'));
-  const hostUrl = page.url();
   await openAssistant(page);
-  const draft = page.getByRole('dialog').getByRole('textbox', { name: '消息输入', exact: true });
-  const send = page.getByRole('dialog').getByRole('button', { name: '发送', exact: true });
+  await expect(page.getByTestId('selected-session')).toHaveCount(0);
+  const draft = page.locator('.ca-page').getByRole('textbox', { name: '消息输入', exact: true });
+  const send = page.locator('.ca-page').getByRole('button', { name: '发送', exact: true });
   await draft.fill('尚未就绪也保留我的草稿');
   await expect(draft).toBeEditable();
   await expect(send).toBeDisabled();
   await draft.press('Enter');
   const savedText = await draft.inputValue();
   expect(fixture.posts).toEqual([]);
-  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.getByTestId('empty-homepage')).toBeVisible();
+  expect(new URL(page.url()).pathname).toBe('/');
+  await page.getByRole('button', { name: '选择合成会话', exact: true }).click();
   await expect(page.getByTestId('selected-session')).toBeVisible();
   await expect(page.getByTestId('selected-session').getByRole('textbox', { name: '消息输入', exact: true })).toHaveValue('保留宿主草稿');
-  expect(page.url()).toBe(hostUrl);
   await openAssistant(page);
   await expect(draft).toHaveValue(savedText);
   expect(fixture.requests.filter(request => request.path === '/readiness')).toHaveLength(2);
   fixture.setReadiness(readiness());
+  await detail(page, /^coordinator：/);
   await page.getByRole('button', { name: '刷新就绪状态' }).click();
   await expect(send).toBeEnabled();
   await send.click();
@@ -121,7 +140,7 @@ test('not-ready users can edit and preserve drafts but cannot send, then refresh
   assertClean(fixture);
 });
 
-test('settings opened before delayed history retain the viewport when the initial page arrives', async ({ page }) => {
+test('compact status detail remains visible while delayed history arrives', async ({ page }) => {
   let release: (() => void) | undefined;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const fixture = await installFixture(page, {
@@ -138,89 +157,82 @@ test('settings opened before delayed history retain the viewport when the initia
   await page.getByRole('menuitem', { name: '助手', exact: true }).click();
   const history = page.getByRole('region', { name: '对话记录', exact: true });
   await expect(history).toHaveAttribute('aria-busy', 'true');
+  await detail(page, /^实时连接：/);
   await expect(page.getByRole('button', { name: '重新连接', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  const heading = page.getByRole('region', { name: '设置', exact: true })
-    .getByRole('heading', { name: '角色设置', exact: true });
+  await detail(page, /^coordinator：/);
+  const heading = page.getByRole('region', { name: '状态详情', exact: true });
   await expect(heading).toBeInViewport({ ratio: 1 });
-  await expect(page.locator('.ca-scroller')).toHaveJSProperty('scrollTop', 0);
   release?.();
   await expect(history).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('[data-ca-item]')).toHaveCount(timeline.length);
   await expect(heading).toBeInViewport({ ratio: 1 });
-  await expect(page.locator('.ca-scroller')).toHaveJSProperty('scrollTop', 0);
   expect(fixture.requests.filter(request => request.path === '/timeline' && request.query === '?limit=50')).toHaveLength(1);
   assertClean(fixture);
 });
 
-test('reply anchors distinguish pending choices from stale questions without hidden posting', async ({ page }) => {
+test('question choices fill ordinary text without reply controls, captured anchors or hidden posting', async ({ page }) => {
   const fixture = await installFixture(page);
   await page.goto('/');
   await openAssistant(page);
-  await page.locator('[data-ca-item="publication-7"]').getByRole('button', { name: '回复', exact: true }).click();
-  const reference = page.getByRole('region', { name: '当前回复引用', exact: true });
-  await expect(page.getByText('来源：synthetic-reception · 引用：anchor-7')).toBeVisible();
+  await expect(page.getByRole('button', { name: '回复', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: '当前回复引用', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '火车', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toHaveValue('火车');
   expect(fixture.posts).toEqual([]);
   await page.getByRole('button', { name: '发送', exact: true }).click();
   await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toHaveValue('');
-  expect(fixture.posts[0]?.body).toMatchObject({ text: '火车', replyTo: 'anchor-7' });
-  await page.locator('[data-ca-item="publication-8"]').getByRole('button', { name: '回复', exact: true }).click();
-  await expect(page.getByText('来源：synthetic-reception · 引用：anchor-8')).toBeVisible();
-  await expect(reference.locator('.ca-choices')).toHaveCount(0);
+  expect(fixture.posts[0]?.body.text).toBe('火车');
+  expect(fixture.posts[0]?.body).not.toHaveProperty('replyTo');
+  await expect(page.locator('[data-ca-item="publication-8"]').getByRole('button')).toHaveCount(0);
   await page.getByRole('textbox', { name: '消息输入', exact: true }).fill('关于旧问题的普通评论');
-  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
-  await expect(page.getByText('来源：synthetic-reception · 引用：anchor-8')).toBeVisible();
   await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toHaveValue('关于旧问题的普通评论');
   assertClean(fixture);
 });
 
-test('a retained pending reply outside the reopened timeline keeps its choices without duplicates', async ({ page }) => {
+test('a quick-filled choice survives reopening as text without retaining a question target', async ({ page }) => {
   const question = publication(1, '需要保留选项的早期问题', {
     type: 'question', anchorId: 'retained-question-anchor',
-    question: { state: 'pending', choices: ['火车', '飞机'], allowFreeform: false },
+    question: { state: 'pending', stateVersion: 1, choices: ['火车', '飞机'], allowFreeform: false },
   });
   const later = publication(2, '最新窗口内的另一个问题', {
-    type: 'question', question: { state: 'pending', choices: ['另一个选项'], allowFreeform: false },
+    type: 'question', question: { state: 'pending', stateVersion: 1, choices: ['另一个选项'], allowFreeform: false },
   });
   const fixture = await installFixture(page, { items: [question], hasOlder: false });
   await page.goto('/');
   await openAssistant(page);
-  await page.locator('[data-ca-item="publication-1"]').getByRole('button', { name: '回复', exact: true }).click();
-  const reference = page.getByRole('region', { name: '当前回复引用', exact: true });
-  await expect(reference.locator('.ca-choices')).toHaveCount(0);
   await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(1);
-  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await page.getByRole('button', { name: '火车', exact: true }).click();
+  await expect(page.getByRole('textbox')).toHaveValue('火车');
+  await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   fixture.setTimeline([later]);
   await openAssistant(page);
   await expect(page.locator('[data-ca-item="publication-1"]')).toHaveCount(0);
-  await expect(reference).toContainText('retained-question-anchor');
-  await expect(reference.getByRole('button', { name: '火车', exact: true })).toHaveCount(1);
-  await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('region', { name: '当前回复引用', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(0);
   await expect(page.locator('[data-ca-item="publication-2"]').getByRole('button', { name: '另一个选项', exact: true })).toBeEnabled();
-  await reference.getByRole('button', { name: '火车', exact: true }).click();
-  await expect(page.getByText('已选：火车', { exact: true })).toBeVisible();
-  await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('textbox')).toHaveValue('火车');
+  await page.getByRole('textbox').fill('普通补充，不受旧问题限制');
   expect(fixture.posts).toEqual([]);
-  await page.getByRole('button', { name: '发送选项', exact: true }).click();
+  await page.getByRole('button', { name: '发送', exact: true }).click();
   await expect.poll(() => fixture.posts.length).toBe(1);
-  expect(fixture.posts[0]?.body).toMatchObject({ text: '火车', replyTo: 'retained-question-anchor' });
+  expect(fixture.posts[0]?.body.text).toBe('普通补充，不受旧问题限制');
+  expect(fixture.posts[0]?.body).not.toHaveProperty('replyTo');
   assertClean(fixture);
 });
 
-test('six long question choices stay in the scroller and preserve the selected reply anchor', async ({ page }) => {
+test('six long question choices stay in the scroller and never replace the public Composer', async ({ page }) => {
   const choices = Array.from({ length: 6 }, (_, index) => `选项${index + 1}：${'合成长选项'.repeat(24).slice(0, 116)}`);
   const selected = choices[3]!;
   let release: (() => void) | undefined;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const question = publication(1, '请从六个完整的长选项中选择', {
-    type: 'question', question: { state: 'pending', choices, allowFreeform: false },
+    type: 'question', question: { state: 'pending', stateVersion: 1, choices, allowFreeform: false },
     anchorId: 'immutable-question-anchor',
   });
   const later = publication(2, '另一个独立的待回答问题', {
-    type: 'question', question: { state: 'pending', choices: ['新的选择'], allowFreeform: false },
+    type: 'question', question: { state: 'pending', stateVersion: 1, choices: ['新的选择'], allowFreeform: false },
     anchorId: 'different-question-anchor',
   });
   const fixture = await installFixture(page, { items: [question, later], hasOlder: false,
@@ -243,23 +255,23 @@ test('six long question choices stay in the scroller and preserve the selected r
   };
   await assertComposerVisible();
   await page.locator('[data-ca-item="publication-1"]').getByRole('button', { name: selected, exact: true }).click();
-  await expect(page.getByText(`已选：${selected}`, { exact: true })).toBeVisible();
-  await expect(draft).toHaveCount(0);
+  await expect(draft).toHaveValue(selected);
   await assertComposerVisible();
-  await expect(scroller.getByRole('region', { name: '当前回复引用', exact: true })).toContainText('immutable-question-anchor');
-  await expect(page.locator('.ca-composer').getByText('已选择回复引用', { exact: true })).toBeVisible();
+  await expect(page.getByRole('region', { name: '当前回复引用', exact: true })).toHaveCount(0);
   await expect(page.locator('.ca-composer').getByRole('button', { name: selected, exact: true })).toHaveCount(0);
   expect(fixture.posts).toEqual([]);
   await send.click();
   await expect.poll(() => fixture.posts.length).toBe(1);
-  expect(fixture.posts[0]?.body).toMatchObject({ text: selected, replyTo: 'immutable-question-anchor' });
+  expect(fixture.posts[0]?.body.text).toBe(selected);
+  expect(fixture.posts[0]?.body).not.toHaveProperty('replyTo');
   await page.locator('[data-ca-item="publication-2"]').getByRole('button', { name: '新的选择', exact: true }).click();
-  await expect(page.getByText('已选：新的选择', { exact: true })).toBeVisible();
+  await expect(draft).toHaveValue('新的选择');
   await assertComposerVisible();
   release?.();
+  await detail(page, '发送回执');
   await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('已接受');
-  await expect(page.getByText('已选：新的选择', { exact: true })).toBeVisible();
-  expect(fixture.posts[0]?.body.replyTo).toBe('immutable-question-anchor');
+  await expect(draft).toHaveValue('新的选择');
+  expect(fixture.posts[0]?.body).not.toHaveProperty('replyTo');
   expect(fixture.posts).toHaveLength(1);
   assertClean(fixture);
 });
@@ -268,16 +280,13 @@ test('role registration belongs to Cockpit; no manual UUID, create, bind or rece
   const fixture = await installFixture(page, { ready: false, items: [], hasOlder: false });
   await page.goto('/');
   await openAssistant(page);
-  await page.getByRole('button', { name: '设置', exact: true }).click();
-  const setup = page.getByRole('region', { name: '设置', exact: true });
-  await expect(setup).toContainText('在 Cockpit 创建会话或添加角色时选择 coordinator 或 memory');
-  await expect(setup).toContainText('所有普通会话都会自动观察，无需单独接入');
-  await expect(setup).toContainText('刷新只读取状态');
-  await expect(setup).toContainText('冷加载包含宿主正常的原生工具初始化');
-  await expect(setup).toContainText('不会额外修复资源、强制重载或自动启用被禁用的资源');
+  await detail(page, /^coordinator：/);
+  const setup = page.getByRole('region', { name: '状态详情', exact: true });
+  await expect(setup).toContainText('在 Cockpit 创建会话或添加角色时选择 coordinator');
   await expect(setup.locator('input,select,form')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: /创建会话|绑定|接入接待者|检查会话/ })).toHaveCount(0);
-  await expect(page.locator('.ca-role-status strong')).toHaveText(['coordinator', 'memory']);
+  await expect(page.getByRole('button', { name: /^(创建会话|绑定|接入接待者|检查会话)/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'coordinator：未绑定' })).toHaveText('coordinator');
+  await expect(page.getByRole('button', { name: 'memory：未绑定' })).toHaveText('memory');
   await expect(page.getByText(/编排者|记忆者|Assistant coordinator|Assistant memory/)).toHaveCount(0);
   expect(fixture.posts).toEqual([]);
   const ready = readiness();
@@ -301,11 +310,13 @@ test('unknown input never resends; receipt lookup uses the original ID and prese
   const draft = page.getByRole('textbox', { name: '消息输入', exact: true });
   await draft.fill('仅发送一次');
   await page.getByRole('button', { name: '发送', exact: true }).click();
+  await detail(page, '发送回执');
   await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('状态未知');
   const requestId = String(fixture.posts[0]?.body.requestId);
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
-  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
+  await detail(page, '发送回执');
   await draft.fill('不应被旧请求清空的新草稿');
   await draft.press('Enter');
   const newerText = await draft.inputValue();
@@ -345,18 +356,20 @@ test('opening loads only bound unloaded carriers, preserves pending receipts and
   ] } });
   expect(fixture.posts[0]!.body.requestId).toMatch(uuid);
   const receipt = page.getByRole('article', { name: '加载内部角色会话', exact: true });
+  await detail(page, /^coordinator：/);
   await expect(receipt).toContainText('处理中');
-  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
+  await detail(page, /^coordinator：/);
   await expect(receipt).toContainText('处理中');
   const draft = page.getByRole('textbox', { name: '消息输入', exact: true });
   await draft.fill('加载完成不得改变此草稿');
-  await expect(page.locator('.ca-role-status').last()).toContainText('角色已选择但尚未应用');
+  await expect(page.getByRole('button', { name: 'memory：不可用' })).toBeVisible();
   unloaded.roles[0]!.status = 'ready';
   fixture.setReadiness(unloaded);
   release();
   await expect(receipt).toContainText('已接受');
-  await expect(page.locator('.ca-role-status').first()).toContainText('已就绪');
+  await expect(page.getByRole('button', { name: 'coordinator：已就绪' })).toBeVisible();
   await expect(draft).toHaveValue('加载完成不得改变此草稿');
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
   expect(fixture.posts).toHaveLength(1);
@@ -379,11 +392,12 @@ test('late POST completion after close/reopen cannot erase new typing or duplica
   await draft.fill('旧请求还在飞行中');
   await page.getByRole('button', { name: '发送', exact: true }).click();
   await expect.poll(() => fixture.posts.length).toBe(1);
-  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
   await draft.fill('关闭后重新输入的内容');
   await expect(page.getByRole('button', { name: '正在提交', exact: true })).toBeDisabled();
   release?.();
+  await detail(page, '发送回执');
   await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('已接受');
   await expect(draft).toHaveValue('关闭后重新输入的内容');
   expect(fixture.posts).toHaveLength(1);
@@ -456,12 +470,14 @@ test('unknown internal activation stays inspectable across reopen with no new-ID
   await page.goto('/');
   await openAssistant(page);
   const receipt = page.getByRole('article', { name: '加载内部角色会话', exact: true });
+  await detail(page, /^coordinator：/);
   await expect(receipt).toContainText('状态未知');
-  await page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+  await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   unloaded.roles[0]!.status = 'unknown';
   fixture.setReadiness(unloaded);
   await openAssistant(page);
-  await expect(page.locator('.ca-role-status').first()).toContainText('状态未知');
+  await detail(page, /^coordinator：/);
+  await expect(page.getByRole('button', { name: 'coordinator：状态未知' })).toBeVisible();
   await page.getByRole('button', { name: '检查操作状态' }).click();
   await expect(receipt).toContainText('回执状态：unknown');
   await receipt.getByRole('button', { name: '展开完整结果' }).click();

@@ -33,7 +33,7 @@ test('route commits inbox decision and frozen delivery atomically; late epoch ca
   } finally { f.close(); }
 });
 
-test('explicit old reply stays at its source after handoff', () => {
+test('historically accepted reply stays at its source after handoff; new replyTo is rejected', () => {
   const f = fixture();
   try {
     f.db.put('topics', { id: 'topic', title: 'T', domain: null, relatedTo: [], pinned: false,
@@ -41,11 +41,14 @@ test('explicit old reply stays at its source after handoff', () => {
     const output = f.db.transaction(() => f.service.addMessage({ kind: 'reply', raw: 'Old proposal', sessionId: 's1', topicId: 'topic' }));
     f.db.put('anchors', { id: output.id, messageId: output.id, sessionId: 's1', kind: 'comment', requestId: null });
     f.db.put('routes', { id: 'topic', sessionIds: ['s2'], version: 2, evidence: 'Explicit handoff' });
-    const input = f.service.accept({ requestId: 'comment', text: 'Change paragraph two', replyTo: output.id });
+    assert.throws(() => f.service.accept({ requestId: 'comment', text: 'Change paragraph two', replyTo: output.id }),
+      /Unrecognized key/);
+    const input = f.service.accept({ requestId: 'comment', text: 'Change paragraph two' });
+    f.db.put('messages', { ...input.message, replyTo: output.id });
     let work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
     assert.throws(() => f.service.decide(f.identities.coordinator, { ...proof(work),
       topic: { id: 'topic' }, reason: 'Same topic', action: { kind: 'route', sessionIds: ['s2'], routeVersion: 2 },
-    }), /original native object/);
+    }), /original native target/);
     assert.equal(f.db.list('deliveries').items.length, 0);
     work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
     f.service.decide(f.identities.coordinator, { ...proof(work),
@@ -56,7 +59,7 @@ test('explicit old reply stays at its source after handoff', () => {
   } finally { f.close(); }
 });
 
-test('multiple asks reject ambiguous unanchored answer and preserve choice constraints', () => {
+test('context can choose among multiple asks without literal uniqueness and preserves choice constraints', () => {
   const f = fixture();
   try {
     f.db.transaction(() => {
@@ -65,20 +68,17 @@ test('multiple asks reject ambiguous unanchored answer and preserve choice const
     });
     const input = f.service.accept({ requestId: 'answer', text: 'Yes' });
     const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-    assert.throws(() => f.service.decide(f.identities.coordinator, { ...proof(work),
+    f.service.decide(f.identities.coordinator, { ...proof(work),
       topic: { title: 'Approval', independent: true }, reason: 'Approval',
       action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0, answerQuestionId: questionKey('s1', 'q1') },
-    }), /unambiguous literal choice/);
-    const q = f.db.must('questions', questionKey('s1', 'q1'));
-    f.db.put('anchors', { id: q.messageId, messageId: q.messageId, sessionId: 's1', requestId: 'q1', kind: 'ask' });
-    assert.throws(() => f.service.accept({ requestId: 'freeform', text: 'Sure thing', replyTo: q.messageId }),
-      /exactly match/);
-    const bad = f.service.accept({ requestId: 'freeform', text: 'Yes', replyTo: q.messageId });
+    });
+    assert.equal(f.db.list('deliveries').items[0]!.answerFreeform, false);
+    const bad = f.service.accept({ requestId: 'freeform', text: 'Yes' });
     f.service.correct(bad.message.id, 'Sure thing', 1, 'Invalid choice must also fail at decision time');
     const badWork = f.service.claim(f.identities.coordinator, 'coordinator', 1, `message:${bad.message.id}:2`)!;
     assert.throws(() => f.service.decide(f.identities.coordinator, { ...proof(badWork),
       topic: { title: 'Approval', independent: true }, reason: 'Approval',
-      action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0 },
+      action: { kind: 'route', sessionIds: ['s2'], routeVersion: 0, answerQuestionId: questionKey('s2', 'q2') },
     }), /exactly match/);
   } finally { f.close(); }
 });
@@ -97,7 +97,9 @@ test('background publication leaves foreground and output source unchanged', () 
     assert.equal(f.db.meta('foregroundTopic', null), 'a');
     assert.equal(f.db.must('messages', output.id).raw, 'Original');
     assert.equal(f.db.list('publications').items[0]?.text, 'Edited summary');
-    assert.equal(f.db.must('anchors', output.id).sessionId, 's2');
+    assert.equal(f.db.must('messages', output.id).sessionId, 's2');
+    assert.equal(f.db.get('anchors', output.id), undefined);
+    assert.equal(f.db.list('publications').items[0]?.anchorId, null);
   } finally { f.close(); }
 });
 
@@ -123,12 +125,12 @@ test('risk notice matches publication and supplement, is rate limited, and never
     f.db.transaction(() => f.service.syncQuestions('s1', [{ requestId: 'ask', question: 'Continue?', choices: ['Yes'], allowFreeform: false }], true));
     const q = f.db.must('questions', questionKey('s1', 'ask'));
     f.db.put('anchors', { id: q.messageId, messageId: q.messageId, sessionId: 's1', requestId: 'ask', kind: 'ask' });
-    const answer = f.service.accept({ requestId: 'answer', text: 'Yes', replyTo: q.messageId });
+    const answer = f.service.accept({ requestId: 'answer', text: 'Yes' });
     const answerWork = f.service.claim(f.identities.coordinator, 'coordinator', 1, answer.work.id)!;
     f.advance(900_000);
     const fresh = f.service.claim(f.identities.coordinator, 'coordinator', 1, answerWork.id)!;
     f.service.decide(f.identities.coordinator, { ...proof(fresh), topic: { id: risk.topicId! },
-      reason: 'Bound answer', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 2 } });
+      reason: 'Context selects answer', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 2, answerQuestionId: q.id } });
     const delivery = f.db.find('deliveries', d => d.kind === 'ask')[0]!;
     assert.equal(delivery.supplement, null);
     assert.equal(delivery.text, 'Yes');

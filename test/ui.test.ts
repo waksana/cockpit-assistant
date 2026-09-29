@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Readable } from 'node:stream';
+import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import type { ModuleRequest, ModuleRoute } from '@waksana/cockpit-module-sdk/backend';
 import { routes } from '../src/http.ts';
+import { ref } from '../src/service.ts';
+import { timelineItem } from '../src/ui.ts';
+import type { NativeAttachment } from '../src/attachments.ts';
+import { Database } from '../src/database.ts';
+import { AssistantService } from '../src/service.ts';
 import { fixture, proof } from './fixtures.ts';
 import type { InputReceipt, Readiness, TimelineItem, TimelinePage } from '../src/ui-types.ts';
 import type { Publication } from '../src/types.ts';
@@ -87,7 +94,9 @@ test('timeline exact lookup and stream enrich questions without changing plain p
     assert.equal(item.topicTitle, 'Question topic');
     assert.equal(item.speaker, 'assistant');
     assert.equal(item.sessionId, 's1');
-    assert.deepEqual(item.question, { state: 'pending', choices: ['A', 'B'], allowFreeform: false });
+    assert.equal(item.text, 'Choose');
+    assert.deepEqual(item.revision, { version: 1, text: 'Choose', attachments: [] });
+    assert.deepEqual(item.question, { state: 'pending', stateVersion: 1, choices: ['A', 'B'], allowFreeform: false });
     question.state = 'answered';
     f.db.put('questions', question);
     assert.equal((await exact()).question?.state, 'answered');
@@ -104,14 +113,265 @@ test('timeline exact lookup and stream enrich questions without changing plain p
     } finally { controller.abort(); await iterator.return?.(); }
     const plain = (await f.request('GET', '/history')).body as { items: Record<string, unknown>[] };
     assert.ok(plain.items.every(entry => !('speaker' in entry)));
+    assert.ok(plain.items.every(entry => !('revision' in entry)));
+    assert.equal(plain.items[0]!.text, message.raw);
+    assert.match(String(plain.items[0]!.text), /Choices:\n- A\n- B\n\nFree-text answers: not allowed/);
     const status = f.service.publish({ type: 'status', messageId: message.id, text: 'No topic at publication' });
     const oldStatus = (await f.request('GET', '/timeline/items/:sequence',
       { params: { sequence: String(status.sequence) } })).body as TimelineItem;
     assert.equal(oldStatus.topicId, null);
     assert.equal(oldStatus.topicTitle, null);
+    assert.equal(oldStatus.text, status.text);
+    assert.equal(oldStatus.speaker, 'system');
+    assert.deepEqual(oldStatus.revision, { version: 1, text: 'Choose', attachments: [] });
     assert.equal((await f.request('GET', '/timeline/items/:sequence', { params: { sequence: '999' } })).status, 404);
     assert.equal(f.calls.length, 0);
   } finally { controller.abort(); f.close(); }
+});
+
+test('restored question state outranks a cached newer-sequence unknown status without a new publication', async () => {
+  const f = setup();
+  try {
+    const ask = { requestId: 'restored-question', question: 'Which project?', choices: ['First', 'Second'], allowFreeform: true };
+    f.service.syncQuestions('s1', [ask], true);
+    const question = f.db.list('questions').items[0]!;
+    const message = f.db.must('messages', question.messageId);
+    const published = f.service.publish({ type: 'question', messageId: message.id,
+      text: message.raw, sources: [ref(message)] });
+    f.service.syncQuestions('s1', [], false);
+    const status = f.db.find('publications', item => item.type === 'status')[0]!;
+    const cached = (await f.request('GET', '/timeline/items/:sequence',
+      { params: { sequence: String(status.sequence) } })).body as TimelineItem;
+    assert.equal(cached.question!.state, 'unknown');
+    assert.equal(cached.question!.stateVersion, 2);
+    const publications = f.db.list('publications').items;
+    f.service.syncQuestions('s1', [ask], true);
+    assert.deepEqual(f.db.list('publications').items, publications, 'restoration emits no new publication');
+    const stored = f.db.must('questions', question.id);
+    assert.equal(stored.stateVersion, 3);
+    const olderPage = (await f.request('GET', '/timeline',
+      { query: { before: status.sequence, limit: 1 } })).body as TimelinePage;
+    const fresh = olderPage.items[0]!;
+    assert.equal(fresh.id, published.id);
+    assert.ok(fresh.sequence < cached.sequence);
+    assert.equal(fresh.question!.state, 'pending');
+    assert.ok(fresh.question!.stateVersion > cached.question!.stateVersion);
+    assert.deepEqual(f.db.must('questions', question.id), stored, 'projection reads never write state');
+    assert.deepEqual(f.db.list('publications').items, publications);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.wakes(), 0);
+  } finally { f.close(); }
+});
+
+test('question counters advance only on state changes and ignore stale or invented input counters', () => {
+  const f = setup();
+  try {
+    const ask = { requestId: 'state-version', question: 'Proceed?', choices: ['Yes'] };
+    f.service.syncQuestions('s1', [ask], true);
+    const original = f.db.list('questions').items[0]!;
+    assert.equal(original.stateVersion, 1);
+    f.db.put('questions', { ...original, stateVersion: 999 });
+    assert.equal(f.db.must('questions', original.id).stateVersion, 1);
+    f.service.syncQuestions('s1', [ask], true);
+    assert.equal(f.db.must('questions', original.id).stateVersion, 1);
+    let version = 1;
+    for (const state of ['unknown', 'pending', 'stale', 'answered', 'unknown'] as const) {
+      f.db.put('questions', { ...original, state, stateVersion: 0 });
+      assert.equal(f.db.must('questions', original.id).stateVersion, ++version);
+      f.db.put('questions', { ...original, state, stateVersion: 500 });
+      assert.equal(f.db.must('questions', original.id).stateVersion, version);
+    }
+    f.db.put('questions', { ...original, id: 'another-question', stateVersion: 999 });
+    assert.equal(f.db.must('questions', 'another-question').stateVersion, 1);
+    const before = f.db.must('questions', original.id);
+    assert.throws(() => f.db.transaction(() => {
+      f.db.put('questions', { ...original, state: 'pending' });
+      throw new Error('Rollback state transition');
+    }), /Rollback/);
+    assert.deepEqual(f.db.must('questions', original.id), before);
+  } finally { f.close(); }
+});
+
+test('reopened legacy question documents read counter zero without migration and advance on their next transition', () => {
+  const path = `test/.question-state-${randomUUID()}.sqlite`;
+  let db = new Database(path);
+  try {
+    const service = new AssistantService(db);
+    const ask = { requestId: 'legacy-question', question: 'Original question?', choices: ['Continue'] };
+    service.syncQuestions('legacy-session', [ask], true);
+    const question = db.list('questions').items[0]!;
+    const message = db.must('messages', question.messageId);
+    const publication = service.publish({ type: 'question', messageId: message.id, text: message.raw,
+      sources: [ref(message)] });
+    db.sql.prepare(`UPDATE questions SET document=json_remove(document, '$.stateVersion') WHERE id=?`).run(question.id);
+    db.close();
+    db = new Database(path);
+    const reopened = new AssistantService(db);
+    const raw = () => db.sql.prepare('SELECT document FROM questions WHERE id=?').get(question.id)!.document;
+    const original = raw();
+    assert.equal(db.must('questions', question.id).stateVersion, 0);
+    assert.equal(db.list('questions').items[0]!.stateVersion, 0);
+    assert.equal(db.forMessage('questions', message.id).items[0]!.stateVersion, 0);
+    assert.equal(timelineItem(reopened, publication).question!.stateVersion, 0);
+    assert.equal(raw(), original);
+    assert.equal(db.sql.prepare('PRAGMA user_version').get()!.user_version, 1);
+    db.put('questions', { ...question, stateVersion: 900 });
+    assert.equal(db.must('questions', question.id).stateVersion, 0, 'saving the same legacy state does not increment');
+    reopened.syncQuestions('legacy-session', [], false);
+    assert.equal(db.must('questions', question.id).stateVersion, 1);
+    reopened.syncQuestions('legacy-session', [ask], true);
+    assert.equal(db.must('questions', question.id).stateVersion, 2);
+    db.close();
+    db = new Database(path);
+    assert.equal(db.must('questions', question.id).stateVersion, 2);
+    assert.equal(db.must('publications', publication.id).text, message.raw);
+  } finally {
+    db.close();
+    for (const suffix of ['', '-wal', '-shm']) rmSync(`${path}${suffix}`, { force: true });
+  }
+});
+
+test('user corrections project current text and attachments without mutating publications, receipts or queue state', async () => {
+  const f = setup();
+  try {
+    const originalAttachments: NativeAttachment[] = [{ type: 'file', path: '/synthetic/old.txt' }];
+    const currentAttachments: NativeAttachment[] = [{ type: 'file', path: '/synthetic/new.txt' }];
+    const input = f.service.accept({ requestId: 'corrected-user', text: 'Old wording', attachments: originalAttachments });
+    const publication = f.service.publish({ type: 'message', messageId: input.message.id,
+      text: input.message.raw, attachments: originalAttachments, sources: [ref(input.message)] });
+    f.service.correct(input.message.id, 'Correct wording', 1, 'User corrected their message', currentAttachments);
+    const correction = f.db.find('publications', item => item.type === 'correction')[0]!;
+    const before = {
+      publications: f.db.list('publications').items,
+      work: f.db.list('work').items,
+      operations: f.db.list('operations').items,
+      messages: f.db.list('messages').items,
+      version: f.service.version,
+    };
+    const recent = (await f.request('GET', '/timeline', { query: { limit: 1 } })).body as TimelinePage;
+    assert.equal(recent.items[0]!.id, correction.id);
+    assert.equal(recent.items[0]!.text, 'User corrected their message');
+    assert.equal(recent.items[0]!.speaker, 'system');
+    assert.deepEqual(recent.items[0]!.revision, { version: 2, text: 'Correct wording', attachments: currentAttachments });
+    const older = (await f.request('GET', '/timeline', { query: { before: recent.before!, limit: 1 } })).body as TimelinePage;
+    assert.equal(older.items[0]!.id, publication.id);
+    assert.equal(older.items[0]!.text, 'Correct wording');
+    assert.deepEqual(older.items[0]!.attachments, currentAttachments);
+    assert.deepEqual(older.items[0]!.revision, recent.items[0]!.revision);
+    assert.equal(older.watermark, correction.sequence);
+    const plain = (await f.request('GET', '/history')).body as { items: Publication[] };
+    assert.deepEqual(plain.items, before.publications);
+    assert.equal(plain.items[0]!.text, 'Old wording');
+    assert.deepEqual(plain.items[0]!.attachments, originalAttachments);
+    const receipt = (await f.request('GET', '/inputs/:requestId',
+      { params: { requestId: 'corrected-user' } })).body as InputReceipt;
+    assert.equal(receipt.input.text, 'Old wording');
+    assert.deepEqual(receipt.input.attachments, originalAttachments);
+    assert.deepEqual({
+      publications: f.db.list('publications').items, work: f.db.list('work').items,
+      operations: f.db.list('operations').items, messages: f.db.list('messages').items, version: f.service.version,
+    }, before);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.wakes(), 0);
+  } finally { f.close(); }
+});
+
+test('native corrections update old projected content but preserve a newly published same-version summary', () => {
+  const f = setup();
+  try {
+    const events = (version: number) => [
+      { id: `start-${version}`, type: 'assistant.turn_start', parentId: null, data: {} },
+      { id: `message-${version}`, type: 'assistant.message', parentId: `start-${version}`,
+        data: { messageId: 'native-output', content: `Native text ${version}`, toolRequests: [],
+          attachments: [{ type: 'file', path: `/synthetic/result-${version}.txt` }] } },
+      { id: `end-${version}`, type: 'assistant.turn_end', parentId: `message-${version}`, data: {} },
+    ];
+    f.runtime.ingestion.apply('s1', 1, events(1), 'cursor-1');
+    const message = f.db.list('messages').items[0]!;
+    const oldPublication = f.service.publish({ type: 'message', messageId: message.id, text: 'Original useful summary',
+      attachments: message.attachments, sources: [ref(message)] });
+    f.runtime.ingestion.apply('s1', 1, events(2), 'cursor-2');
+    const current = f.db.must('messages', message.id);
+    const correction = f.db.find('publications', item => item.type === 'correction')[0]!;
+    const corrected = timelineItem(f.service, oldPublication);
+    assert.equal(corrected.text, 'Native text 2');
+    assert.deepEqual(corrected.attachments, current.attachments);
+    assert.deepEqual(timelineItem(f.service, correction).revision, {
+      version: 2, text: 'Native text 2', attachments: current.attachments,
+    });
+    const summary = f.service.publish({ type: 'message', messageId: message.id, text: 'New useful summary',
+      attachments: current.attachments, sources: [ref(current)] });
+    const sameVersion = timelineItem(f.service, summary);
+    assert.equal(sameVersion.text, 'New useful summary');
+    assert.equal(sameVersion.revision!.text, 'Native text 2');
+    assert.equal(sameVersion.revision!.version, 2);
+    assert.deepEqual(f.db.must('publications', oldPublication.id), oldPublication);
+    assert.deepEqual(f.db.must('publications', summary.id), summary);
+    assert.equal(f.db.meta<{ raw: string }>(`revision:${message.id}:1`, { raw: '' }).raw, 'Native text 1');
+  } finally { f.close(); }
+});
+
+test('same-version reclassification and legacy missing source versions do not overwrite published summaries', () => {
+  const f = setup();
+  try {
+    const message = f.service.addMessage({ kind: 'reply', raw: 'Detailed original answer', sessionId: 's1' });
+    const publication = f.service.publish({ type: 'message', messageId: message.id, text: 'Concise published summary',
+      sources: [ref(message)] });
+    f.db.transaction(() => f.service.classify(message, { title: 'Reclassified topic', independent: true }, 'Correct topic'));
+    assert.equal(f.db.must('messages', message.id).assignmentVersion, 1);
+    assert.equal(timelineItem(f.service, publication).text, 'Concise published summary');
+    assert.deepEqual(timelineItem(f.service, publication).revision, { version: 1, text: message.raw, attachments: [] });
+    const legacy = f.service.publish({ type: 'message', messageId: message.id, text: 'Legacy published summary' });
+    f.service.correct(message.id, 'New detailed answer', 1, 'Native source correction');
+    assert.equal(timelineItem(f.service, publication).text, 'New detailed answer');
+    assert.equal(timelineItem(f.service, legacy).text, 'Legacy published summary');
+    assert.equal(timelineItem(f.service, legacy).revision!.version, 2);
+  } finally { f.close(); }
+});
+
+test('clarifications retain their own wording and never inherit source revisions', () => {
+  const f = setup();
+  try {
+    const input = f.service.accept({ requestId: 'clarification-source', text: 'Which one is better?' });
+    const clarification = f.service.publish({ type: 'clarification', messageId: input.message.id,
+      text: 'Do you mean the first project or the second?', sources: [ref(input.message)] });
+    const risk = f.service.publish({ type: 'risk', messageId: input.message.id, text: 'Shared context notice' });
+    f.service.correct(input.message.id, 'Changed user wording', 1, 'Correction');
+    const item = timelineItem(f.service, clarification);
+    assert.equal(item.text, clarification.text);
+    assert.equal(item.speaker, 'assistant');
+    assert.equal('revision' in item, false);
+    assert.equal('revision' in timelineItem(f.service, risk), false);
+    const standalone = timelineItem(f.service, f.service.publish({ type: 'status', text: 'Native wake accepted' }));
+    assert.equal(standalone.speaker, 'system');
+    assert.equal('revision' in standalone, false);
+  } finally { f.close(); }
+});
+
+test('internal carriers and system sources are not assistant speech; ordinary disabled history remains speech', () => {
+  const f = setup();
+  try {
+    for (const sessionId of ['coordinator', 'memory']) {
+      const message = f.service.addMessage({ kind: 'reply', raw: 'Internal role output', sessionId });
+      const publication = f.service.publish({ type: 'message', messageId: message.id, text: message.raw });
+      assert.equal(timelineItem(f.service, publication).speaker, 'system');
+      const question = f.service.publish({ type: 'question', messageId: message.id, text: 'Internal question' });
+      assert.equal(timelineItem(f.service, question).speaker, 'system');
+    }
+    const system = f.service.addMessage({ kind: 'system', raw: 'Internal lifecycle event', sessionId: 's1' });
+    for (const type of ['message', 'question', 'clarification'] as const) {
+      const publication = f.service.publish({ type, messageId: system.id, text: system.raw });
+      assert.equal(timelineItem(f.service, publication).speaker, 'system');
+    }
+    const ordinary = f.service.addMessage({ kind: 'reply', raw: 'A historical answer about coordinator design',
+      sessionId: 's1', historical: true });
+    f.db.put('receptions', { ...f.db.must('receptions', 's1'), enabled: false, availability: 'missing' });
+    const history = f.service.publish({ type: 'message', messageId: ordinary.id, text: ordinary.raw,
+      sources: [ref(ordinary)] });
+    assert.equal(timelineItem(f.service, history).speaker, 'assistant');
+    assert.deepEqual(f.db.must('publications', history.id), history);
+    assert.equal(f.calls.length, 0);
+  } finally { f.close(); }
 });
 
 test('readiness rechecks both roles passively every time and inspect only reads the exact session', async () => {

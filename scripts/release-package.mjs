@@ -19,7 +19,7 @@ export async function packageRelease(root, sequence, sourceSha, output = 'releas
   for (const version of [pkg.version, manifest.version, lock.version, lock.packages[''].version]) {
     assert.equal(version, '0.0.0-dev', 'Source manifests keep the development version');
   }
-  assert.equal(pkg.devDependencies['@waksana/cockpit-module-sdk'], '0.7.0');
+  assert.equal(pkg.devDependencies['@waksana/cockpit-module-sdk'], '0.8.0');
   const descriptor = { ...expected, product: await product(root) };
   const directory = resolve(root, output);
   mkdirSync(directory);
@@ -33,7 +33,7 @@ export async function packageRelease(root, sequence, sourceSha, output = 'releas
     json(join(stage, 'package.json'), { ...pkg, version: expected.version });
     json(join(stage, 'cockpit.module.json'), { ...manifest, version: expected.version });
     json(join(stage, 'module-build.json'), { format: 1, version: expected.version, sourceSha,
-      node: process.versions.node, platform: process.platform, arch: process.arch, sdk: '0.7.0' });
+      node: process.versions.node, platform: process.platform, arch: process.arch, sdk: '0.8.0' });
     json(join(stage, 'cockpit-deployment.json'), descriptor);
     json(join(directory, 'cockpit-deployment.json'), descriptor);
     const archive = join(directory, expected.archive.name);

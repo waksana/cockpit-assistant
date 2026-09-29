@@ -51,10 +51,10 @@ test('native answers use request interface, not prompt; stale request is rejecte
     f.metas.get('s1')!.ask = ask;
     const q = f.db.must('questions', questionKey('s1', 'q'));
     f.db.put('anchors', { id: q.messageId, messageId: q.messageId, sessionId: 's1', kind: 'ask', requestId: 'q' });
-    const input = f.service.accept({ requestId: 'answer', text: 'Yes', replyTo: q.messageId });
+    const input = f.service.accept({ requestId: 'answer', text: 'Yes' });
     const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
     f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'T', independent: true },
-      reason: 'Bound answer', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0 } });
+      reason: 'Context selects answer', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0, answerQuestionId: q.id } });
     await f.runtime.wake();
     assert.equal(f.calls.filter(c => c.name === 'answer').length, 1);
     assert.equal(f.calls.filter(c => c.name === 'prompt' && JSON.stringify(c.body).includes('"s1"')).length, 0);

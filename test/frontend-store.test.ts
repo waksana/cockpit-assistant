@@ -103,20 +103,39 @@ test('not-ready roles never post input and leave editing available', async () =>
   } finally { f.store.dispose(); }
 });
 
-test('accepted anchored send preserves edits made after capture, including across close and reopen', async () => {
+test('ordinary input omits replyTo and preserves newer edits across page navigation', async () => {
   const pending = deferred<Response>();
   const f = await fixture(path => path === '/messages' ? pending.promise : undefined);
   try {
-    f.store.open(); await turn(); f.store.reply(item(5, 'old-topic')); f.store.edit('old reply');
+    f.store.open(); await turn(); f.store.edit('old reply');
     const sending = f.store.send();
     f.store.close(); f.store.open(); f.store.edit('new draft'); await turn();
     pending.resolve(Response.json({ message: { id: 'saved' }, work: {} })); await sending;
     assert.equal(f.store.getSnapshot().draft.text, 'new draft');
     assert.equal(f.store.getSnapshot().submissions[0]?.state, 'accepted');
     const body = JSON.parse(String(f.requests.find(request => request.path === '/messages')?.init?.body));
-    assert.equal(body.replyTo, 'anchor5');
+    assert.equal(Object.hasOwn(body, 'replyTo'), false);
     assert.equal(body.text, 'old reply');
     assert.equal(body.topicId, undefined);
+  } finally { f.store.dispose(); }
+});
+
+test('a displayed choice-only question does not bind new natural input or disable its attachments', async () => {
+  const question = { ...item(10), type: 'question', question: {
+    state: 'pending', choices: ['Proceed', 'Wait'], allowFreeform: false,
+  } };
+  const f = await fixture(path => path === '/timeline?limit=50'
+    ? Response.json({ items: [question], before: 10, watermark: 10, hasMore: false }) : undefined);
+  try {
+    f.store.open(); await turn();
+    f.store.edit('I am asking about a different topic.');
+    assert.equal(f.store.getSnapshot().draft.submittable, true);
+    assert.equal(f.store.getSnapshot().draft.capabilities.attachments, true);
+    assert.equal(f.store.getSnapshot().draft.askContext, undefined);
+    await f.store.send();
+    const body = JSON.parse(String(f.requests.find(request => request.path === '/messages')?.init?.body));
+    assert.equal(body.text, 'I am asking about a different topic.');
+    assert.equal(Object.hasOwn(body, 'replyTo'), false);
   } finally { f.store.dispose(); }
 });
 
@@ -167,11 +186,10 @@ test('a successful POST cannot ACK without a receipt matching the entire immutab
     });
     try {
       f.store.open(); await turn();
-      f.store.reply(item(5)); f.store.edit('must survive');
+      f.store.edit('must survive');
       await f.store.send();
       assert.equal(f.store.getSnapshot().submissions[0]?.state, 'unknown', field);
       assert.equal(f.store.getSnapshot().draft.text, 'must survive', field);
-      assert.equal(f.store.getSnapshot().reply?.anchorId, 'anchor5', field);
       await f.store.inspectInput(String(captured.requestId));
       await f.store.send();
       assert.equal(f.requests.filter(request => request.path === '/messages').length, 1, field);
@@ -179,18 +197,19 @@ test('a successful POST cannot ACK without a receipt matching the entire immutab
   }
 });
 
-test('binding HTTP rejection with unknown durable receipt cannot be repeated as a new operation', async () => {
+test('activation HTTP rejection with unknown durable receipt cannot be repeated as a new operation', async () => {
   const f = await fixture(path => {
-    if (path === '/roles/bind') return Response.json({ error: { code: 'ROLE_NOT_READY', message: 'preparation ran' } }, { status: 409 });
+    if (path === '/readiness') return Response.json({ ...ready, canSend: false,
+      roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
+    if (path === '/roles/activate') return Response.json({ error: { code: 'ROLE_NOT_READY', message: 'preparation ran' } }, { status: 409 });
     if (path.startsWith('/operations/')) return Response.json({ id: decodeURIComponent(path.split('/').at(-1)!),
       state: 'unknown', fingerprint: 'x', result: null });
   });
   try {
     f.store.open(); await turn();
-    await f.store.bind('coordinator', 'candidate', 'model', 1);
     assert.equal(f.store.getSnapshot().setup[0]?.state, 'unknown');
-    await f.store.bind('coordinator', 'candidate', 'model', 1);
-    assert.equal(f.requests.filter(request => request.path === '/roles/bind').length, 1);
+    f.store.close(); f.store.open(); await turn();
+    assert.equal(f.requests.filter(request => request.path === '/roles/activate').length, 1);
   } finally { f.store.dispose(); }
 });
 
@@ -213,7 +232,7 @@ test('fresh opening captures bound role epochs before activation; late completio
     ] });
     f.store.close();
     assert.equal(post.init?.signal?.aborted, false);
-    f.store.open(); f.store.edit('new draft'); f.store.reply(item(5, 'retained-topic')); await turn();
+    f.store.open(); f.store.edit('new draft'); await turn();
     assert.equal(f.store.getSnapshot().setup[0]?.requestId, operation.requestId);
     assert.equal(f.requests.filter(request => request.path === '/roles/activate').length, 1);
     readiness = ready;
@@ -222,7 +241,6 @@ test('fresh opening captures bound role epochs before activation; late completio
     assert.equal(f.store.getSnapshot().setup[0]?.state, 'accepted');
     assert.equal(f.store.getSnapshot().readiness?.canSend, true);
     assert.equal(f.store.getSnapshot().draft.text, 'new draft');
-    assert.equal(f.store.getSnapshot().reply?.topicId, 'retained-topic');
   } finally { f.store.dispose(); }
 });
 

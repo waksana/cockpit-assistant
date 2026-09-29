@@ -29,7 +29,7 @@ Readiness separately checks the actual model, directory, applied roles and
 resources. An intentional recovery replacement retains compare-and-swap epochs;
 late work cannot commit through a retired carrier.
 
-The coordinator may request an ordinary session for a claimed, unanchored user
+The coordinator may request an ordinary session for a claimed user
 input when no suitable existing target exists. Creation requires an explicit
 working directory and a durable per-work receipt; it does not deliver the user
 input or complete the work. The coordinator reads the result and makes a separate
@@ -50,7 +50,7 @@ ordinary-session cursor history -> evidenced output -> coordinator -> publicatio
 SQLite uses WAL and `synchronous=FULL`. A Linux abstract-socket lease prevents a
 second cooperating activation from recovering or dispatching the same store.
 The database commit precedes an acceptance response. Message bodies, source
-identities, classification versions, anchors, role epochs, leases, operation
+identities, classification versions, historical anchors, role epochs, leases, operation
 fingerprints, and effect/publication state are durable. Sequence cursors are
 database order, never UUID lexical order.
 
@@ -124,20 +124,49 @@ This proves a complete text response, not the success of any work described in
 that text. Delivery-to-response correlation remains `unknown`; session identity
 does not prove which of several user inputs a response answers.
 
-## Anchors, questions, and reception
+## Contextual routing, questions, and historical compatibility
 
-An explicit reply anchor freezes its original reception and optional native
-request ID. Topic reclassification and handoff never rewrite it. An ordinary
-comment carries its source reference through a normal queued prompt. A native
-question goes through the native answer API, retaining its exact request ID,
-literal choices, and free-text restrictions. The program rechecks current
-native questions immediately before answering. Races can still reject an
-answer; they never redirect it to a replacement question.
+New inputs contain only `requestId`, `text`, optional native `attachments`, and
+an optional `topicId` context hint. `POST /messages` strictly rejects `replyTo`,
+including null, rather than silently changing old delivery semantics. No new
+output creates a generic anchor. The coordinator selects a topic, reception, or
+current native question using original messages, source sessions, recent topics,
+routes, and publications. Publications expose prior recipient clarifications
+with their original input and topic, so the next ordinary answer can continue
+that exchange. Only a genuinely uncertain recipient warrants one brief target
+clarification; this is not another business authorization or demand for a
+literal option. Semantic interpretation is not guaranteed native causality.
 
-An unanchored answer can map automatically only to one unique literal pending
-choice. Other ambiguous answers need clarification. Several pending questions
-coexist; a missing/unloaded/deleted original session is visible, not replaced
-silently. Ask answer text never receives a risk warning or context suffix.
+Native answers select a stored `answerQuestionId` and its single session; the
+backend retains the real request ID. Exact option text is a choice; other text
+is forwarded unchanged as freeform when allowed, including reservations,
+comments, and follow-up questions. Choice-only questions and attachments have
+explicit route errors, without stripping content or bypassing them via prompts.
+Input can be durably accepted before its eventual route is known. A pending
+question blocks ordinary prompts only to its own session, not other topics or
+sessions. A matching option alone does not block creation for an unrelated goal.
+
+Dispatch rechecks the original request. An ask rejected before the native call
+(including a stale/replaced question or unavailable target) leaves the rejected
+delivery as evidence and returns the same input work to pending with the observed
+question facts and their availability. A definitive native rejection
+also permits deliberate re-evaluation. Fresh lease/version checks and a new
+decision receipt are required; no automatic retarget or resend occurs. User
+publication is not duplicated by that recovery. Accepted, calling and unknown
+deliveries prevent rerouting the same message; unknown native effects never
+reopen work automatically. Ask text receives no risk warning or context suffix.
+
+There is no destructive migration. Historical `Message.replyTo`,
+`Publication.anchorId`, and anchors remain intact. New records retain null
+fields for storage compatibility. Previously accepted anchored input keeps its
+original destination, and old accepted/unknown operations retain their original
+fingerprints and receipts. Only `GET /inputs/:requestId` accepts the historical input
+shape for receipt readback (`ReceiptInput`, optional original `replyTo`);
+`NativeInput` has no `replyTo`. A browser with an old pending transaction must
+preserve its complete payload and request ID, compare the complete normalized
+receipt, and use GET-only recovery. It must never strip the field or POST the
+old request again, even if no receipt is found. No anchors are required for new
+messages, and this compatibility is not a second routing API.
 
 Reception records now index observed ordinary sessions; they are not a separate
 role or a prerequisite the user must configure. A topic may route to several
@@ -145,7 +174,7 @@ ordinary sessions and a session may serve several topics. Topic labels do not is
 context. Risk detection uses active independent topics and actual reception
 relationships. Its exact warning is both published and appended to the normal
 user prompt as separately attributed context; no extra native turn is created.
-Durable context-exposure records include anchored deliveries and survive routing
+Durable context-exposure records include historical deliveries and survive routing
 changes; a handoff never means the previous reception forgot an active topic.
 Rate limiting and an explicit continue-sharing acknowledgment suppress repeats.
 The notice alone is not permission to create or split sessions; creating a target
@@ -169,8 +198,8 @@ original native session/event IDs and reply anchors remain provenance.
 
 ## Publication and reconnect
 
-Publication records contain full display text, references, topic, and optional
-stable anchor. Raw source text is stored separately. Accepted user input remains
+Publication records contain full display text, references, topic, and an optional
+historical anchor. New publications have no anchor. Raw source text is stored separately. Accepted user input remains
 pending source/work data until a coordinator decision publishes it. The durable
 event API supports bounded replay; SSE frames contain whole publication JSON values,
 not token deltas. Reconnect after the last fully consumed event ID; duplicates

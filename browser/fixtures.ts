@@ -18,7 +18,7 @@ export const longMarkdown = [
 export function publication(sequence: number, text: string, patch: Partial<TimelineItem> = {}): TimelineItem {
   return {
     id: `publication-${sequence}`, sequence, type: 'message', messageId: `message-${sequence}`,
-    topicId: 'topic-a', topicTitle: '旅行计划 A', text, anchorId: `anchor-${sequence}`,
+    topicId: 'topic-a', topicTitle: '旅行计划 A', text, anchorId: null,
     sources: [], createdAt: 1_750_000_000_000 + sequence * 1000, speaker: 'assistant',
     sessionId: 'synthetic-reception', question: null, attachments: [], ...patch,
   };
@@ -85,11 +85,19 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
   await page.route('**/*', async route => {
     const url = new URL(route.request().url());
     const staticPath = ['/', '/host.js', '/host.css', '/_modules', '/favicon.ico'].includes(url.pathname)
+      || url.pathname.startsWith('/modules/')
       || url.pathname.startsWith('/_modules/assets/assistant/')
       || url.pathname.startsWith('/_modules/assets/synthetic-probe/');
     if (url.origin !== 'http://127.0.0.1:' + (process.env.ASSISTANT_BROWSER_PORT ?? '4179') || !staticPath) {
       seenUnexpected.push(url.href);
       await route.abort();
+      return;
+    }
+    if (url.pathname.startsWith('/modules/') && route.request().isNavigationRequest()) {
+      // Only the HTTP SPA fallback is synthetic. The production host parses,
+      // renders and navigates the original URL; no fixture router is involved.
+      const response = await page.request.get('/');
+      await route.fulfill({ response });
       return;
     }
     await route.fallback();
@@ -172,7 +180,7 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
     await json(route, { error: { code: 'UNEXPECTED_FIXTURE_REQUEST', message: path } }, 501);
   });
   return {
-    posts, requests, consoleErrors, seenUnexpected,
+    posts, requests, receipts, consoleErrors, seenUnexpected,
     setReadiness: (value: Readiness) => { currentReadiness = value; },
     setTimeline: (items: TimelineItem[]) => { latest = items; },
   };

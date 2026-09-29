@@ -30,10 +30,12 @@ export const decisionSchema = proofSchema.extend({
   reason: z.string().min(1).max(4000),
   action: z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('route'), sessionIds: z.array(id).min(1).max(8),
-      routeVersion: z.int().nonnegative(), answerQuestionId: id.optional(),
+      routeVersion: z.int().nonnegative(), answerQuestionId: id.describe(
+        'Current stored native question selected using conversation context, not option-text matching. Its session must be the sole target.').optional(),
       context: z.string().max(16_000).optional() }),
     z.strictObject({ kind: z.literal('publish'), text: text.optional() }),
-    z.strictObject({ kind: z.literal('clarify'), text }),
+    z.strictObject({ kind: z.literal('clarify'), text: text.describe(
+      'One brief recipient clarification only when context is genuinely ambiguous, or explain an actual native answer constraint. Do not re-ask business authorization or demand a reply anchor.') }),
     z.strictObject({ kind: z.literal('suppress'), reason: z.string().min(1).max(4000) }),
   ]),
 });
@@ -62,7 +64,7 @@ export const createSessionSchema = z.strictObject({
 });
 export const roleReadSchema = z.strictObject({
   role, epoch: z.int().positive(),
-  resource: z.enum(['work', 'receipts', 'topics', 'routes', 'receptions', 'messages', 'questions', 'memories', 'deliveries']),
+  resource: z.enum(['work', 'receipts', 'topics', 'routes', 'receptions', 'messages', 'publications', 'questions', 'memories', 'deliveries']),
   after: z.int().nonnegative().default(0), limit: z.int().min(1).max(100).default(50),
   workId: id.optional(),
 });

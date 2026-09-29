@@ -1,6 +1,6 @@
 import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend';
 import { z } from 'zod';
-import type { Readiness, SessionInspection, TimelineItem, TimelinePage } from '../src/ui-types.ts';
+import type { Readiness, TimelineItem, TimelinePage } from '../src/ui-types.ts';
 import type { Operation, Role } from '../src/types.ts';
 import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts';
 import { createInput } from './input.ts';
@@ -83,19 +83,19 @@ export async function readPublications(response: Response, apply: (item: Timelin
 
 export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'signal' | 'report' | 'state'>): AssistantActions {
   let notify = () => {};
-  const input = createInput(context, itemSchema, () => notify());
+  const input = createInput(context, () => notify());
   let state: Snapshot = {
     open: false, items: [], hasOlder: false, loading: false, loadingOlder: false,
     stream: 'disconnected', error: null, readiness: null, checking: false, readinessError: null,
-    draft: input.reference.getSnapshot(), reply: input.business().reply,
+    draft: input.reference.getSnapshot(),
     submissions: input.business().submissions, setup: [],
   };
   const listeners = new Set<() => void>();
   let disposed = false;
   notify = () => {
     if (disposed) return;
-    const { reply, submissions } = input.business();
-    state = { ...state, draft: input.reference.getSnapshot(), reply, submissions };
+    const { submissions } = input.business();
+    state = { ...state, draft: input.reference.getSnapshot(), submissions };
     for (const listener of listeners) listener();
   };
   let generation = 0;
@@ -207,7 +207,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
           && result.roles.some(role => role.sessionId !== null && role.status === 'unloaded')) {
           activationAttempts.set(key, result.roles.filter(role => role.sessionId !== null && role.status === 'unloaded')
             .map(role => role.role));
-          await operate('/roles/activate', 'activate', activationLabel, { bindings });
+          await activateRoles(bindings);
         }
       }
     } catch (error) {
@@ -229,34 +229,25 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
   };
   const setOperation = (requestId: string, patch: Partial<SetupOperation>) =>
     update({ setup: state.setup.map(entry => entry.requestId === requestId ? { ...entry, ...patch } : entry) });
-  const operate = async (path: string, prefix: string, label: string, value: Record<string, unknown>) => {
-    if (state.setup.some(operation => operation.label === label
+  const activateRoles = async (bindings: { role: Role; sessionId: string | null; epoch: number }[]) => {
+    if (state.setup.some(operation => operation.label === activationLabel
       && (operation.state === 'pending' || operation.state === 'unknown'))) return;
     const requestId = id();
-    update({ setup: [...state.setup, { requestId, receiptId: `${prefix}:${requestId}`,
-      label, state: 'pending', detail: '请求处理中；关闭窗口不代表撤销' }] });
+    const receiptId = `activate:${requestId}`;
+    update({ setup: [...state.setup, { requestId, receiptId,
+      label: activationLabel, state: 'pending', detail: '请求处理中；离开页面不代表撤销' }] });
     try {
-      const result = await post<unknown>(path, { requestId, ...value });
-      if (prefix === 'activate') {
-        const receipt = operationSchema.parse(result);
-        if (receipt.id !== `${prefix}:${requestId}`) throw new Error('加载回执编号不匹配；请检查原操作');
-        setOperation(requestId, { state: operationState(receipt.state), result: receipt.result,
-          detail: `加载回执：${receipt.state}；实际就绪状态以刷新检查为准，不会自动重试` });
-      } else {
-        const receipt = z.object({ state: z.string(), result: z.unknown() }).safeParse(result);
-        const effectState = receipt.success ? receipt.data.state : 'accepted';
-        setOperation(requestId, { state: effectState === 'accepted' ? 'accepted'
-          : effectState === 'rejected' || effectState === 'cancelled' ? 'error' : 'unknown',
-        detail: effectState === 'accepted' ? '已接受，请查看回执并刷新状态'
-          : `回执状态：${effectState}，不会自动重试`, result });
-      }
+      const receipt = operationSchema.parse(await post<unknown>('/roles/activate', { requestId, bindings }));
+      if (receipt.id !== receiptId) throw new Error('加载回执编号不匹配；请检查原操作');
+      setOperation(requestId, { state: operationState(receipt.state), result: receipt.result,
+        detail: `加载回执：${receipt.state}；实际就绪状态以刷新检查为准，不会自动重试` });
     } catch (error) {
-      // A binding failure may follow successful resource preparation. HTTP 409 alone
+      // Activation can fail after a carrier loads. HTTP rejection alone
       // does not establish that nothing happened; the durable receipt owns the effect.
       setOperation(requestId, { state: 'unknown', detail: errorText(error) });
       try {
-        const receipt = operationSchema.parse(await read<Operation>(`/operations/${encodeURIComponent(`${prefix}:${requestId}`)}`, context.signal));
-        if (receipt.id !== `${prefix}:${requestId}`) throw new Error('操作回执编号不匹配');
+        const receipt = operationSchema.parse(await read<Operation>(`/operations/${encodeURIComponent(receiptId)}`, context.signal));
+        if (receipt.id !== receiptId) throw new Error('操作回执编号不匹配');
         setOperation(requestId, { state: operationState(receipt.state),
         result: receipt.result, detail: `${errorText(error)}；回执：${receipt.state}` });
       } catch (inspectionError) {
@@ -284,20 +275,16 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       void refresh(true);
     },
     close() {
-      try { input.close(); }
-      catch (error) { update({ error: errorText(error) }); return; }
       ++generation;
       ++readinessGeneration;
       lifetime?.abort();
       stopStream();
       update({ open: false, checking: false, stream: 'disconnected' });
+      try { input.close(); }
+      catch (error) { update({ error: errorText(error) }); context.report(error); }
     },
     edit(text) {
       try { input.edit(text); }
-      catch (error) { update({ error: errorText(error) }); }
-    },
-    reply(item) {
-      try { input.reply(item); }
       catch (error) { update({ error: errorText(error) }); }
     },
     async send() {
@@ -328,12 +315,6 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       } else void connect(generation, true);
     },
     refresh: () => refresh(),
-    inspectSession: sessionId => read<SessionInspection>(`/sessions/${encodeURIComponent(sessionId)}/inspect`, lifetime?.signal),
-    createSession: (cwd, role) => operate('/sessions', 'create', `创建${role ?? 'reception'}`, { cwd, ...(role ? { role } : {}) }),
-    bind: (role, sessionId, expectedModelId, expectedEpoch) =>
-      operate('/roles/bind', 'bind', `绑定${role}`, { role, sessionId, expectedModelId, expectedEpoch, definitionVersion: '1' }),
-    enroll: (sessionId, label) => operate('/enrollment', 'enroll', '接入接待者',
-      { sessionId, label, kind: 'reception', evidence: 'User explicitly selected this session in the Assistant setup interface.' }),
     async inspectOperation(requestId) {
       const operation = state.setup.find(entry => entry.requestId === requestId);
       if (!operation) return null;

@@ -118,19 +118,13 @@ test('pre-effect rejection alone permits a corrected explicit choice while prese
   } finally { f.close(); }
 });
 
-test('anchors, native choices, stale work and foreign or internal callers fail before native effects', async () => {
+test('historical anchors, stale work and foreign or internal callers fail before native effects', async () => {
   const cases: [string, (f: ReturnType<typeof setup>) => void, Partial<McpInvocationMeta>, string][] = [
     ['anchor', f => {
       const work = f.db.must('work', f.input.workId);
       const message = f.db.must('messages', work.messageId!);
       f.db.put('messages', { ...message, replyTo: 'original-native-anchor' });
     }, {}, 'ANCHOR_MISMATCH'],
-    ['choice', f => {
-      f.service.syncQuestions('s1', [{ requestId: 'ask', question: 'Continue?',
-        choices: ['Start a new project in /synthetic/project'], allowFreeform: false }], true);
-      const fresh = f.service.claim(f.identities.coordinator, 'coordinator', 1, f.input.workId)!;
-      Object.assign(f.input, proof(fresh, f.input.requestId));
-    }, {}, 'PENDING_ASK'],
     ['stale lease', f => f.advance(300_001), {}, 'STALE_LEASE'],
     ['stale state', f => { f.service.changed(); }, {}, 'STALE_STATE'],
     ['foreign', () => {}, { sessionId: 'foreign', runtimeSessionId: 'foreign' }, 'STALE_ROLE'],
@@ -151,6 +145,18 @@ test('anchors, native choices, stale work and foreign or internal callers fail b
       assert.equal(f.db.get('operations', `topic-create:${f.input.workId}`), undefined, label);
     } finally { f.close(); }
   }
+});
+
+test('unrelated pending questions and matching option text do not hijack new-topic creation', async () => {
+  const f = setup();
+  try {
+    f.service.syncQuestions('s1', [{ requestId: 'ask', question: 'Which example sentence?',
+      choices: ['Start a new project in /synthetic/project'], allowFreeform: false }], true);
+    const fresh = f.service.claim(f.identities.coordinator, 'coordinator', 1, f.input.workId)!;
+    Object.assign(f.input, proof(fresh, f.input.requestId));
+    assert.equal((await f.create()).state, 'accepted');
+    assert.equal(f.creates().length, 1);
+  } finally { f.close(); }
 });
 
 test('identity authorization is still required to replay an accepted operation', async () => {

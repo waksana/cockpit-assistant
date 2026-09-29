@@ -4,17 +4,21 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { prepareReleases } from '../browser/release-fixtures.mjs';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const output = join(root, 'node_modules/.cache/assistant-browser');
-export const hostRevision = '0dcfd6688b4c01b3f29776ee804b901612a6ae9b';
-const host = join(output, 'host');
+export const hostRevision = 'd2dddc9d58f3673d69a682a941d9c9cc8e20976d';
+export const host = process.env.COCKPIT_FIXTURE_HOST
+  ? resolve(process.env.COCKPIT_FIXTURE_HOST) : join(output, 'host');
 const require = createRequire(import.meta.url);
 const dependencyPaths = [root, ...(process.env.COCKPIT_BROWSER_DEPENDENCIES
   ? [process.env.COCKPIT_BROWSER_DEPENDENCIES] : [])];
 const dependency = name => require.resolve(name, { paths: dependencyPaths });
 const git = args => execFileSync('git', ['-C', host, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
+await mkdir(output, { recursive: true });
+if (!process.env.COCKPIT_FIXTURE_HOST) {
 await mkdir(host, { recursive: true });
 try { await access(join(host, '.git')); } catch { git(['init', '--quiet']); }
 let revision;
@@ -28,6 +32,10 @@ if (revision !== hostRevision) {
 if (git(['rev-parse', 'HEAD']) !== hostRevision || git(['status', '--porcelain'])) {
   throw new Error('Browser tests require the exact clean, pinned public host fixture');
 }
+} else {
+  await access(join(host, 'apps/web/src/lib/moduleRuntime.ts'));
+  console.warn(`Development-only unpinned host override: ${host}`);
+}
 if (process.argv.includes('--host-only')) process.exit(0);
 const web = join(host, 'apps/web/src');
 const sass = require(dependency('sass'));
@@ -35,27 +43,36 @@ const stylesheet = sass.compile(join(web, 'styles/index.scss'), { style: 'expand
 await writeFile(join(output, 'host.css'), stylesheet.css);
 
 const aliases = {
+  '@fixture/app': join(web, 'App.tsx'),
   '@fixture/runtime': join(web, 'lib/moduleRuntime.ts'),
   '@fixture/components': join(web, 'components/ModuleComponents.tsx'),
   '@fixture/menu': join(web, 'components/AnchoredMenu.tsx'),
   '@fixture/composer': join(web, 'components/Composer.tsx'),
+  '@fixture/composer-surface': join(web, 'components/ComposerSurface.tsx'),
   '@fixture/draft': join(web, 'lib/textDraft.ts'),
-  '@cockpit/protocol': join(host, 'packages/protocol/src/index.ts'),
-  '@cockpit/module-api': join(root, 'node_modules/@waksana/cockpit-module-sdk'),
+  '@cockpit/protocol': join(host, 'packages/protocol/src'),
+  '@cockpit/module-api': join(host, 'packages/module-api/src'),
   'lucide-react': dependency('lucide-react'),
   react: dirname(dependency('react/package.json')),
   'react-dom': dirname(dependency('react-dom/package.json')),
+  'react-router-dom': dependency('react-router-dom'),
 };
-await build({
+const fixtureBuild = await build({
   absWorkingDir: root, entryPoints: ['browser/host-entry.ts'],
   outfile: join(output, 'host.js'), bundle: true, platform: 'browser',
-  format: 'esm', target: 'es2022', jsx: 'automatic', sourcemap: true,
+  format: 'esm', target: 'es2022', jsx: 'automatic', sourcemap: true, metafile: true,
   alias: aliases,
   plugins: [{
     name: 'synthetic-host-state-only',
     setup(builder) {
-      builder.onResolve({ filter: /(^|\/)net\/store$/ }, args => {
-        if (args.importer.startsWith(web)) return { path: join(root, 'browser/host-state.ts') };
+      builder.onResolve({ filter: /(?:features\/workspace\/Workspace|components\/ManageWorkspace)$/ }, args => {
+        if (args.importer === join(web, 'App.tsx')) return { path: join(root, 'browser/host-workspace.ts') };
+      });
+      builder.onResolve({ filter: /(^|\/)store(?:\.ts)?$/ }, args => {
+        if (args.importer.startsWith(web)
+          && resolve(dirname(args.importer), args.path).replace(/\.ts$/, '') === join(web, 'net/store')) {
+          return { path: join(root, 'browser/host-state.ts') };
+        }
       });
       builder.onResolve({ filter: /^zod$/ }, args => {
         // This pinned host uses Zod 3. The module's production bundle uses Zod 4.
@@ -64,10 +81,15 @@ await build({
     },
   }],
 });
+if (Object.keys(fixtureBuild.metafile.inputs).some(path => path.endsWith('/apps/web/src/net/store.ts'))) {
+  throw new Error('Browser fixture must not bundle the production native store');
+}
 await build({
   absWorkingDir: root, entryPoints: ['browser/probe.ts'], outfile: join(output, 'probe.js'),
   bundle: true, platform: 'browser', format: 'esm', target: 'es2022',
 });
 await readFile(join(root, 'dist/web/index.js'));
 await readFile(join(root, 'dist/web/styles.css'));
-console.log(`Assistant browser fixture ready: public host ${hostRevision}; production dist/web assets`);
+await prepareReleases(output);
+console.log(`Assistant browser fixture ready: ${process.env.COCKPIT_FIXTURE_HOST
+  ? `development host ${host}` : `pinned public host ${hostRevision}`}; production dist/web assets`);

@@ -1,5 +1,5 @@
 import type { Delivery, Message, Publication, Question, Reception, Role, Work } from './types.ts';
-import type { NativeInput } from './attachments.ts';
+import type { ReceiptInput } from './attachments.ts';
 
 export interface TimelineItem extends Publication {
   topicTitle: string | null;
@@ -47,7 +47,7 @@ export interface SessionInspection {
 
 export interface InputReceipt {
   requestId: string;
-  input: NativeInput;
+  input: ReceiptInput;
   message: Message;
   work: Work[];
   deliveries: Delivery[];

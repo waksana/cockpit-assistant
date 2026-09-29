@@ -2,7 +2,7 @@ import type { AssistantService } from './service.ts';
 import type { Message, Publication } from './types.ts';
 import type { InputReceipt, TimelineItem, TimelinePage } from './ui-types.ts';
 import { requireFact } from './errors.ts';
-import { inputSchema, withAttachments } from './attachments.ts';
+import { receiptInputSchema, withAttachments } from './attachments.ts';
 
 export function timelineItem(service: AssistantService, publication: Publication): TimelineItem {
   const { db } = service;
@@ -35,7 +35,7 @@ export function inputReceipt(service: AssistantService, requestId: string): Inpu
   const work = service.db.forMessage('work', message.id);
   const deliveries = service.db.forMessage('deliveries', message.id);
   // Older receipts saved only their original message snapshot, never the mutable current row.
-  const input = inputSchema.parse('input' in original ? original.input : {
+  const input = receiptInputSchema.parse('input' in original ? original.input : {
     requestId, text: message.raw, attachments: message.attachments,
     ...(message.replyTo === null ? {} : { replyTo: message.replyTo }),
     ...(message.topicId === null ? {} : { topicId: message.topicId }) });

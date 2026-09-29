@@ -21,11 +21,11 @@ const attachments: NativeAttachment[] = [
   { type: 'blob', data: 'aGk=', mimeType: 'text/plain', displayName: 'Inline' },
 ];
 const input = (requestId = 'attached') => ({ requestId, text: '', attachments: structuredClone(attachments) });
-function route(f: ReturnType<typeof fixture>, work: Work, sessionIds = ['s1']) {
+function route(f: ReturnType<typeof fixture>, work: Work, sessionIds = ['s1'], answerQuestionId?: string) {
   const claimed = f.service.claim(f.identities.coordinator, 'coordinator', 1, work.id)!;
   f.service.decide(f.identities.coordinator, { ...proof(claimed),
     topic: { title: 'Attachments', independent: true }, reason: 'Explicit input',
-    action: { kind: 'route', sessionIds, routeVersion: 0 } });
+    action: { kind: 'route', sessionIds, routeVersion: 0, ...(answerQuestionId ? { answerQuestionId } : {}) } });
   return f.db.find('deliveries', delivery => delivery.messageId === work.messageId);
 }
 function ask(f: ReturnType<typeof fixture>) {
@@ -152,15 +152,13 @@ test('versions, work, timeline, receipts and native prompt retain the same immut
   } finally { f.close(); }
 });
 
-test('known native asks reject attachments and choices-only freeform at input and decision boundaries', () => {
+test('ordinary input accepts attachments and free text; actual ask routes enforce their restrictions', () => {
   const f = fixture();
   try {
     const question = ask(f);
-    assert.throws(() => f.service.accept({ ...input(), replyTo: question.messageId }), /cannot accept attachments/);
-    assert.throws(() => f.service.accept({ ...input(), text: 'Yes', replyTo: question.messageId }), /cannot accept attachments/);
-    assert.throws(() => f.service.accept({ requestId: 'bad-choice', text: 'Sure', replyTo: question.messageId }),
-      /exactly match/);
-    assert.equal(f.db.get('operations', 'input:attached'), undefined);
+    assert.throws(() => f.service.accept({ ...input(), replyTo: question.messageId }), /Unrecognized key/);
+    const badChoice = f.service.accept({ requestId: 'bad-choice', text: 'Sure' });
+    assert.throws(() => route(f, badChoice.work, ['s1'], question.id), /exactly match/);
     const unanchored = f.service.accept({ ...input(), text: 'Yes' });
     const claimed = f.service.claim(f.identities.coordinator, 'coordinator', 1, unanchored.work.id)!;
     assert.throws(() => f.service.decide(f.identities.coordinator, { ...proof(claimed),
@@ -168,9 +166,9 @@ test('known native asks reject attachments and choices-only freeform at input an
       action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0, answerQuestionId: question.id } }),
     /cannot accept attachments/);
     assert.equal(f.db.list('deliveries').items.length, 0);
-    const valid = f.service.accept({ requestId: 'anchored', text: 'Yes', replyTo: question.messageId });
+    const valid = f.service.accept({ requestId: 'text-answer', text: 'Yes' });
     f.service.correct(valid.message.id, 'Yes', 1, 'Added attachments', attachments);
-    assert.throws(() => route(f, f.db.must('work', `message:${valid.message.id}:2`)), /cannot accept attachments/);
+    assert.throws(() => route(f, f.db.must('work', `message:${valid.message.id}:2`), ['s1'], question.id), /cannot accept attachments/);
   } finally { f.close(); }
 });
 
@@ -183,8 +181,8 @@ test('native send rechecks ask attachment and choice restrictions against frozen
     const f = fixture();
     try {
       const question = ask(f);
-      const accepted = f.service.accept({ requestId: 'answer', text: 'Yes', replyTo: question.messageId });
-      const [delivery] = route(f, accepted.work);
+      const accepted = f.service.accept({ requestId: 'answer', text: 'Yes' });
+      const [delivery] = route(f, accepted.work, ['s1'], question.id);
       f.db.put('deliveries', { ...delivery!, ...change });
       await f.runtime.wake();
       const result = f.db.must('deliveries', delivery!.id);
@@ -198,13 +196,13 @@ test('native send rechecks ask attachment and choice restrictions against frozen
   }
 });
 
-test('a late pending ask blocks comment-anchor routing atomically and keeps work available to clarify', () => {
+test('a late pending ask blocks ordinary routing only to its session and keeps work available', () => {
   const f = fixture();
   try {
     const original = f.service.addMessage({ kind: 'reply', raw: 'Earlier comment', sessionId: 's1' });
     f.db.put('anchors', { id: original.id, messageId: original.id, sessionId: 's1',
       requestId: null, kind: 'comment' });
-    const accepted = f.service.accept({ ...input(), replyTo: original.id });
+    const accepted = f.service.accept(input());
     ask(f);
     const claimed = f.service.claim(f.identities.coordinator, 'coordinator', 1, accepted.work.id)!;
     const snapshot = () => ({
@@ -217,7 +215,7 @@ test('a late pending ask blocks comment-anchor routing atomically and keeps work
     assert.throws(() => f.service.decide(f.identities.coordinator, {
       ...proof(claimed, 'blocked-comment-route'), topic: { title: 'New topic', independent: true },
       reason: 'Reply to earlier comment', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0 },
-    }), /pending questions/);
+    }), /pending native question/);
     assert.deepEqual(snapshot(), before, 'failed routing must roll back classification, publication and completion');
     assert.equal(f.db.must('work', accepted.work.id).state, 'leased');
     assert.equal(f.db.get('operations', 'decision:blocked-comment-route'), undefined);
@@ -225,7 +223,7 @@ test('a late pending ask blocks comment-anchor routing atomically and keeps work
     f.service.decide(f.identities.coordinator, {
       ...proof(reclaimed, 'clarify-comment'), topic: { title: 'Attachment reply', independent: true },
       reason: 'A native question appeared after input acceptance',
-      action: { kind: 'clarify', text: 'Please answer the pending native question before sending this attachment reply.' },
+      action: { kind: 'clarify', text: 'This session is waiting for a native answer and cannot accept these attachments as an answer.' },
     });
     assert.equal(f.db.must('work', accepted.work.id).state, 'done');
     assert.equal(f.db.list('deliveries').items.length, 0);
@@ -313,7 +311,7 @@ test('legacy text-only documents normalize only missing attachment fields includ
   } finally { f.close(); }
 });
 
-test('input receipts persist the exact original topic and reply identity independently of classification', () => {
+test('legacy input receipts preserve original topic and reply identity independently of classification', () => {
   const f = fixture();
   try {
     f.db.put('topics', { id: 'original-topic', title: 'Original', independent: true, domain: null,
@@ -321,7 +319,11 @@ test('input receipts persist the exact original topic and reply identity indepen
     const parent = f.service.addMessage({ kind: 'reply', raw: 'Reply source', sessionId: 's1' });
     f.db.put('anchors', { id: parent.id, messageId: parent.id, sessionId: 's1', kind: 'comment', requestId: null });
     const captured = { ...input(), topicId: 'original-topic', replyTo: parent.id };
-    const accepted = f.service.accept(captured);
+    const accepted = f.service.accept(input());
+    const legacyMessage = { ...accepted.message, topicId: captured.topicId, replyTo: parent.id };
+    f.db.put('messages', legacyMessage);
+    f.db.put('operations', { ...f.db.must('operations', 'input:attached'), fingerprint: fingerprint(captured),
+      result: { ...accepted, message: legacyMessage, input: captured } });
     const stored = f.db.must('operations', 'input:attached').result as { input: unknown };
     assert.deepEqual(stored.input, captured);
     route(f, accepted.work);
@@ -329,6 +331,8 @@ test('input receipts persist the exact original topic and reply identity indepen
     f.service.correct(accepted.message.id, 'Different text', 1, 'Correction', []);
     assert.deepEqual(inputReceipt(f.service, 'attached').input, captured);
     assert.deepEqual((f.db.must('operations', 'input:attached').result as { input: unknown }).input, captured);
+    assert.throws(() => f.service.accept(captured), /Unrecognized key/);
+    assert.throws(() => f.service.accept({ ...input(), topicId: captured.topicId }), /different input/);
   } finally { f.close(); }
 });
 

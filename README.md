@@ -3,7 +3,9 @@
 Assistant is a trusted Cockpit module for durable topic-based
 conversation across ordinary native sessions. It does not require
 Task or replace native history. The global menu's **助手** action opens its
-session-independent conversation dialog, including on an empty Cockpit home.
+session-independent SPA page, including on an empty Cockpit home. Direct URLs,
+refresh and browser forward/back navigation retain the page; its return arrow
+always goes to Cockpit home.
 
 The coordinator classifies inputs and session outputs; the program validates,
 persists, sends, and publishes them. A separate memory role extracts versioned,
@@ -12,6 +14,11 @@ Select `coordinator` and `memory` on two separate sessions using Cockpit's
 normal role controls; successful role saves register their carriers with the
 module. Registration does not claim readiness. Ordinary sessions are observed
 automatically, without a separate receptionist setup step.
+
+Inputs need no reply selection or `replyTo`. The coordinator uses conversation
+context to choose the recipient and forwards the user's wording to a real native
+question when appropriate. Only an ambiguous destination needs clarification;
+native choice/freeform and attachment restrictions still apply.
 
 ## Development
 
@@ -32,7 +39,7 @@ Dependencies and the public SDK are pinned exactly. The backend is bundled into
 one ESM entry; the host does not install dependencies. Native SQLite and standard
 Node modules are provided by Node.js. Tests use temporary databases and synthetic
 native adapters, not production sessions.
-The browser harness builds pinned real Cockpit menu/runtime/global-component
+The browser harness builds pinned real Cockpit menu/runtime/page
 implementations against synthetic module HTTP fixtures; it never starts a native
 host or installs the module. Its checkout/cache stays under `node_modules/.cache`.
 

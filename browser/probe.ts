@@ -21,12 +21,14 @@ declare global {
   interface Window {
     assistantProbe: Probe;
     restartFixture(): Promise<void>;
+    stopFixture(): void;
     fixtureNativeSends: number;
   }
 }
 
 export function activate(context: ModuleFrontendContext): ModuleFrontend {
-  if (!new URL(location.href).searchParams.has('probes')) return { apiVersion: 3 };
+  if (new URL(location.href).searchParams.has('probes')) sessionStorage.setItem('fixture-probes', '1');
+  if (sessionStorage.getItem('fixture-probes') !== '1') return { apiVersion: 3 };
   const { createElement: h, useSyncExternalStore } = context.react;
   let active: { reference: DraftReference; draft: ModuleDraft; scope: DraftSchemaScope<Files> } | undefined;
   let intent: CapturedDraftSend | undefined;

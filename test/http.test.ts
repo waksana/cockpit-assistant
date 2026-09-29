@@ -76,6 +76,41 @@ test('completed role receipts remain readable without replaying work after epoch
   } finally { f.close(); }
 });
 
+test('coordinator reads prior recipient clarifications with source context through bounded publications', async () => {
+  const f = setup();
+  try {
+    const input = f.service.accept({ requestId: 'ambiguous', text: 'What does that mean?' });
+    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
+    f.service.decide(f.identities.coordinator, { ...proof(work),
+      topic: { title: 'Discussion', independent: false }, reason: 'Two equally plausible topics',
+      action: { kind: 'clarify', text: 'Which project do you mean?' } });
+    const page = toolData<{ items: { type: string; messageId: string; sources: { messageId: string }[] }[] }>(
+      await f.tool('assistant_read', { role: 'coordinator', epoch: 1, resource: 'publications', limit: 10 }));
+    const clarification = page.items.find(item => item.type === 'clarification')!;
+    assert.equal(clarification.messageId, input.message.id);
+    assert.equal(clarification.sources[0]!.messageId, input.message.id);
+  } finally { f.close(); }
+});
+
+test('POST rejects every legacy replyTo field while historical input GET stays read-only and complete', async () => {
+  const f = setup();
+  try {
+    const accepted = f.service.accept({ requestId: 'legacy', text: 'Original answer' });
+    const original = { requestId: 'legacy', text: 'Original answer', attachments: [], replyTo: 'original-anchor' };
+    f.db.put('operations', { id: 'input:legacy', fingerprint: fingerprint(original), state: 'accepted',
+      result: { ...accepted, input: original } });
+    for (const replyTo of ['original-anchor', null]) {
+      const response = await f.request('POST', '/messages', { ...original, replyTo });
+      assert.equal(response.status, 400);
+    }
+    const receipt = await f.request('GET', '/inputs/:requestId', undefined, { params: { requestId: 'legacy' } });
+    assert.deepEqual((receipt.body as { input: unknown }).input, original);
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.wakes.length, 0);
+    assert.equal(f.db.find('deliveries', () => true).length, 0);
+  } finally { f.close(); }
+});
+
 test('module reads are bounded, replay publications durably, and never enumerate native sessions', async () => {
   const f = setup();
   try {

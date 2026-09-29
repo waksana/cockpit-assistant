@@ -47,10 +47,7 @@ export async function createTopicSession(service: AssistantService, runtime: Top
     requireFact(message.version === work.inputVersion, 'STALE_INPUT', 'Input message was corrected');
     requireFact(message.kind === 'user' && !message.historical && !message.sessionId,
       'WORK_KIND', 'Native outputs and historical messages cannot create sessions');
-    requireFact(!message.replyTo, 'ANCHOR_MISMATCH', 'An anchored reply must stay with its original session');
-    requireFact(!db.find('questions', question => question.state === 'pending'
-      && question.request.choices?.includes(message.raw) === true).length,
-    'PENDING_ASK', 'A possible literal native answer must be answered or clarified, not redirected into a new session');
+    requireFact(!message.replyTo, 'ANCHOR_MISMATCH', 'Historical anchored input must stay with its original session');
     const receipt: Operation = { id: key, fingerprint: hash, state: 'calling',
       result: { requestId: value.requestId, workId: value.workId, cwd: value.cwd, reason: value.reason,
         nativeOperationId: nativeKey, createdId: null, observation: 'not_started', retryAllowed: false,

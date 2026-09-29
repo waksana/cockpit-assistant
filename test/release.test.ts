@@ -30,7 +30,7 @@ function fixture() {
   for (const [name, value] of Object.entries({
     'package.json': { version: expected.version },
     'cockpit.module.json': { version: expected.version },
-    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.7.0', platform: 'linux', node: '24.20.0' },
+    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.8.0', platform: 'linux', node: '24.20.0' },
     'cockpit-deployment.json': descriptor,
   })) writeFileSync(join(stage, name), `${JSON.stringify(value)}\n`);
   writeFileSync(join(directory, 'cockpit-deployment.json'), readFileSync(join(stage, 'cockpit-deployment.json')));
@@ -117,7 +117,7 @@ test('Only actual accepted main merges in the intended repository qualify', () =
 test('Descriptor derives real public requirements and all database preservation columns', async () => {
   const actual = await product(resolve('.'));
   assert.equal(actual.id, 'assistant');
-  assert.ok(actual.requiresCapabilities.includes('globalComponent.v1'));
+  assert.ok(actual.requiresCapabilities.includes('page.v1'));
   for (const capability of ['frontend-api.v3', 'publicComponents.v1', 'draftOwner.v1', 'draftSubmission.v2']) {
     assert.ok(actual.requiresCapabilities.includes(capability));
   }

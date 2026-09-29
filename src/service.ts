@@ -5,7 +5,7 @@ import { requireFact } from './errors.ts';
 import { MemoryEngine } from './memory.ts';
 import { configSchema, decisionSchema, inputSchema, rememberSchema } from './schema.ts';
 import type { Config, Decision, Proof } from './schema.ts';
-import type { Anchor, Binding, Delivery, Message, Publication, Question, Role, SourceRef, Topic, Work } from './types.ts';
+import type { Binding, Delivery, Message, Publication, Question, Role, SourceRef, Topic, Work } from './types.ts';
 import { attachmentsSchema, withAttachments } from './attachments.ts';
 import type { NativeAttachment } from './attachments.ts';
 
@@ -52,22 +52,9 @@ export class AssistantService {
     const { attachments, ...textInput } = value;
     const identity = attachments.length ? value : textInput;
     const result = this.db.transaction(() => this.idempotent(`input:${value.requestId}`, identity, () => {
-      if (value.replyTo) {
-        const anchor = this.db.must('anchors', value.replyTo);
-        this.reception(anchor.sessionId, true);
-        if (anchor.kind === 'ask') {
-          const question = this.db.must('questions', questionKey(anchor.sessionId, anchor.requestId!));
-          askAnswer(question.request, value.text, attachments);
-        } else if (attachments.length) {
-          requireFact(!this.db.find('questions', question => question.sessionId === anchor.sessionId
-            && question.state === 'pending').length, 'ASK_ATTACHMENTS_UNSUPPORTED',
-          'Native questions cannot accept attachments; do not bypass the pending question with a prompt');
-        }
-      }
       if (value.topicId) this.db.must('topics', value.topicId);
       const message = this.addMessage({
         kind: 'user', raw: value.text, attachments, topicId: value.topicId ?? null,
-        replyTo: value.replyTo ?? null,
       });
       const work = this.addWork(message);
       return { input: value, message, work };
@@ -164,7 +151,9 @@ export class AssistantService {
         const message = this.db.must('messages', work.messageId);
         requireFact(message.version === work.inputVersion, 'STALE_INPUT', 'Message was corrected');
         const topic = this.classify(message, decision.topic, decision.reason, work.kind === 'input');
-        if (work.kind === 'input') this.publish({ type: 'message', messageId: message.id,
+        if (work.kind === 'input' && !this.db.find('publications', item => item.type === 'message'
+          && item.messageId === message.id && item.sources.some(source => source.version === message.version)).length)
+          this.publish({ type: 'message', messageId: message.id,
           topicId: topic.id, text: message.raw, attachments: message.attachments, sources: [ref(message)] });
         let result: unknown;
         switch (decision.action.kind) {
@@ -179,7 +168,7 @@ export class AssistantService {
             break;
           case 'clarify':
             requireFact(work.kind === 'input', 'WORK_KIND', 'Clarifications apply to user inputs');
-            result = this.publish({ type: 'clarification', topicId: topic.id,
+            result = this.publish({ type: 'clarification', messageId: message.id, topicId: topic.id,
               text: decision.action.text, sources: [ref(message)] });
             break;
           case 'suppress':
@@ -239,31 +228,28 @@ export class AssistantService {
   private route(message: Message, topic: Topic, action: Extract<Decision['action'], { kind: 'route' }>, reason: string) {
     requireFact(new Set(action.sessionIds).size === action.sessionIds.length,
       'DUPLICATE_TARGET', 'Duplicate reception targets');
-    let anchor: Anchor | undefined = message.replyTo ? this.db.must('anchors', message.replyTo) : undefined;
-    if (action.answerQuestionId) {
-      const question = this.db.must('questions', action.answerQuestionId);
-      askAnswer(question.request, message.raw, message.attachments);
-      requireFact(!anchor || anchor.requestId === question.request.requestId && anchor.sessionId === question.sessionId,
-        'ANCHOR_MISMATCH', 'Explicit reply anchor cannot be changed');
-      if (!anchor) {
-        const matching = this.db.find('questions', q => q.state === 'pending'
-          && q.request.choices?.filter(choice => choice === message.raw).length === 1);
-        requireFact(matching.length === 1 && matching[0]!.id === question.id,
-          'AMBIGUOUS_ANSWER', 'Unanchored answers require one unambiguous literal choice; otherwise clarify');
-        anchor = { id: 'inferred-literal', kind: 'ask', messageId: question.messageId,
-          sessionId: question.sessionId, requestId: question.request.requestId };
-      }
-    }
-    if (anchor) requireFact(action.sessionIds.length === 1 && action.sessionIds[0] === anchor.sessionId,
-      'ANCHOR_MISMATCH', 'Explicit replies stay bound to their original native object');
+    // Previously accepted anchored input retains its frozen destination; new input has no anchor.
+    const legacyAnchor = message.replyTo ? this.db.must('anchors', message.replyTo) : undefined;
+    const question = action.answerQuestionId ? this.db.must('questions', action.answerQuestionId)
+      : legacyAnchor?.kind === 'ask'
+        ? this.db.must('questions', questionKey(legacyAnchor.sessionId, legacyAnchor.requestId!)) : undefined;
+    if (legacyAnchor) requireFact(action.sessionIds.length === 1 && action.sessionIds[0] === legacyAnchor.sessionId
+      && (!question || legacyAnchor.kind === 'ask' && question.request.requestId === legacyAnchor.requestId
+        && question.sessionId === legacyAnchor.sessionId),
+    'ANCHOR_MISMATCH', 'Historical input retains its original native target');
+    if (question) requireFact(action.sessionIds.length === 1 && action.sessionIds[0] === question.sessionId,
+      'QUESTION_TARGET_MISMATCH', 'A native answer must target only the selected question session');
+    requireFact(!this.db.find('deliveries', delivery => delivery.messageId === message.id
+      && !['rejected', 'cancelled'].includes(delivery.state)).length,
+    'INPUT_ALREADY_ROUTED', 'Existing pending, accepted or uncertain deliveries must not be sent again');
     const currentRoute = this.db.get('routes', topic.id);
     requireFact(action.routeVersion === (currentRoute?.version ?? 0), 'STALE_ROUTE', 'Topic reception route changed');
-    if (anchor?.kind !== 'ask') {
+    if (!question) {
       const pending = this.db.find('questions', q => q.state === 'pending');
       requireFact(!pending.some(q => action.sessionIds.includes(q.sessionId)),
-        'PENDING_ASK', 'A reception has pending questions; bind an answer or clarify before ordinary routing');
+        'PENDING_ASK', 'This reception has a pending native question; select its actual question when answering, otherwise wait or explain the target restriction');
     }
-    const handoff = !anchor && currentRoute
+    const handoff = !legacyAnchor && !question && currentRoute
       && fingerprint(currentRoute.sessionIds) !== fingerprint(action.sessionIds);
     const handoffSources = handoff ? this.db.find('messages', item => item.topicId === topic.id && item.id !== message.id)
       .sort((a, b) => b.sequence - a.sequence).slice(0, 10).reverse() : [];
@@ -279,20 +265,19 @@ export class AssistantService {
       let requestId: string | null = null;
       let supplement: string | null = action.context ? `Assistant context (not new user authorization):\n${action.context}` : null;
       if (handoffContext) supplement = [handoffContext, supplement].filter(Boolean).join('\n\n');
-      if (anchor?.kind === 'ask') {
-        const question = this.db.must('questions', questionKey(sessionId, anchor.requestId!));
+      if (question) {
         requireFact(question.state === 'pending', 'STALE_ASK', 'Original question is no longer pending');
         answerFreeform = askAnswer(question.request, message.raw, message.attachments);
         requireFact(!this.db.find('deliveries', d => d.kind === 'ask' && d.sessionId === sessionId
-          && d.requestId === anchor!.requestId && !['rejected', 'cancelled'].includes(d.state)).length,
+          && d.requestId === question.request.requestId && !['rejected', 'cancelled'].includes(d.state)).length,
         'ASK_IN_FLIGHT', 'An answer already exists for this native request');
         kind = 'ask';
-        requestId = anchor.requestId;
+        requestId = question.request.requestId;
         supplement = null;
       } else {
-        if (anchor) {
-          const original = this.db.must('messages', anchor.messageId);
-          supplement = [`Explicit reply to original message ${original.id}:\n${original.raw}`, supplement].filter(Boolean).join('\n\n');
+        if (legacyAnchor) {
+          const original = this.db.must('messages', legacyAnchor.messageId);
+          supplement = [`Historical reply to original message ${original.id}:\n${original.raw}`, supplement].filter(Boolean).join('\n\n');
         }
         const warning = this.riskWarning(sessionId, topic.id);
         if (warning) supplement = [supplement, warning].filter(Boolean).join('\n\n');
@@ -308,7 +293,7 @@ export class AssistantService {
       });
       deliveries.push(delivery);
     }
-    if (!anchor) {
+    if (!legacyAnchor && !question) {
       if (currentRoute && fingerprint(currentRoute.sessionIds) !== fingerprint(action.sessionIds)) this.memory.schedule(topic.id, 'handoff');
       this.db.put('routes', { id: topic.id, sessionIds: action.sessionIds,
         version: (currentRoute?.version ?? 0) + 1, evidence: reason });
@@ -335,19 +320,13 @@ export class AssistantService {
   private publishOutput(message: Message, text?: string): Publication {
     requireFact(message.sessionId, 'SOURCE_REQUIRED', 'Native output must preserve its reception');
     this.reception(message.sessionId);
-    let anchor = this.db.get('anchors', message.id);
-    if (!anchor) {
-      const question = this.db.find('questions', q => q.messageId === message.id)[0];
-      if (message.kind === 'ask') requireFact(question?.state === 'pending', 'STALE_ASK', 'Question is not currently pending');
-      anchor = { id: message.id, messageId: message.id, sessionId: message.sessionId,
-        kind: question ? 'ask' : 'comment', requestId: question?.request.requestId ?? null };
-      this.db.put('anchors', anchor);
-    }
+    const question = this.db.find('questions', q => q.messageId === message.id)[0];
+    if (message.kind === 'ask') requireFact(question?.state === 'pending', 'STALE_ASK', 'Question is not currently pending');
     return this.publish({ type: message.kind === 'ask' ? 'question' : 'message',
       messageId: message.id, topicId: message.topicId,
       text: message.kind === 'ask' ? message.raw : text ?? message.raw,
       attachments: message.attachments,
-      anchorId: anchor.id, sources: [ref(message)] });
+      sources: [ref(message)] });
   }
   syncQuestions(sessionId: string, asks: AskRequest[], available: boolean): void {
     for (const old of this.db.find('questions', q => q.sessionId === sessionId && q.state === 'pending')) {

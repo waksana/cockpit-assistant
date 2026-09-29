@@ -2,7 +2,7 @@ import type { McpInvocationMeta, ModuleHostApi, NativeChatEvent, PublicSessionMe
 import { fingerprint } from './database.ts';
 import { BusinessError, errorText, requireFact } from './errors.ts';
 import { Ingestion } from './ingestion.ts';
-import { AssistantService, questionKey } from './service.ts';
+import { AssistantService, askAnswer, questionKey } from './service.ts';
 import type { Binding, Delivery, Operation, Reception, Role } from './types.ts';
 import { activateRolesSchema, bindingSchema, createSessionSchema, enrollSchema, inputSchema } from './schema.ts';
 import type { Readiness, RoleReadiness, SessionInspection } from './ui-types.ts';
@@ -708,6 +708,7 @@ export class Runtime {
         if (unresolved.length) continue;
         if (db.get('deliveries', `wake:${key}`)) continue;
         db.put('deliveries', { id: `wake:${key}`, kind: 'wake', messageId: null, sessionId: binding.sessionId,
+          attachments: [],
           requestId: null, text: `Assistant durable work is available. Role=${binding.id}, epoch=${binding.epoch}. `
             + 'Use assistant_claim, read its input and current state, then submit through the role tool. '
             + 'Drain pending work. This is an internal wake, not user authorization or a public reply.',
@@ -720,6 +721,24 @@ export class Runtime {
     const db = this.service.db;
     let delivery = db.must('deliveries', id);
     if (delivery.state !== 'pending') return;
+    const validateAnswer = (meta: PublicSessionMeta): void => {
+      const asks = meta.decisions?.filter(d => d.kind === 'ask').map(d => d.request) ?? (meta.ask ? [meta.ask] : []);
+      if (delivery.kind === 'wake') {
+        requireFact(delivery.attachments.length === 0, 'INTERNAL_ATTACHMENTS',
+          'Internal wakes must not carry user attachments');
+      } else if (delivery.kind === 'ask') {
+        const ask = asks.find(q => q.requestId === delivery.requestId);
+        const stored = db.must('questions', questionKey(delivery.sessionId, delivery.requestId!));
+        requireFact(ask && stored.state === 'pending' && fingerprint(ask) === fingerprint(stored.request),
+          'STALE_ASK', 'The exact original native question is no longer pending');
+        requireFact(askAnswer(ask, delivery.text, delivery.attachments) === delivery.answerFreeform,
+          'ANSWER_CHANGED', 'Frozen answer mode does not match the original native question');
+      } else {
+        requireFact(asks.length === 0 && !db.find('questions', q => q.sessionId === delivery.sessionId
+          && q.state === 'pending').length, 'PENDING_ASK',
+        'A native question is pending; do not bypass it with an ordinary prompt');
+      }
+    };
     try {
       const meta = await this.meta(delivery.sessionId);
       requireFact(meta?.loaded && !meta.closing, 'SESSION_UNAVAILABLE', 'Native target is missing, unloaded, or closing');
@@ -730,14 +749,20 @@ export class Runtime {
       } else {
         requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Target now has an internal role identity');
         this.service.reception(delivery.sessionId);
-        if (delivery.kind === 'ask') {
-          const asks = meta.decisions?.filter(d => d.kind === 'ask').map(d => d.request) ?? (meta.ask ? [meta.ask] : []);
-          const ask = asks.find(q => q.requestId === delivery.requestId);
-          const stored = db.must('questions', questionKey(delivery.sessionId, delivery.requestId!));
-          requireFact(ask && stored.state === 'pending' && fingerprint(ask) === fingerprint(stored.request),
-            'STALE_ASK', 'The exact original native question is no longer pending');
-        }
       }
+      validateAnswer(meta);
+      if (this.stopped) return;
+      db.transaction(() => {
+        delivery = db.must('deliveries', id);
+        requireFact(delivery.state === 'pending', 'EFFECT_CHANGED', 'Effect changed before native call');
+        if (delivery.kind === 'wake') {
+          requireFact(db.find('bindings', b => b.sessionId === delivery.sessionId && b.epoch === delivery.roleEpoch && b.ready).length === 1,
+            'STALE_ROLE', 'Role was replaced immediately before wake dispatch');
+        } else this.service.reception(delivery.sessionId);
+        validateAnswer(meta);
+        delivery.state = 'calling';
+        db.put('deliveries', delivery);
+      });
     } catch (error) {
       db.transaction(() => {
         delivery = db.must('deliveries', id);
@@ -748,17 +773,6 @@ export class Runtime {
       });
       return;
     }
-    if (this.stopped) return;
-    db.transaction(() => {
-      delivery = db.must('deliveries', id);
-      requireFact(delivery.state === 'pending', 'EFFECT_CHANGED', 'Effect changed before native call');
-      if (delivery.kind === 'wake') {
-        requireFact(db.find('bindings', b => b.sessionId === delivery.sessionId && b.epoch === delivery.roleEpoch && b.ready).length === 1,
-          'STALE_ROLE', 'Role was replaced immediately before wake dispatch');
-      } else this.service.reception(delivery.sessionId);
-      delivery.state = 'calling';
-      db.put('deliveries', delivery);
-    });
     let state: Delivery['state'];
     let result: unknown;
     let error: string | null = null;
@@ -769,7 +783,8 @@ export class Runtime {
         state = response.accepted ? 'accepted' : 'rejected';
       } else {
         result = await this.native.host.call('prompt', { sessionId: delivery.sessionId, mode: 'enqueue',
-          text: delivery.supplement ? `${delivery.text}\n\n---\n${delivery.supplement}` : delivery.text });
+          text: delivery.supplement ? `${delivery.text}\n\n---\n${delivery.supplement}` : delivery.text,
+          ...(delivery.attachments.length ? { attachments: delivery.attachments } : {}) });
         state = typeof result === 'object' && result !== null && 'ok' in result && result.ok === true ? 'accepted' : 'rejected';
       }
     } catch (failure) {

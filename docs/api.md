@@ -6,15 +6,16 @@ Assistant space and its `dataRoot/assistant.sqlite`. Use Linux and Node.js 24
 with built-in `node:sqlite`.
 
 The installed public SDK dependency is pinned to
-`@waksana/cockpit-module-sdk@0.6.0`, including the native methods used here.
+`@waksana/cockpit-module-sdk@0.7.0`, including the native methods used here.
 The host compatibility reference is commit
-[`af4c8a227053640ae7c113c8849543a6731a5e19`](https://github.com/waksana/cockpit/commit/af4c8a227053640ae7c113c8849543a6731a5e19),
-release `v0.0.0-rolling.20`; see its fixed
-[role lifecycle contract](https://github.com/waksana/cockpit/blob/af4c8a227053640ae7c113c8849543a6731a5e19/docs/module-contract.md#role-assignment-lifecycle).
+[`0dcfd6688b4c01b3f29776ee804b901612a6ae9b`](https://github.com/waksana/cockpit/commit/0dcfd6688b4c01b3f29776ee804b901612a6ae9b),
+release `v0.0.0-rolling.21`; see its fixed
+[module contract](https://github.com/waksana/cockpit/blob/0dcfd6688b4c01b3f29776ee804b901612a6ae9b/docs/module-contract.md).
 Activation requires `serviceReadyVersion`, `chatReadVersion`,
 `askResponseVersion`, `resourcePreparationVersion`, `roleAssignmentVersion`,
 `sessionDirectoryVersion`, and `sessionLoadVersion` all equal to `1`.
-Frontend activation separately requires Web API `2`, `globalComponentVersion`,
+Frontend activation separately requires Web API `3`, `publicComponentsVersion`
+and `draftOwnerVersion` `1`, `draftSubmissionVersion` `2`, `globalComponentVersion`,
 `menuVersion`, `uiVersion`, and `uiSurfaceVersion` all `1`, and host `createPortal`.
 Rolling publication is described in [releases](releases.md). Source merge and
 publication do not install/deploy or establish production/native-model
@@ -62,7 +63,9 @@ Before service readiness or after shutdown, routes reject with `NOT_READY`/503.
 - Versions/epochs are integers. Content/topic/reception versions and active role
   epochs are positive; assignment/state/route versions and `expectedEpoch`
   permit zero.
-- `text` is 1–100,000 characters unless specified otherwise. `evidence` and
+- Input `text` is 0–100,000 characters; nonblank text or at least one native
+  attachment is required. Other text fields remain 1–100,000 unless specified.
+  `evidence` and
   correction/reclassification reasons are trimmed, nonempty, at most 4,000.
   Decision reasons are nonempty, at most 4,000.
 - Idempotence records durable outcomes, not exactly-once native execution.
@@ -76,6 +79,39 @@ message/request IDs, literal `text`, optional `supplement`, `answerFreeform`,
 `error`, and role epoch. States are `pending`, `calling`, `accepted`, `rejected`,
 `unknown`, or `cancelled`. `accepted` means observed acceptance, not model reading,
 completion, or successful work.
+
+### Native attachment inputs
+
+`POST /messages` accepts SDK-native `file`, `directory`, `selection`, and `blob`
+descriptors in `attachments`. The optional array defaults to `[]` for text-only
+clients. Empty `text` with nonempty attachments is valid; no placeholder text
+is inserted. For example, a File upload supplies its persisted native path:
+
+```json
+{"requestId":"input-file-1","text":"","attachments":[{"type":"file","path":"/absolute/upload/report.pdf","displayName":"report.pdf"}]}
+```
+
+There are at most 20 descriptors, with at most 1,000,000 UTF-8 bytes for their
+combined JSON encoding. Paths are absolute native filesystem paths, not preview
+URLs; blob data is base64, not a data URL. Selection ranges must be ordered.
+Unknown fields, unsupported types and reserved business fields in content
+projections are rejected. These limits bound descriptions/inline data, not the
+size or current readability of a referenced file or directory. Native loading
+can still reject a missing/inaccessible path or unsupported content.
+
+`GET /inputs/:requestId` includes `input`, the immutable normalized original
+`{requestId,text,attachments,replyTo?,topicId?}`. Reclassification/correction
+cannot change that receipt. Compare the complete input before reconciling an
+uncertain browser submission; never repost or replace its ID. Native ask
+answers cannot contain attachments, including when a route attempts to answer
+an existing question; unsupported inputs are not silently stripped or sent as
+ordinary prompts.
+
+Schema-1 records predating attachments remain readable: only an absent
+attachment field normalizes to `[]`; malformed present fields fail explicitly.
+Historical input receipts lacking the new `input` field recover from their
+original operation snapshot, never the current mutable message. No database
+schema migration or production rewrite is needed.
 
 ## Minimal initialization
 
@@ -268,7 +304,7 @@ editing installed config does not overwrite the initialized store on restart.
 
 | Method/path | Body besides `requestId` |
 | --- | --- |
-| `POST /messages` | `text`, `[replyTo]` (publication anchor ID), `[topicId]` (existing topic). |
+| `POST /messages` | `text`, `[attachments]` (native descriptors), `[replyTo]` (publication anchor ID), `[topicId]` (existing topic). |
 | `POST /messages/:id/correct` | `expectedVersion`, `text`, `reason`; returns an operation receipt. |
 | `POST /messages/:id/reclassify` | `expectedVersion`, `expectedAssignmentVersion`, `topic` (schema below), `reason`. |
 | `POST /receptions/:id/recover` | `maxPages` (1–10), `acknowledgeGap:true`, `evidence`. |

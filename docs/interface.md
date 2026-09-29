@@ -6,7 +6,9 @@ On a compatible host, choose **助手** in the global hamburger menu. This opens
 near-viewport native dialog (full-screen layout on mobile), not browser
 Fullscreen mode. A public global component stays in the host React tree outside
 session routes; the menu only changes the module-owned visibility service.
-The frontend declares no native draft or send capability. The left arrow closes
+The frontend uses a public owner draft, not a native-session draft or prompt
+sender. Its Composer, Message and Attachment components come from the same
+`context.components` entry as the host. The left arrow closes
 the native dialog and returns to the existing Cockpit view; it never navigates
 browser history or changes the selected host session. The single gear on the
 right toggles settings. Both actions use exact Lucide 1.46.0 nodes through host
@@ -63,10 +65,17 @@ readable in both themes.
 Use a message's reply action to select its immutable anchor; cancel the reference
 to return to an unanchored input. Native question choices and free-text limits
 remain visible. The backend rechecks the original question before answering.
-Topic changes never retarget an anchor. Enter submits, Shift+Enter inserts a
-line break, and composition/IME Enter is not a submit.
+Topic changes never retarget an anchor. The shared Composer owns keyboard/IME
+behavior: desktop Enter submits, Shift+Enter inserts a line break; touch input
+keeps Enter for typing and supports the explicit send button. Choice-only
+questions expose selection controls instead of a free-text editor.
 
-The input is sent through Assistant's `/messages`, not a host native draft.
+The input is sent through Assistant's `/messages`, never the background native
+Chat. Public File/Speech enhancements attach to this same host-issued draft;
+Assistant does not import their stores, implement upload/recording UI, or
+fabricate a session ID. Text and attachment-only submissions follow the same
+adapter for buttons and captured Speech sends. Native questions disable
+attachments, and the backend also checks the decision and native send boundary.
 The backend freshly verifies both role bindings before accepting new input.
 Saved input waits for coordinator classification and durable dispatch. Accepted
 is neither proof of delivery nor proof the receiver completed its work. Receipt
@@ -86,14 +95,27 @@ preserves position when older items are prepended, and follows new messages only
 while the reader stays at the bottom. Otherwise a new-message action lets the
 reader choose to return. Refresh does not move keyboard focus.
 
-Closing aborts reads and the stream, not accepted writes. Late write results
-belong to their original request and clear only the exact captured draft revision,
-never text edited afterward. Reopening rereads readiness and the recent window;
-the draft, selected anchor and receipts survive closing within this module
-activation. They are not persisted across a full page reload or module revocation;
-the durable backend remains authoritative and exposes receipts through the API.
-Record uncertain IDs before a full browser reload. Errors remain in their owning
-UI; a write that settles after module disposal reports its failure to the host.
+Closing aborts reads and the stream, not accepted writes, and does not retire
+the owner. It invalidates captured sends by advancing the business action
+revision. Changing the reply anchor also invalidates prior consent. Late results
+clear only captured text/field versions and a matching reply action revision;
+new text, attachments and reply selections survive.
+
+The host persists the request ID, submission ID, complete immutable payload,
+schema checkpoints and settlement journal before network dispatch. Assistant's
+non-projecting business schema retains the reply and receipt index, not another
+text/revision store. Reload restores the original transaction as uncertain.
+**Recover original submission** queries `/inputs/:requestId`, proves the complete
+original input, then settles the original transaction without another POST.
+Missing/mismatched receipts stay unknown. A failed field ACK is an incomplete
+local cleanup, not permission to resend accepted input. Missing field schemas
+block lossy text-only submission. Module revocation removes runtime authority;
+the host's occurrence/generation rules govern subsequent restoration. File ACK
+does not delete the persisted uploaded file needed by future delivery.
+
+Speech reference text comes only from an already-rendered eligible Assistant
+reply, bounded to the final 1,000 Unicode code points. No background Chat or
+implicit history read supplies that context.
 
 ## Backend additions
 
@@ -115,8 +137,10 @@ These module-relative routes supplement, not replace, existing `/history`,
 
 `before` and `after` cannot be combined. Limits are 1 through 100. `watermark`
 is the global highest publication sequence at that read, not proof the user read
-it. `TimelineItem` extends `Publication` with `topicTitle`, `speaker`, `sessionId`
-and nullable `question` (`state`, optional `choices` and `allowFreeform`). Topic
+it. `TimelineItem` extends `Publication` with `topicTitle`, `speaker`, `sessionId`,
+native `attachments` and nullable `question` (`state`, optional `choices` and
+`allowFreeform`). Public message presentation uses an Assistant-owned identity;
+it never uses a publication ID as a native message ID. Topic
 titles and question state are current enrichment, not edits to immutable
 publication text or anchors. Exact lookup and a fresh page can observe later
 question state; SSE is a publication log, not a general mutable-record change feed.

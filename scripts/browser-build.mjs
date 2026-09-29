@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const output = join(root, 'node_modules/.cache/assistant-browser');
-export const hostRevision = 'af4c8a227053640ae7c113c8849543a6731a5e19';
+export const hostRevision = '0dcfd6688b4c01b3f29776ee804b901612a6ae9b';
 const host = join(output, 'host');
 const require = createRequire(import.meta.url);
 const dependencyPaths = [root, ...(process.env.COCKPIT_BROWSER_DEPENDENCIES
@@ -28,6 +28,7 @@ if (revision !== hostRevision) {
 if (git(['rev-parse', 'HEAD']) !== hostRevision || git(['status', '--porcelain'])) {
   throw new Error('Browser tests require the exact clean, pinned public host fixture');
 }
+if (process.argv.includes('--host-only')) process.exit(0);
 const web = join(host, 'apps/web/src');
 const sass = require(dependency('sass'));
 const stylesheet = sass.compile(join(web, 'styles/index.scss'), { style: 'expanded', sourceMap: false });
@@ -37,6 +38,8 @@ const aliases = {
   '@fixture/runtime': join(web, 'lib/moduleRuntime.ts'),
   '@fixture/components': join(web, 'components/ModuleComponents.tsx'),
   '@fixture/menu': join(web, 'components/AnchoredMenu.tsx'),
+  '@fixture/composer': join(web, 'components/Composer.tsx'),
+  '@fixture/draft': join(web, 'lib/textDraft.ts'),
   '@cockpit/protocol': join(host, 'packages/protocol/src/index.ts'),
   '@cockpit/module-api': join(root, 'node_modules/@waksana/cockpit-module-sdk'),
   'lucide-react': dependency('lucide-react'),
@@ -60,6 +63,10 @@ await build({
       });
     },
   }],
+});
+await build({
+  absWorkingDir: root, entryPoints: ['browser/probe.ts'], outfile: join(output, 'probe.js'),
+  bundle: true, platform: 'browser', format: 'esm', target: 'es2022',
 });
 await readFile(join(root, 'dist/web/index.js'));
 await readFile(join(root, 'dist/web/styles.css'));

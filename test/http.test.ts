@@ -432,6 +432,7 @@ test('explicit rejected wake retry creates one new logical delivery and preserve
   try {
     const original: Delivery = {
       id: 'wake:rejected', kind: 'wake', messageId: null, sessionId: 'coordinator', requestId: null,
+      attachments: [],
       text: 'Drain coordinator work for epoch 1', supplement: null, answerFreeform: null,
       state: 'rejected', result: { ok: false }, error: 'Native rejected wake', createdAt: 1, roleEpoch: 1,
     };
@@ -467,6 +468,7 @@ test('wake retry rejects prompts, asks, non-rejections, stale bindings and missi
   try {
     const original: Delivery = {
       id: 'wake:source', kind: 'wake', messageId: null, sessionId: 'coordinator', requestId: null,
+      attachments: [],
       text: 'Internal wake', supplement: null, answerFreeform: null, state: 'rejected', result: null,
       error: 'Rejected', createdAt: 1, roleEpoch: 1,
     };

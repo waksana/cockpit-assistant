@@ -1,13 +1,11 @@
 import { z } from 'zod';
 import { isAbsolute } from 'node:path';
+export { inputSchema } from './attachments.ts';
 
 export const id = z.string().min(1).max(200);
 export const text = z.string().min(1).max(100_000);
 export const role = z.enum(['coordinator', 'memory']);
 export const source = z.strictObject({ messageId: id, version: z.int().positive(), assignmentVersion: z.int().nonnegative() });
-export const inputSchema = z.strictObject({
-  requestId: id, text, replyTo: id.optional(), topicId: id.optional(),
-});
 export const claimSchema = z.strictObject({ role, epoch: z.int().positive(), workId: id.optional() });
 export const proofSchema = z.strictObject({
   requestId: id, workId: id, epoch: z.int().positive(), token: id,

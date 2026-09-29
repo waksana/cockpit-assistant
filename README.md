@@ -37,7 +37,11 @@ implementations against synthetic module HTTP fixtures; it never starts a native
 host or installs the module. Its checkout/cache stays under `node_modules/.cache`.
 
 The frontend uses the host's React and public module UI, not a separate React
-root. See [the interface guide](docs/interface.md) for setup, receipts, history,
+root. Its shared public Composer uses a durable owner draft; compatible
+File/Speech enhancements use that same input without routing to a background
+Chat. Text and native attachments persist together through Assistant receipts
+and independently recorded native deliveries.
+See [the interface guide](docs/interface.md) for setup, receipts, history,
 and browser lifecycle boundaries.
 
 See [API and role setup](docs/api.md) for host compatibility, initialization,

@@ -71,8 +71,11 @@ test('multiple asks reject ambiguous unanchored answer and preserve choice const
     }), /unambiguous literal choice/);
     const q = f.db.must('questions', questionKey('s1', 'q1'));
     f.db.put('anchors', { id: q.messageId, messageId: q.messageId, sessionId: 's1', requestId: 'q1', kind: 'ask' });
-    const bad = f.service.accept({ requestId: 'freeform', text: 'Sure thing', replyTo: q.messageId });
-    const badWork = f.service.claim(f.identities.coordinator, 'coordinator', 1, bad.work.id)!;
+    assert.throws(() => f.service.accept({ requestId: 'freeform', text: 'Sure thing', replyTo: q.messageId }),
+      /exactly match/);
+    const bad = f.service.accept({ requestId: 'freeform', text: 'Yes', replyTo: q.messageId });
+    f.service.correct(bad.message.id, 'Sure thing', 1, 'Invalid choice must also fail at decision time');
+    const badWork = f.service.claim(f.identities.coordinator, 'coordinator', 1, `message:${bad.message.id}:2`)!;
     assert.throws(() => f.service.decide(f.identities.coordinator, { ...proof(badWork),
       topic: { title: 'Approval', independent: true }, reason: 'Approval',
       action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0 },

@@ -1,15 +1,13 @@
-import type { InputReceipt, Readiness, SessionInspection, TimelineItem } from '../src/ui-types.ts';
+import type { Readiness, SessionInspection, TimelineItem } from '../src/ui-types.ts';
 import type { Operation, Role } from '../src/types.ts';
+import type { DraftReference, ModuleDraftSnapshot } from '@waksana/cockpit-module-sdk/frontend';
 
-export interface Draft { text: string; reply: TimelineItem | null; revision: number }
 export interface Submission {
   requestId: string;
-  text: string;
-  replyTo?: string;
-  revision: number;
+  submissionId: string;
   state: 'pending' | 'accepted' | 'unknown' | 'error';
   detail: string;
-  receipt?: InputReceipt;
+  receipt?: unknown;
 }
 export interface SetupOperation {
   requestId: string;
@@ -30,11 +28,13 @@ export interface Snapshot {
   readiness: Readiness | null;
   checking: boolean;
   readinessError: string | null;
-  draft: Draft;
+  draft: Readonly<ModuleDraftSnapshot>;
+  reply: TimelineItem | null;
   submissions: Submission[];
   setup: SetupOperation[];
 }
 export interface AssistantActions {
+  readonly draft: DraftReference;
   getSnapshot(): Snapshot;
   subscribe(listener: () => void): () => void;
   open(): void;

@@ -1,0 +1,269 @@
+import { expect, test, type Page } from '@playwright/test';
+import { installFixture, json, publication } from './fixtures.ts';
+
+async function open(page: Page) {
+  await page.getByRole('button', { name: '全局菜单', exact: true }).click();
+  await page.getByRole('menuitem', { name: '助手', exact: true }).click();
+  await expect(page.getByRole('region', { name: '对话记录', exact: true })).toHaveAttribute('aria-busy', 'false');
+  await expect(page.getByRole('dialog').getByTestId('synthetic-enhancers')).toBeVisible();
+}
+const editor = (page: Page) => page.getByRole('dialog', { name: '助手', exact: true })
+  .getByRole('textbox', { name: '消息输入', exact: true });
+const send = (page: Page) => page.getByRole('dialog').getByRole('button', { name: '发送', exact: true });
+const close = (page: Page) => page.getByRole('button', { name: '返回 Cockpit', exact: true }).click();
+function clean(fixture: Awaited<ReturnType<typeof installFixture>>) {
+  expect(fixture.consoleErrors).toEqual([]);
+  expect(fixture.seenUnexpected).toEqual([]);
+  expect(fixture.posts.every(post => post.path === '/messages')).toBe(true);
+}
+
+for (const selected of [false, true]) {
+  test(`real shared Composer accepts attachment-only and captured speech (${selected ? 'background Chat' : 'homepage'})`, async ({ page }) => {
+    const attachment = { type: 'file' as const, path: '/synthetic/history.txt', displayName: 'history.txt' };
+    const fixture = await installFixture(page, {
+      items: [publication(1, '', { attachments: [attachment], sessionId: null, speaker: 'user' })], hasOlder: false,
+    });
+    await page.goto('/?probes=1');
+    if (selected) {
+      await page.getByRole('button', { name: '选择合成会话' }).click();
+      await page.getByTestId('selected-session').getByRole('textbox', { name: '消息输入' }).fill('independent Chat draft');
+      await expect(page.getByTestId('selected-session').getByTestId('synthetic-enhancers')).toHaveAttribute('data-native', 'true');
+    }
+    await open(page);
+    await expect(page.getByRole('dialog').getByTestId('synthetic-enhancers'))
+      .toHaveAttribute('data-selected-session', selected ? 'synthetic-selected-session' : '');
+    await expect(page.getByRole('dialog').getByTestId('synthetic-enhancers')).toHaveAttribute('data-native', 'false');
+    await expect(page.locator('[data-ca-item]').getByText('history.txt')).toBeVisible();
+    const events = await page.evaluate(() => window.assistantProbe.events);
+    expect(events.some(event => event.boundary === 'message'
+      && JSON.stringify(event.identity) === JSON.stringify({ owner: 'assistant', id: 'publication-1', kind: 'message', role: 'user' }))).toBe(true);
+    expect(events.some(event => event.boundary === 'attachment'
+      && JSON.stringify(event.attachment) === JSON.stringify(attachment))).toBe(true);
+    expect(events.every(event => event.origin === undefined)).toBe(true);
+    await page.getByRole('dialog').getByRole('button', { name: '合成文件探针' }).click();
+    await expect(editor(page)).toHaveValue('');
+    await expect(send(page)).toBeEnabled();
+    await send(page).click();
+    await expect(page.getByRole('dialog').getByTestId('synthetic-files')).toHaveText('');
+    expect(fixture.posts[0]?.body).toMatchObject({ text: '', attachments: [
+      { type: 'file', path: '/synthetic/fixture.txt', displayName: 'fixture.txt' },
+    ] });
+    await page.getByRole('dialog').getByRole('button', { name: '合成语音捕获' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: '合成语音发送' }).click();
+    await expect(editor(page)).toHaveValue('');
+    expect(fixture.posts).toHaveLength(2);
+    expect(fixture.posts[1]?.body.text).toBe('合成语音文本');
+    await close(page);
+    if (selected) await expect(page.getByTestId('selected-session').getByRole('textbox', { name: '消息输入' })).toHaveValue('independent Chat draft');
+    expect(await page.evaluate(() => window.fixtureNativeSends)).toBe(0);
+    clean(fixture);
+  });
+}
+
+test('late receipt ACK only removes captured file/text/reply, preserving concurrent edits across close/reopen', async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const fixture = await installFixture(page, { items: [publication(1, 'old'), publication(2, 'new')], hasOlder: false,
+    post: async (_post, route) => { await gate; await json(route, { accepted: true }); return true; },
+  });
+  await page.goto('/?probes=1'); await open(page);
+  await page.locator('[data-ca-item="publication-1"]').getByRole('button', { name: '回复', exact: true }).click();
+  await editor(page).fill('captured');
+  await page.evaluate(() => window.assistantProbe.add('old.txt'));
+  await send(page).click();
+  await expect.poll(() => fixture.posts.length).toBe(1);
+  await close(page);
+  await page.evaluate(() => window.assistantProbe.add('new.txt'));
+  await open(page);
+  await editor(page).fill('new text');
+  await page.locator('[data-ca-item="publication-2"]').getByRole('button', { name: '回复', exact: true }).click();
+  release();
+  await expect(page.getByTestId('synthetic-files')).toHaveText('new.txt');
+  await expect(editor(page)).toHaveValue('new text');
+  await expect(page.getByRole('region', { name: '当前回复引用' })).toContainText('anchor-2');
+  expect(fixture.posts[0]?.body).toMatchObject({ text: 'captured', replyTo: 'anchor-1',
+    attachments: [{ type: 'file', path: '/synthetic/old.txt', displayName: 'old.txt' }] });
+  clean(fixture);
+});
+
+test('unknown receipt restores after page refresh and inspection settles without reposting', async ({ page }) => {
+  const fixture = await installFixture(page, { items: [], hasOlder: false,
+    post: async (_post, route) => { await route.abort('failed'); return true; },
+  });
+  await page.goto('/?probes=1'); await open(page);
+  await editor(page).fill('uncertain');
+  await page.evaluate(() => window.assistantProbe.add('persisted.txt'));
+  await send(page).click();
+  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('未知');
+  const requestId = fixture.posts[0]?.body.requestId;
+  await close(page); await open(page);
+  await expect(send(page)).toBeDisabled();
+  await page.reload(); await open(page);
+  await expect(editor(page)).toHaveValue('uncertain');
+  await expect(page.getByTestId('synthetic-files')).toHaveText('persisted.txt');
+  await expect(send(page)).toBeDisabled();
+  await page.getByRole('button', { name: '检查发送回执' }).click();
+  await expect(editor(page)).toHaveValue('');
+  await expect(page.getByTestId('synthetic-files')).toHaveText('');
+  expect(fixture.posts).toHaveLength(1);
+  expect(fixture.requests.some(request => request.path === `/inputs/${String(requestId)}`)).toBe(true);
+  clean(fixture);
+});
+
+test('field ACK failure retains its file and reconciliation retries ACK, never transport', async ({ page }) => {
+  const fixture = await installFixture(page, { items: [], hasOlder: false });
+  await page.goto('/?probes=1'); await open(page);
+  await page.evaluate(() => { window.assistantProbe.add('retain.txt'); window.assistantProbe.failAck = true; });
+  await send(page).click();
+  await expect.poll(() => fixture.posts.length).toBe(1);
+  await expect.poll(() => page.evaluate(() => window.assistantProbe.snapshot().unconfirmed)).toBe(true);
+  await expect(page.getByTestId('synthetic-files')).toHaveText('retain.txt');
+  await page.evaluate(() => { window.assistantProbe.failAck = false; });
+  await page.getByRole('button', { name: '检查发送回执' }).click();
+  await expect(page.getByTestId('synthetic-files')).toHaveText('');
+  expect(fixture.posts).toHaveLength(1);
+  expect(fixture.seenUnexpected).toEqual([]);
+  expect(fixture.consoleErrors.length).toBeGreaterThan(0);
+  expect(fixture.consoleErrors.every(error => error.includes('Synthetic file ACK failure'))).toBe(true);
+});
+
+test('restored unknown ACK preserves newly edited text, reply and attachment identities', async ({ page }) => {
+  const fixture = await installFixture(page, { items: [publication(1, 'original'), publication(2, 'new reply')], hasOlder: false,
+    post: async (_post, route) => { await route.abort('failed'); return true; },
+  });
+  await page.goto('/?probes=1'); await open(page);
+  await page.locator('[data-ca-item="publication-1"]').getByRole('button', { name: '回复', exact: true }).click();
+  await editor(page).fill('original text');
+  await page.evaluate(() => window.assistantProbe.add('original.txt'));
+  await send(page).click();
+  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('未知');
+  await page.reload(); await open(page);
+  await editor(page).fill('edited after restoration');
+  await page.locator('[data-ca-item="publication-2"]').getByRole('button', { name: '回复', exact: true }).click();
+  await page.evaluate(() => window.assistantProbe.add('new.txt'));
+  const newItem = await page.evaluate(() => window.assistantProbe.snapshot().items.at(-1));
+  await page.getByRole('button', { name: '检查发送回执' }).click();
+  await expect(page.getByTestId('synthetic-files')).toHaveText('new.txt');
+  await expect(editor(page)).toHaveValue('edited after restoration');
+  await expect(page.getByRole('region', { name: '当前回复引用' })).toContainText('anchor-2');
+  expect(await page.evaluate(() => window.assistantProbe.snapshot().items)).toEqual([newItem]);
+  expect(fixture.posts).toHaveLength(1);
+  expect(fixture.posts[0]?.body).toMatchObject({ text: 'original text', replyTo: 'anchor-1',
+    attachments: [{ type: 'file', path: '/synthetic/original.txt', displayName: 'original.txt' }] });
+  clean(fixture);
+});
+
+test('pending receipt lookup survives reload; all native descriptor shapes are captured immutably', async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let first = true;
+  const fixture = await installFixture(page, { items: [], hasOlder: false,
+    read: async (url, route) => {
+      if (!url.pathname.includes('/inputs/') || !first) return false;
+      first = false;
+      await gate;
+      await route.abort('failed');
+      return true;
+    },
+  });
+  await page.goto('/?probes=1'); await open(page);
+  const attachments = await page.evaluate(() => {
+    const descriptors = [
+      { type: 'directory' as const, path: '/synthetic/tree', displayName: 'tree' },
+      { type: 'selection' as const, filePath: '/synthetic/source.ts', displayName: 'selection',
+        selection: { start: { line: 0, character: 1 }, end: { line: 2, character: 3 } }, text: 'selected bytes' },
+      { type: 'blob' as const, data: 'aGVsbG8=', mimeType: 'text/plain', displayName: 'blob' },
+    ];
+    for (const descriptor of descriptors) window.assistantProbe.addDescriptor(descriptor);
+    const saved = structuredClone(descriptors);
+    descriptors[0]!.displayName = 'mutated caller object';
+    return saved;
+  });
+  await send(page).click();
+  await expect.poll(() => fixture.requests.filter(request => request.path.startsWith('/inputs/')).length).toBe(1);
+  expect(fixture.posts[0]?.body.attachments).toEqual(attachments);
+  await page.reload();
+  release();
+  await open(page);
+  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('未知');
+  await expect(page.getByTestId('synthetic-files')).toHaveText('tree, selection, blob');
+  await expect(send(page)).toBeDisabled();
+  await page.getByRole('button', { name: '检查发送回执' }).click();
+  await expect(page.getByTestId('synthetic-files')).toHaveText('');
+  expect(fixture.posts).toHaveLength(1);
+  clean(fixture);
+});
+
+test('schema generation revocation denies old scope and rehydrates persisted items', async ({ page }) => {
+  const fixture = await installFixture(page, { items: [], hasOlder: false });
+  await page.goto('/?probes=1'); await open(page);
+  await page.evaluate(() => window.assistantProbe.add('generation.txt'));
+  await close(page);
+  const revoked = await page.evaluate(async () => {
+    const stale = window.assistantProbe.revokedUpdate!;
+    await window.restartFixture();
+    try { stale(); return false; } catch { return true; }
+  });
+  expect(revoked).toBe(true);
+  await open(page);
+  await expect(page.getByTestId('synthetic-files')).toHaveText('generation.txt');
+  await send(page).click();
+  await expect(page.getByTestId('synthetic-files')).toHaveText('');
+  expect(fixture.posts).toHaveLength(1);
+  expect(fixture.seenUnexpected).toEqual([]);
+  expect(fixture.consoleErrors.every(error => error.includes('Draft schema generation has stopped'))).toBe(true);
+});
+
+test('captured speech consent is invalidated by reply changes and closing, even after reopening', async ({ page }) => {
+  const fixture = await installFixture(page, { items: [publication(1, 'reply target')], hasOlder: false });
+  await page.goto('/?probes=1'); await open(page);
+  await page.getByRole('button', { name: '合成语音捕获' }).click();
+  await page.locator('[data-ca-item]').getByRole('button', { name: '回复', exact: true }).click();
+  expect(await page.evaluate(() => window.assistantProbe.sendCaptured())).toMatchObject({ status: 'blocked' });
+  await page.getByRole('button', { name: '合成语音捕获' }).click();
+  await close(page); await open(page);
+  expect(await page.evaluate(() => window.assistantProbe.sendCaptured())).toMatchObject({ status: 'blocked' });
+  expect(fixture.posts).toHaveLength(0);
+  clean(fixture);
+});
+
+test('known ask forbids attachment projection and choice-only questions reject freeform', async ({ page }) => {
+  const fixture = await installFixture(page, { hasOlder: false, items: [publication(1, 'choose', {
+    type: 'question', question: { state: 'pending', allowFreeform: false, choices: ['yes', 'no'] },
+  })] });
+  await page.goto('/?probes=1'); await open(page);
+  await page.evaluate(() => window.assistantProbe.add('not-an-answer.txt'));
+  await page.locator('[data-ca-item]').getByRole('button', { name: '回复', exact: true }).click();
+  await expect(page.getByRole('button', { name: '合成文件探针' })).toHaveCount(0);
+  await expect(editor(page)).toHaveCount(0);
+  await page.evaluate(() => window.assistantProbe.edit('freeform'));
+  await expect(page.getByRole('button', { name: '发送选项' })).toBeDisabled();
+  await page.getByRole('button', { name: 'yes', exact: true }).click();
+  await page.evaluate(() => window.assistantProbe.capture());
+  expect(await page.evaluate(() => window.assistantProbe.sendCaptured())).toMatchObject({ status: 'blocked' });
+  expect(fixture.posts).toHaveLength(0);
+  clean(fixture);
+});
+
+test('real Composer preserves IME composition and focus inside the native dialog', async ({ page }, info) => {
+  const fixture = await installFixture(page, { items: [], hasOlder: false });
+  await page.goto('/?probes=1'); await open(page);
+  await editor(page).focus();
+  await editor(page).fill('组合输入');
+  await editor(page).dispatchEvent('compositionstart', { data: '' });
+  await editor(page).dispatchEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true, keyCode: 229 });
+  expect(fixture.posts).toHaveLength(0);
+  await editor(page).dispatchEvent('compositionend', { data: '组合输入' });
+  await expect(editor(page)).toBeFocused();
+  await editor(page).press('Enter');
+  if (info.project.name.startsWith('mobile')) {
+    expect(fixture.posts).toHaveLength(0);
+    await expect(editor(page)).toHaveValue('组合输入\n');
+    await send(page).click();
+  }
+  await expect(editor(page)).toHaveValue('');
+  expect(fixture.posts).toHaveLength(1);
+  await close(page);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  clean(fixture);
+});

@@ -23,7 +23,7 @@ credentials are not persisted; package read credentials are limited to install.
 Source package, lock and module manifests remain `0.0.0-dev`. A private packaging
 stage receives `0.0.0-rolling.N`; no generated version is committed. The immutable
 lightweight tag `v0.0.0-rolling.N` points to that exact merged commit.
-The npm SDK dependency remains exactly `0.6.0`, independently versioned.
+The npm SDK dependency remains exactly `0.7.0`, independently versioned.
 
 Each Release contains exactly four assets:
 
@@ -41,10 +41,11 @@ archive root and as a sidecar. Format 2, channel `rolling`, uses the public
 Independent checksum files avoid a self-referential archive digest.
 
 The product is module **`assistant`**, backend API 1, requiring public frontend
-API 2, global components/menu/UI/surfaces v1, service readiness, chat reads, ask
+API 3, public components/owner drafts v1, draft submission v2,
+global components/menu/UI/surfaces v1, service readiness, chat reads, ask
 responses, resource preparation, role assignments, session discovery and session
 load v1. These capabilities are available in host
-commit `af4c8a227053640ae7c113c8849543a6731a5e19` (Rolling.20).
+commit `0dcfd6688b4c01b3f29776ee804b901612a6ae9b` (Rolling.21).
 Required intents are extracted from actual host calls. The database declaration
 is derived from the real database initialized **in memory**, enumerating all
 application tables/columns for preservation. It declares `assistant.sqlite`,

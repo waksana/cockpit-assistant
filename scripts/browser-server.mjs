@@ -11,6 +11,7 @@ const files = new Map([
   ['/host.js', [join(output, 'host.js'), 'text/javascript']],
   ['/host.js.map', [join(output, 'host.js.map'), 'application/json']],
   ['/host.css', [join(output, 'host.css'), 'text/css']],
+  [`/_modules/assets/synthetic-probe/${digest}/index.js`, [join(output, 'probe.js'), 'text/javascript']],
   [`${assets}/index.js`, [join(root, 'dist/web/index.js'), 'text/javascript']],
   [`${assets}/index.js.map`, [join(root, 'dist/web/index.js.map'), 'application/json']],
   [`${assets}/styles.css`, [join(root, 'dist/web/styles.css'), 'text/css']],
@@ -22,7 +23,10 @@ const server = createServer(async (request, response) => {
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ modules: [{ id: 'assistant', name: 'Assistant', version: '0.1.0',
       digest, config: {}, styles: [`${assets}/styles.css`],
-      apiBase: `/_modules/assistant/${digest}/api`, entry: `${assets}/index.js` }], errors: [] }));
+      apiBase: `/_modules/assistant/${digest}/api`, entry: `${assets}/index.js` },
+      { id: 'synthetic-probe', name: 'Synthetic File/Speech probe', version: '0.1.0', digest,
+        config: {}, styles: [], apiBase: `/_modules/synthetic-probe/${digest}/api`,
+        entry: `/_modules/assets/synthetic-probe/${digest}/index.js` }], errors: [] }));
     return;
   }
   if (url.pathname === `/_modules/assistant/${digest}/api/timeline/stream`) {

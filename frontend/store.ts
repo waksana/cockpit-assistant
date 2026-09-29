@@ -5,6 +5,7 @@ import type { Operation, Role } from '../src/types.ts';
 import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts';
 import { createInput } from './input.ts';
 import { attachmentsSchema } from '../src/attachments.ts';
+import { conversationItems, isConversationItem } from './timeline.ts';
 
 const sequence = z.number().int().nonnegative().safe();
 const itemSchema = z.object({
@@ -16,8 +17,10 @@ const itemSchema = z.object({
   topicTitle: z.string().nullable(), speaker: z.enum(['user', 'assistant', 'system']),
   sessionId: z.string().nullable(),
   question: z.object({ state: z.enum(['pending', 'stale', 'answered', 'unknown']),
-    choices: z.array(z.string()).optional(), allowFreeform: z.boolean().optional() }).nullable(),
+    stateVersion: sequence.default(0), choices: z.array(z.string()).optional(),
+    allowFreeform: z.boolean().optional() }).nullable(),
   attachments: attachmentsSchema.default([]),
+  revision: z.object({ version: sequence.positive(), text: z.string(), attachments: attachmentsSchema }).optional(),
 });
 const pageSchema = z.object({ items: z.array(itemSchema), before: sequence.nullable(),
   hasMore: z.boolean(), watermark: sequence, cursor: sequence.optional() });
@@ -111,7 +114,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     state = { ...state, ...patch };
     input.update(state.open, !!state.readiness?.canSend && !state.checking && !state.readinessError
       && (['coordinator', 'memory'] as const).every(role =>
-        state.readiness?.roles.some(entry => entry.role === role && entry.status === 'ready')), state.items);
+        state.readiness?.roles.some(entry => entry.role === role && entry.status === 'ready')), conversationItems(state.items));
     for (const listener of listeners) listener();
   };
   const current = (epoch: number) => !disposed && state.open && epoch === generation;
@@ -221,10 +224,25 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       const result = await page('?limit=50', signal);
       if (!current(epoch)) return;
       applied = result.items.at(-1)?.sequence ?? result.watermark;
-      update({ items: result.items, hasOlder: result.hasMore, loading: false, error: null });
+      update({ items: result.items, hasOlder: result.hasMore, error: null });
+      if (!result.items.some(isConversationItem) && result.hasMore) await older(epoch, signal);
+      if (!current(epoch)) return;
+      update({ loading: false });
       void connect(epoch, false);
     } catch (error) {
       if (current(epoch)) update({ loading: false, error: errorText(error) });
+    }
+  };
+  const older = async (epoch: number, signal: AbortSignal) => {
+    while (current(epoch) && state.hasOlder) {
+      const before = state.items[0]?.sequence;
+      if (before === undefined) throw new Error('历史消息游标缺失');
+      const result = await page(`?before=${before}&limit=50`, signal);
+      if (!current(epoch) || signal.aborted) return;
+      if ((!result.items.length && result.hasMore)
+        || result.items.some(item => item.sequence >= before)) throw new Error('历史消息游标未前进');
+      update({ items: merge(result.items), hasOlder: result.hasMore });
+      if (result.items.some(isConversationItem)) return;
     }
   };
   const setOperation = (requestId: string, patch: Partial<SetupOperation>) =>
@@ -296,13 +314,12 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       catch (error) { update({ error: errorText(error) }); if (disposed) context.report(error); }
     },
     async loadOlder() {
-      if (!state.hasOlder || state.loadingOlder || !state.items.length) return;
+      if (state.loading || !state.hasOlder || state.loadingOlder || !state.items.length) return;
       const epoch = generation;
-      const before = state.items[0]!.sequence;
       update({ loadingOlder: true });
       try {
-        const result = await page(`?before=${before}&limit=50`, lifetime?.signal);
-        if (current(epoch)) update({ items: merge(result.items), hasOlder: result.hasMore, loadingOlder: false });
+        await older(epoch, lifetime!.signal);
+        if (current(epoch)) update({ loadingOlder: false });
       } catch (error) {
         if (current(epoch)) update({ loadingOlder: false, error: errorText(error) });
       }

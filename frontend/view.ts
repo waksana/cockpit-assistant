@@ -1,10 +1,10 @@
 import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend';
-import type { ComponentType, CSSProperties } from 'react';
+import type { ComponentType } from 'react';
 import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts';
 import type { Role } from '../src/types.ts';
 import type { TimelineItem } from '../src/ui-types.ts';
-import { createMarkdown } from './markdown.ts';
 import { createIcon } from './icons.ts';
+import { conversationItems } from './timeline.ts';
 
 const roleNames: Record<Role, string> = { coordinator: 'coordinator', memory: 'memory' };
 const statusNames = {
@@ -16,19 +16,12 @@ const stateName = (state: string) => statusNames[state as keyof typeof statusNam
 const json = (value: unknown) => JSON.stringify(value, null, 2);
 type StatusTarget = Role | 'connection' | 'receipts';
 
-export function topicStyle(topicId: string | null): CSSProperties {
-  let hash = 0;
-  for (const character of topicId ?? '') hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
-  return { '--ca-topic-color': `color-mix(in srgb, var(--ck-color-accent) ${35 + hash % 56}%, var(--ck-color-text))` } as CSSProperties;
-}
-
 export function createPage(context: ModuleFrontendContext, store: AssistantActions, goHome: () => void): ComponentType {
-  const { createElement: h, Fragment, useSyncExternalStore, useState, useRef, useLayoutEffect, useId } = context.react;
-  const markdown = createMarkdown(context);
+  const { createElement: h, Fragment, useSyncExternalStore, useState, useRef, useLayoutEffect, useId, useMemo, useCallback } = context.react;
   const icon = createIcon(context);
   const Composer = context.components.get('composer');
-  const PublicMessage = context.components.get('message');
-  const Attachment = context.components.get('attachment');
+  const MessageList = context.components.get('messageList');
+  const ChatMessage = context.components.get('chatMessage');
   const button = (text: string, onClick: () => void, disabled = false, extra: Record<string, unknown> = {}) =>
     h('button', { type: 'button', className: 'ck-button', onClick, disabled, ...extra }, text);
   const choices = (item: TimelineItem) => item.question?.state === 'pending' && item.question.choices?.length
@@ -79,40 +72,37 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
       }, checking));
   }
 
-  function Message({ item, startsTopic }: { item: TimelineItem; startsTopic: boolean }) {
-    const speaker = item.speaker === 'user' ? '你' : item.speaker === 'assistant' ? '助手' : '系统';
-    const title = item.topicId ? item.topicTitle || '未命名话题' : '系统';
-    const date = new Date(item.createdAt);
-    const validDate = !Number.isNaN(date.getTime());
-    return h('article', { className: 'ca-message', 'data-ca-item': item.id, style: topicStyle(item.topicId),
-      'aria-label': `${title} · ${speaker}` },
-      startsTopic ? h('h3', { className: 'ca-topic-heading' }, title) : null,
-      h('div', { className: 'ca-message-meta ck-status-text' },
-        h('strong', null, speaker),
-        h('span', { className: 'ca-wrap' }, '来源：', item.sessionId ?? (item.speaker === 'user' ? '助手输入' : '系统')),
-        h('time', { dateTime: validDate ? date.toISOString() : undefined }, validDate ? date.toLocaleString('zh-CN') : '时间未知')),
-      h(PublicMessage, { identity: { owner: 'assistant', id: item.id,
-        kind: 'message', role: item.speaker }, complete: true },
-      markdown(item.text),
-      ...(item.attachments ?? []).map((attachment, index) => {
-        const label = attachment.displayName ?? (attachment.type === 'blob' ? attachment.mimeType
-          : attachment.type === 'selection' ? attachment.filePath : attachment.path);
-        return h(Attachment, { key: index, index, attachment, label,
-          children: h('p', { className: 'ca-wrap' }, label) });
-      })),
-      item.question ? h('p', { className: 'ck-status-text' },
-        '提问状态：', stateName(item.question.state),
-        item.question.allowFreeform === false ? ' · 仅接受列出的选项' : null) : null,
-      choices(item));
+  function Message({ item, previous }: { item: TimelineItem; previous?: TimelineItem }) {
+    const role = item.speaker === 'user' ? 'user' : 'assistant';
+    return h(ChatMessage, { identity: { owner: 'assistant', id: item.id,
+      kind: 'message', role }, complete: true, role, timestamp: item.createdAt,
+      body: item.text, attachments: item.attachments,
+      previous: previous ? { role: previous.speaker === 'user' ? 'user' : 'assistant',
+        timestamp: previous.createdAt } : undefined,
+      'data-ca-item': item.id,
+      'data-ca-message-id': item.type === 'clarification' ? undefined : item.messageId ?? undefined,
+    }, choices(item));
   }
 
   function Conversation({ snapshot }: { snapshot: Snapshot }) {
+    const items = useMemo(() => conversationItems(snapshot.items), [snapshot.items]);
     const scrollerRef = useRef<HTMLDivElement>(null);
     const contentRef = useRef<HTMLDivElement>(null);
+    const [scrollerNode, setScrollerNode] = useState<HTMLDivElement | null>(null);
+    const [contentNode, setContentNode] = useState<HTMLDivElement | null>(null);
+    const bindScroller = useCallback((node: HTMLDivElement | null) => {
+      scrollerRef.current = node;
+      setScrollerNode(node);
+    }, []);
+    const bindContent = useCallback((node: HTMLDivElement | null) => {
+      contentRef.current = node;
+      setContentNode(node);
+    }, []);
+    const previousNodes = useRef<{ scroller: HTMLDivElement; content: HTMLDivElement | null } | null>(null);
     const nearBottom = useRef(true);
     const initialized = useRef(false);
     const previous = useRef<TimelineItem[]>([]);
-    const anchor = useRef<{ id: string; offset: number } | null>(null);
+    const anchor = useRef<{ id: string; messageId?: string; offset: number } | null>(null);
     const [statusOpen, setStatusOpen] = useState<StatusTarget | null>(null);
     const statusControls = useRef<Partial<Record<StatusTarget, HTMLButtonElement | null>>>({});
     const [unread, setUnread] = useState(0);
@@ -123,7 +113,8 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
       const top = scroller.getBoundingClientRect().top;
       const first = Array.from(scroller.querySelectorAll<HTMLElement>('[data-ca-item]'))
         .find(element => element.getBoundingClientRect().bottom > top);
-      anchor.current = first ? { id: first.dataset.caItem!, offset: first.getBoundingClientRect().top - top } : null;
+      anchor.current = first ? { id: first.dataset.caItem!, messageId: first.dataset.caMessageId,
+        offset: first.getBoundingClientRect().top - top } : null;
     };
     const bottom = () => {
       const scroller = scrollerRef.current;
@@ -135,8 +126,11 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
     useLayoutEffect(() => {
       const scroller = scrollerRef.current;
       if (!scroller) return;
+      const replaced = previousNodes.current?.scroller !== scroller
+        || previousNodes.current?.content !== contentRef.current;
+      previousNodes.current = { scroller, content: contentRef.current };
       const old = previous.current;
-      previous.current = snapshot.items;
+      previous.current = items;
       if (!initialized.current && !snapshot.loading) {
         initialized.current = true;
         if (nearBottom.current) bottom();
@@ -145,20 +139,21 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
       }
       const oldFirst = old[0]?.sequence;
       const oldLast = old.at(-1)?.sequence;
-      const prepended = oldFirst !== undefined && (snapshot.items[0]?.sequence ?? oldFirst) < oldFirst;
-      const appended = oldLast === undefined ? 0 : snapshot.items.filter(item => item.sequence > oldLast).length;
-      if (prepended && anchor.current) {
+      const prepended = oldFirst !== undefined && (items[0]?.sequence ?? oldFirst) < oldFirst;
+      const appended = oldLast === undefined ? items.length : items.filter(item => item.sequence > oldLast).length;
+      if ((prepended || replaced) && anchor.current) {
         const saved = anchor.current;
         const target = Array.from(scroller.querySelectorAll<HTMLElement>('[data-ca-item]'))
-          .find(element => element.dataset.caItem === saved.id);
+          .find(element => element.dataset.caItem === saved.id
+            || (saved.messageId !== undefined && element.dataset.caMessageId === saved.messageId));
         if (target) scroller.scrollTop += target.getBoundingClientRect().top - scroller.getBoundingClientRect().top - saved.offset;
         readAnchor();
       }
-      if (appended > 0) {
+      if (appended > 0 || (replaced && nearBottom.current)) {
         if (nearBottom.current) bottom();
         else setUnread(count => count + appended);
       }
-    }, [snapshot.items, snapshot.loading]);
+    }, [items, snapshot.loading, scrollerNode, contentNode]);
     useLayoutEffect(() => {
       const content = contentRef.current;
       if (!content || typeof ResizeObserver === 'undefined') return;
@@ -168,7 +163,7 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
       observer.observe(content);
       if (scrollerRef.current) observer.observe(scrollerRef.current);
       return () => observer.disconnect();
-    }, []);
+    }, [scrollerNode, contentNode]);
 
     const rolesReady = (['coordinator', 'memory'] as const).every(role =>
       snapshot.readiness?.roles.some(entry => entry.role === role && entry.status === 'ready'));
@@ -236,27 +231,26 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
           if (event.key === 'Escape') { statusControls.current[statusOpen]?.focus(); setStatusOpen(null); }
         } },
         localStatus()) : null,
-      h('div', { className: 'ca-scroller', ref: scrollerRef, onScroll: () => {
+      h(MessageList, { className: 'ca-scroller', viewportRef: bindScroller, contentRef: bindContent,
+        role: 'region', 'aria-label': '对话记录', 'aria-busy': snapshot.loading || snapshot.loadingOlder,
+        before: h(Fragment, null,
+          snapshot.hasOlder ? button(snapshot.loadingOlder ? '正在加载…' : '加载更早消息', () => {
+            readAnchor(); void store.loadOlder();
+          }, snapshot.loading || snapshot.loadingOlder) : null,
+          snapshot.loading ? h('span', { role: 'status', 'aria-label': '正在加载对话' }, icon('loader')) : null),
+        onScroll: () => {
         const scroller = scrollerRef.current;
         if (!scroller) return;
         nearBottom.current = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 48;
         if (nearBottom.current) setUnread(0);
         readAnchor();
-      } },
-      h('div', { ref: contentRef, className: 'ca-content' },
-        h('section', { className: 'ca-timeline', 'aria-label': '对话记录', 'aria-busy': snapshot.loading || snapshot.loadingOlder },
-          snapshot.error && snapshot.stream !== 'disconnected' && statusOpen !== 'connection'
-            ? h('p', { role: 'alert', className: 'ck-danger ca-wrap' }, snapshot.error) : null,
-          snapshot.hasOlder ? button(snapshot.loadingOlder ? '正在加载…' : '加载更早消息', () => {
-            readAnchor(); void store.loadOlder();
-          }, snapshot.loadingOlder) : null,
-          snapshot.loading ? h('span', { role: 'status', 'aria-label': '正在加载对话' }, icon('loader')) : null,
-          ...snapshot.items.map((item, index) => h(Message, { key: item.id, item,
-            startsTopic: index === 0 || snapshot.items[index - 1]?.topicId !== item.topicId }))),
+      } }, ...items.map((item, index) => h(Message, { key: item.id, item, previous: items[index - 1] }))),
+      h('footer', { className: 'ca-composer' },
         snapshot.submissions.some(submission => submission.state === 'error' || submission.state === 'unknown')
           && statusOpen !== 'receipts' ? h('div', { role: 'alert', className: 'ck-danger' },
-            '发送尚未确认。', button('检查发送回执', () => setStatusOpen('receipts'))) : null)),
-      h('footer', { className: 'ca-composer' },
+            '发送尚未确认。', button('检查发送回执', () => setStatusOpen('receipts'))) : null,
+        snapshot.error && snapshot.stream !== 'disconnected' && statusOpen !== 'connection'
+          ? h('p', { role: 'alert', className: 'ck-danger ca-wrap' }, snapshot.error) : null,
         unread > 0 ? button(`${unread} 条新消息，查看最新`, bottom, false, { className: 'ck-button ca-new-messages' }) : null,
         h('div', null,
           h(Composer, { draft: store.draft, operation: 'prompt', disabled: !snapshot.draft.editable,

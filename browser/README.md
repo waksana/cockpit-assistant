@@ -17,8 +17,13 @@ npx playwright test
 ```
 
 The host revision is pinned to
-`d2dddc9d58f3673d69a682a941d9c9cc8e20976d` (merged host PR #270) in
+`4c1b9e31911e7a121faff13521552135b712f93f` (merged host PR #271) in
 `scripts/browser-build.mjs`. A clean cached checkout is required.
+When its web dependencies are absent, the fixture prepares the pinned host's
+web dependency closure with `pnpm --filter @cockpit/web... install --prod
+--frozen-lockfile --ignore-scripts`; dependency files stay ignored and tracked
+host source must remain clean. The host's Markdown dependency graph is bundled
+from that checkout, not copied into the Assistant package manifest.
 `COCKPIT_FIXTURE_SOURCE=/path/to/cockpit` uses a local Git
 object database, but still checks the pinned revision. For coordinated host API
 development only, `COCKPIT_FIXTURE_HOST=/path/to/host-worktree` explicitly opts
@@ -47,6 +52,10 @@ stopped. No fixture is part of the module package.
   `Workspace`/`ManageWorkspace` presentation is replaced with a no-session home
   and a selected Chat reference containing the real public `Composer`,
   `SessionDraft` and the exact `ComposerSurface`/`ComposerCard` used by Chat.
+  The opt-in `?transcript=1` reference additionally renders the real
+  `ThreadTranscript` and its `TranscriptMessages` with synthetic conversation
+  data, under the native Chat layout. No message bubbles, Markdown renderer,
+  timestamps or attachment markup are reimplemented in the fixture.
   The real `AnchoredMenu` invokes the registered global action.
   There is no replacement router, proxy module owner, second React root or
   Assistant dialog.
@@ -110,6 +119,21 @@ Scenarios run on desktop/mobile Chromium in light/dark themes:
   Composer, ordinary text quick-fill without reply targets, paging and
   reading-position/SSE recovery.
 - Public Composer computed styles/control geometry compared with Chat.
+- Complete public message presentation compared with the native
+  `ThreadTranscript`: user bubbles, assistant document body, Markdown,
+  same-speaker/speaker-change spacing, timestamps and attachment-only rows.
+  Unsafe links, raw HTML and unsupported media are compared against the same
+  native renderer, with no script execution or external media request.
+- A separately registered, late-activating passthrough `messageList` middleware
+  is removed through the real runtime's module unregister path. Both viewport
+  replacements must retain the off-bottom reading anchor and live draft.
+  After returning to bottom, subsequent same-message body growth must still
+  follow via the rebound resize observer, without new-message unread counts.
+- Natural user/assistant order across hidden status, wake, risk and correction
+  publications; correction replaces the right body without counting as unread.
+  System-only pages stay blank and multi-page system-only history is traversed
+  to reach earlier dialogue. Hidden SSE still advances raw watermarks, catches
+  gaps, reconnects and deduplicates; only new dialogue increments unread.
 - Genuine File upload, clipboard paste, drag/drop, preview and attachment-only
   send/ACK; genuine Speech microphone/F8, real browser touch/pointer hold,
   foreground target and cancellation.
@@ -122,4 +146,7 @@ Scenarios run on desktop/mobile Chromium in light/dark themes:
 
 `test/frontend-host.ts` also bundles the pinned real runtime for store tests,
 using isolated in-memory draft storage. A cold Node test may fetch the pinned
-host; it does not require a browser or a production module build.
+host and prepare its locked web dependencies; it does not require a browser or
+a production module build. Only the test process's React/ReactDOM and existing
+Zod 3 compatibility entry remain external; real Markdown code is bundled and
+metafile checks reject extra React runtimes or leaked parser dependencies.

@@ -32,8 +32,8 @@ export const timeline = [
   publication(4, 'A：先讨论旅行计划', { speaker: 'user' }),
   publication(5, 'B：现在讨论代码审查', { topicId: 'topic-b', topicTitle: '代码审查 B', speaker: 'user' }),
   publication(6, 'A：继续刚才的旅行计划'),
-  publication(7, '请选择交通方式', { type: 'question', question: { state: 'pending', choices: ['火车', '飞机'], allowFreeform: true } }),
-  publication(8, '旧问题已经失效', { type: 'question', question: { state: 'stale', choices: ['旧选项'], allowFreeform: false } }),
+  publication(7, '请选择交通方式', { type: 'question', question: { state: 'pending', stateVersion: 1, choices: ['火车', '飞机'], allowFreeform: true } }),
+  publication(8, '旧问题已经失效', { type: 'question', question: { state: 'stale', stateVersion: 1, choices: ['旧选项'], allowFreeform: false } }),
   publication(9, longMarkdown),
 ];
 export function readiness(ready = true): Readiness {

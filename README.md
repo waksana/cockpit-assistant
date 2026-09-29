@@ -20,6 +20,12 @@ context to choose the recipient and forwards the user's wording to a real native
 question when appropriate. Only an ambiguous destination needs clarification;
 native choice/freeform and attachment restrictions still apply.
 
+The page presents ordinary conversation using the same public message and
+Composer surfaces as Chat. Internal wake/status/risk records and correction
+notices stay out of the reading flow; corrections update the actual message
+instead. Topic/session metadata remains backstage, and all underlying records
+and sequence cursors are preserved.
+
 ## Development
 
 Use Linux and Node.js 24. Authenticate to GitHub Packages with a token authorized

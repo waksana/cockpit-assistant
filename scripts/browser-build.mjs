@@ -8,7 +8,7 @@ import { prepareReleases } from '../browser/release-fixtures.mjs';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const output = join(root, 'node_modules/.cache/assistant-browser');
-export const hostRevision = 'd2dddc9d58f3673d69a682a941d9c9cc8e20976d';
+export const hostRevision = '4c1b9e31911e7a121faff13521552135b712f93f';
 export const host = process.env.COCKPIT_FIXTURE_HOST
   ? resolve(process.env.COCKPIT_FIXTURE_HOST) : join(output, 'host');
 const require = createRequire(import.meta.url);
@@ -36,6 +36,30 @@ if (git(['rev-parse', 'HEAD']) !== hostRevision || git(['status', '--porcelain']
   await access(join(host, 'apps/web/src/lib/moduleRuntime.ts'));
   console.warn(`Development-only unpinned host override: ${host}`);
 }
+const dependenciesRevision = join(output, 'host-dependencies-revision');
+let prepareDependencies = false;
+try {
+  await access(join(host, 'apps/web/node_modules/react-markdown/package.json'));
+  await access(join(host, 'apps/web/node_modules/remark-gfm/package.json'));
+  if (!process.env.COCKPIT_FIXTURE_HOST) {
+    prepareDependencies = await readFile(dependenciesRevision, 'utf8') !== hostRevision;
+  }
+} catch {
+  prepareDependencies = true;
+}
+if (prepareDependencies) {
+  if (process.env.COCKPIT_FIXTURE_HOST) {
+    throw new Error('Prepare the development host web dependencies before using its override');
+  }
+  const scratch = join(output, 'runtime');
+  await mkdir(scratch, { recursive: true });
+  execFileSync('pnpm', ['--dir', host, '--filter', '@cockpit/web...', 'install',
+    '--prod', '--frozen-lockfile', '--ignore-scripts', '--store-dir', join(output, 'pnpm-store')], {
+    stdio: 'inherit', env: { ...process.env, TMPDIR: scratch, CI: 'true' },
+  });
+  if (git(['status', '--porcelain'])) throw new Error('Host dependency preparation changed tracked fixture source');
+  await writeFile(dependenciesRevision, hostRevision);
+}
 if (process.argv.includes('--host-only')) process.exit(0);
 const web = join(host, 'apps/web/src');
 const sass = require(dependency('sass'));
@@ -49,6 +73,7 @@ const aliases = {
   '@fixture/menu': join(web, 'components/AnchoredMenu.tsx'),
   '@fixture/composer': join(web, 'components/Composer.tsx'),
   '@fixture/composer-surface': join(web, 'components/ComposerSurface.tsx'),
+  '@fixture/thread-transcript': join(web, 'features/thread/ThreadTranscript.tsx'),
   '@fixture/draft': join(web, 'lib/textDraft.ts'),
   '@cockpit/protocol': join(host, 'packages/protocol/src'),
   '@cockpit/module-api': join(host, 'packages/module-api/src'),
@@ -86,6 +111,10 @@ if (Object.keys(fixtureBuild.metafile.inputs).some(path => path.endsWith('/apps/
 }
 await build({
   absWorkingDir: root, entryPoints: ['browser/probe.ts'], outfile: join(output, 'probe.js'),
+  bundle: true, platform: 'browser', format: 'esm', target: 'es2022',
+});
+await build({
+  absWorkingDir: root, entryPoints: ['browser/message-list-probe.ts'], outfile: join(output, 'message-list-probe.js'),
   bundle: true, platform: 'browser', format: 'esm', target: 'es2022',
 });
 await readFile(join(root, 'dist/web/index.js'));

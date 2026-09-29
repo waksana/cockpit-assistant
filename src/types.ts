@@ -64,6 +64,7 @@ export interface Question {
   request: AskRequest;
   messageId: string;
   state: 'pending' | 'stale' | 'answered' | 'unknown';
+  stateVersion?: number;
 }
 export interface Work {
   id: string;

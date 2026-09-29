@@ -59,16 +59,21 @@ An empty timeline is blank. There is no duplicate conversation heading, empty
 state paragraph, static message label, or permanent composer help text. Necessary
 loading indicators, actionable errors, questions, and their original options remain.
 
-Messages follow durable publication sequence, displaying the source speaker,
-session and recorded timestamp. Consecutive publications with the same topic
-form one titled block. A, B, A are three blocks, with the same stable topic
-accent for both A blocks. Titles, not color alone, identify topics. System
-publications without topics remain unassigned.
+The reading area is ordinary conversation, using the host's shared message
+presentation for user bubbles, assistant bodies, Markdown, timestamps and
+attachments. Topic and source-session metadata remain available to the backend,
+not displayed as titled blocks, colored borders or UUID labels.
 
-Markdown is rendered as React elements with raw HTML kept as text. Script/data
-links are not navigation; images are represented as explicit links instead of
-unsolicited remote fetches. Fenced code, tables, lists and long text remain
-readable in both themes.
+Only user speech, user-facing assistant answers and necessary questions appear
+in the main flow. Internal role output, wake receipts, lifecycle status, risk and
+correction notices are not chat bubbles. Their durable records are not deleted.
+Corrections update the affected visible body and attachments in place; a later
+publication of the same source replaces its presentation without duplicating
+the message. Destination clarifications remain independent assistant questions.
+
+Markdown uses Chat's shared host renderer rather than an Assistant-specific
+parser or stylesheet. Fenced code, tables, lists and long text use the same
+semantics and presentation in both themes.
 
 Every new input is an ordinary message, without quote selection or `replyTo`.
 The coordinator uses recent conversation, topics, source sessions and actual
@@ -109,14 +114,21 @@ unconfirmed failures also provide a visible recovery action.
 
 Opening loads the latest 50 publications, then connects enriched full-message SSE
 from the loaded watermark. Earlier history is explicit bounded upward paging.
+When a history page contains only hidden diagnostic records, the same read
+continues through bounded older pages until conversation is found or history
+ends. An entirely diagnostic history leaves the conversation area blank.
 Duplicate stream records are ignored; an out-of-order record is not applied past
 the last known sequence. Reconnection reads ordered missing pages before resuming
-the stream. This never uses host chat history or reloads every table per message.
+the stream. Hidden publications still advance the raw sequence cursor, including
+system-only catch-up pages. This never uses host chat history or reloads every
+table per message.
 
 There is one main reading scroller. It initially positions at the latest content,
 preserves position when older items are prepended, and follows new messages only
 while the reader stays at the bottom. Otherwise a new-message action lets the
-reader choose to return. Refresh does not move keyboard focus.
+reader choose to return. Only newly visible conversation increments that count,
+not system records, corrections or repeated publications of an existing message.
+Refresh does not move keyboard focus.
 
 Leaving the page aborts reads and the stream, not accepted writes, and does not retire
 the owner. It invalidates captured sends by advancing the business action
@@ -165,11 +177,14 @@ These module-relative routes supplement, not replace, existing `/history`,
 `before` and `after` cannot be combined. Limits are 1 through 100. `watermark`
 is the global highest publication sequence at that read, not proof the user read
 it. `TimelineItem` extends `Publication` with `topicTitle`, `speaker`, `sessionId`,
-native `attachments` and nullable `question` (`state`, optional `choices` and
-`allowFreeform`). Public message presentation uses an Assistant-owned identity;
+native `attachments`, a current source `revision` when available, and nullable
+`question` (`state`, `stateVersion`, optional `choices` and `allowFreeform`).
+Question snapshots merge by their durable state version rather than publication
+order, so newly read older pages cannot be overridden by a cached stale status.
+Public message presentation uses an Assistant-owned identity;
 it never uses a publication ID as a native message ID. Topic
-titles and question state are current enrichment, not edits to immutable
-publication text or anchors. Exact lookup and a fresh page can observe later
+titles, source revisions and question state are current enrichment, not edits
+to immutable publication text or anchors. Exact lookup and a fresh page can observe later
 question state; SSE is a publication log, not a general mutable-record change feed.
 
 `Readiness` contains role session IDs, expected epochs/models/directories,

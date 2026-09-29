@@ -22,7 +22,7 @@ function assertClean(fixture: Awaited<ReturnType<typeof installFixture>>) {
 }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-test('real host global menu opens on an empty homepage; complete Markdown, A/B/A and public theme', async ({ page }, info) => {
+test('real host global menu opens on an empty homepage; complete conversation and public theme without provenance cards', async ({ page }, info) => {
   const fixture = await installFixture(page);
   await page.goto('/');
   await expect(page.getByTestId('empty-homepage').getByRole('heading')).toHaveText('没有选择会话');
@@ -33,18 +33,17 @@ test('real host global menu opens on an empty homepage; complete Markdown, A/B/A
   await expect(messages).toHaveCount(timeline.length);
   expect(await messages.evaluateAll(elements => elements.map(element => element.getAttribute('data-ca-item'))))
     .toEqual(timeline.map(item => item.id));
-  const headings = page.locator('.ca-topic-heading');
-  await expect(headings).toHaveText(['旅行计划 A', '代码审查 B', '旅行计划 A']);
-  const colors = await messages.evaluateAll(elements => elements.slice(0, 3).map(element =>
-    (element as HTMLElement).style.getPropertyValue('--ca-topic-color')));
-  expect(colors[0]).toBe(colors[2]);
-  expect(colors[0]).not.toBe(colors[1]);
+  await expect(page.locator('.ca-topic-heading')).toHaveCount(0);
+  await expect(messages.first()).toContainText('A：先讨论旅行计划');
+  await expect(messages.nth(1)).toContainText('B：现在讨论代码审查');
+  await expect(messages.nth(2)).toContainText('A：继续刚才的旅行计划');
+  await expect(page.getByRole('region', { name: '对话记录', exact: true }))
+    .not.toContainText(/来源：|synthetic-reception|旅行计划 A|代码审查 B/);
   const long = page.locator('[data-ca-item="publication-9"]');
   await expect(long.getByRole('heading', { name: '完整 Markdown 回答' })).toBeVisible();
   await expect(long.getByRole('table')).toContainText('已确认');
   await expect(long.locator('pre')).toContainText('const result');
   await expect(long.getByText('长回答结束标记', { exact: true })).toBeVisible();
-  await expect(messages.first()).toContainText('来源：synthetic-reception');
   await expect(messages.first().locator('time')).toHaveAttribute('datetime', /2025-/);
   const measurements = await page.locator('.ca-page').evaluate(element => {
     const rect = element.getBoundingClientRect();
@@ -195,10 +194,10 @@ test('question choices fill ordinary text without reply controls, captured ancho
 test('a quick-filled choice survives reopening as text without retaining a question target', async ({ page }) => {
   const question = publication(1, '需要保留选项的早期问题', {
     type: 'question', anchorId: 'retained-question-anchor',
-    question: { state: 'pending', choices: ['火车', '飞机'], allowFreeform: false },
+    question: { state: 'pending', stateVersion: 1, choices: ['火车', '飞机'], allowFreeform: false },
   });
   const later = publication(2, '最新窗口内的另一个问题', {
-    type: 'question', question: { state: 'pending', choices: ['另一个选项'], allowFreeform: false },
+    type: 'question', question: { state: 'pending', stateVersion: 1, choices: ['另一个选项'], allowFreeform: false },
   });
   const fixture = await installFixture(page, { items: [question], hasOlder: false });
   await page.goto('/');
@@ -229,11 +228,11 @@ test('six long question choices stay in the scroller and never replace the publi
   let release: (() => void) | undefined;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const question = publication(1, '请从六个完整的长选项中选择', {
-    type: 'question', question: { state: 'pending', choices, allowFreeform: false },
+    type: 'question', question: { state: 'pending', stateVersion: 1, choices, allowFreeform: false },
     anchorId: 'immutable-question-anchor',
   });
   const later = publication(2, '另一个独立的待回答问题', {
-    type: 'question', question: { state: 'pending', choices: ['新的选择'], allowFreeform: false },
+    type: 'question', question: { state: 'pending', stateVersion: 1, choices: ['新的选择'], allowFreeform: false },
     anchorId: 'different-question-anchor',
   });
   const fixture = await installFixture(page, { items: [question, later], hasOlder: false,

@@ -11,6 +11,7 @@ const tables: Table[] = ['topics', 'receptions', 'messages', 'anchors', 'questio
 
 function record<T extends Table>(table: T, document: unknown): Tables[T] {
   const value = JSON.parse(String(document)) as Tables[T];
+  if (table === 'questions') return { stateVersion: 0, ...value };
   return ['messages', 'work', 'deliveries', 'publications'].includes(table) ? withAttachments(value) : value;
 }
 
@@ -84,6 +85,14 @@ export class Database {
     return value;
   }
   put<T extends Table>(table: T, record: Tables[T]): void {
+    if (table === 'questions') {
+      this.sql.prepare(`INSERT INTO questions(id,document) VALUES(?,json_set(?, '$.stateVersion', 1))
+        ON CONFLICT(id) DO UPDATE SET document=json_set(excluded.document, '$.stateVersion',
+          COALESCE(json_extract(questions.document, '$.stateVersion'), 0)
+          + CASE WHEN json_extract(questions.document, '$.state') IS json_extract(excluded.document, '$.state')
+            THEN 0 ELSE 1 END)`).run(record.id, JSON.stringify(record));
+      return;
+    }
     this.sql.prepare(`INSERT INTO ${table}(id,document) VALUES(?,?)
       ON CONFLICT(id) DO UPDATE SET document=excluded.document`).run(record.id, JSON.stringify(record));
   }

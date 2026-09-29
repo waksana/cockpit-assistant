@@ -199,7 +199,7 @@ test('legacy selected reply business state migrates without attaching an anchor 
   await page.evaluate(() => window.stopFixture());
   const legacyReply = publication(1, '旧版被选中的问题', {
     anchorId: 'legacy-selected-anchor', type: 'question',
-    question: { state: 'pending', choices: ['旧选项'], allowFreeform: false },
+    question: { state: 'pending', stateVersion: 1, choices: ['旧选项'], allowFreeform: false },
   });
   const changed = await page.evaluate(reply => {
     let changed = 0;
@@ -342,7 +342,7 @@ test('captured speech consent is invalidated by closing, even after reopening', 
 
 test('choice-only historical asks do not bind the owner or forbid ordinary text and attachments', async ({ page }) => {
   const fixture = await installFixture(page, { hasOlder: false, items: [publication(1, 'choose', {
-    type: 'question', question: { state: 'pending', allowFreeform: false, choices: ['yes', 'no'] },
+    type: 'question', question: { state: 'pending', stateVersion: 1, allowFreeform: false, choices: ['yes', 'no'] },
   })] });
   await page.goto('/?probes=1'); await open(page);
   await page.evaluate(() => window.assistantProbe.add('not-an-answer.txt'));

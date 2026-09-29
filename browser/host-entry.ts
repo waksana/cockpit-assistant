@@ -16,6 +16,11 @@ const runtime = new ModuleRuntime({
 });
 window.restartFixture = async () => { runtime.stop(); await runtime.start(); };
 window.stopFixture = () => runtime.stop();
+window.revokeMessageListProbe = () => {
+  const module = runtime.getSnapshot().find(value => value.asset.id === 'synthetic-message-list');
+  if (!module) throw new Error('Late message-list probe is not registered');
+  runtime.unregister(module);
+};
 const root = document.getElementById('root');
 if (!root) throw new Error('Missing fixture root');
 // Production App owns all routes, focus ownership, navigation and ModulePages.

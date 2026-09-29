@@ -6,17 +6,17 @@ Assistant space and its `dataRoot/assistant.sqlite`. Use Linux and Node.js 24
 with built-in `node:sqlite`.
 
 The installed public SDK dependency is pinned to
-`@waksana/cockpit-module-sdk@0.8.0`, including the native methods used here.
+`@waksana/cockpit-module-sdk@0.9.0`, including the native methods used here.
 The host compatibility reference is commit
-[`d2dddc9d58f3673d69a682a941d9c9cc8e20976d`](https://github.com/waksana/cockpit/commit/d2dddc9d58f3673d69a682a941d9c9cc8e20976d),
-release `v0.0.0-rolling.22`;
+[`4c1b9e31911e7a121faff13521552135b712f93f`](https://github.com/waksana/cockpit/commit/4c1b9e31911e7a121faff13521552135b712f93f),
+release `v0.0.0-rolling.23`;
 see its fixed
-[module contract](https://github.com/waksana/cockpit/blob/d2dddc9d58f3673d69a682a941d9c9cc8e20976d/docs/module-contract.md).
+[module contract](https://github.com/waksana/cockpit/blob/4c1b9e31911e7a121faff13521552135b712f93f/docs/module-contract.md).
 Activation requires `serviceReadyVersion`, `chatReadVersion`,
 `askResponseVersion`, `resourcePreparationVersion`, `roleAssignmentVersion`,
 `sessionDirectoryVersion`, and `sessionLoadVersion` all equal to `1`.
 Frontend activation separately requires Web API `3`, `publicComponentsVersion`
-and `draftOwnerVersion` `1`, `draftSubmissionVersion` `2`, `pageVersion`,
+and `draftOwnerVersion` `1`, `draftSubmissionVersion` `2`, `pageVersion`, `messagePresentationVersion`,
 `menuVersion`, `uiVersion`, and `uiSurfaceVersion` all `1`. The page is registered
 as `main` at `/modules/assistant/main`; navigation uses the public host bridge.
 Rolling publication is described in [releases](releases.md). Source merge and
@@ -236,6 +236,41 @@ is descriptive, not literal JSON. `role` is `coordinator | memory`.
 The UI's bounded recent/upward timeline, enriched stream, fresh readiness and
 exact receipts are documented in [interface API additions](interface.md#backend-additions).
 The table routes below retain their original forward-pagination semantics.
+
+The enriched `/timeline`, `/timeline/items/:sequence`, and `/timeline/stream`
+project current conversation content without rewriting publication history.
+For a `message`, `question`, `correction`, or `status` with an existing source
+message, `TimelineItem` includes optional
+`revision: {version: number, text: string, attachments: NativeAttachment[]}`.
+This is the current content version, not a new publication or native effect.
+An ordinary message whose content version exceeds its matching publication
+source version projects the current original text and attachments. Otherwise
+its published text remains intact, including a coordinator summary; assignment
+changes alone do not replace a summary. A question projects the native
+`request.question`, with choices and freeform restrictions retained in the
+separate `question` metadata, not appended as internal template text.
+That metadata includes `stateVersion: number`, independent of content
+`revision.version` and publication sequence. Compare question snapshots by
+`stateVersion`: a freshly read older publication can contain a newer question
+state than a cached later status item. Newly stored questions start at 1; each
+actual state transition increments the persisted counter atomically. Saving
+the same state does not increment it, and caller-supplied stale counters cannot
+roll it back. Legacy questions with no counter read as 0 without a GET write or
+schema migration; their next state transition advances from 0. This adds no
+publication, wake, or native behavior.
+
+Correction/status items retain their own notification text while their
+`revision` allows a chat-only client to update an older visible message, even
+when that message is loaded later through pagination. A same-version snapshot
+must not overwrite a newer published summary. Clarifications have no `revision`
+and retain their own question text rather than their source user's wording.
+Known coordinator/memory carrier sources and system messages project as
+`speaker: "system"`; ordinary reception history is not relabeled simply because
+its reception is disabled or missing. These projections do not filter sequence
+records or change watermarks, work, deliveries, or wake behavior. Clients must
+consume hidden system records while rendering only conversation content.
+The plain `/publications`, `/history`, `/events`, and `/events/stream` remain
+the immutable publication log, without these projection fields.
 
 | Method/path | Query and result |
 | --- | --- |

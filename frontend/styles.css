@@ -16,37 +16,12 @@
 .ca-header [data-status="error"], .ca-header [data-status="invalid"], .ca-header [data-status="disconnected"] { color: var(--ck-color-danger); }
 .ca-status-detail { flex: 0 1 auto; max-height: 30dvh; overflow-y: auto; padding: var(--ck-space); border-bottom: 1px solid var(--ck-color-border); }
 .ca-status-detail p { margin-block: var(--ck-space); }
-.ca-scroller { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; }
-.ca-content { padding: calc(2 * var(--ck-space)); }
-.ca-content > * + * { margin-top: calc(3 * var(--ck-space)); }
 .ca-composer { flex: 0 0 auto; min-width: 0; }
 .ca-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--ck-space); margin: var(--ck-space) 0; }
 .ca-facts dt { color: var(--ck-color-muted); }
 .ca-facts dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .ca-wrap { overflow-wrap: anywhere; white-space: pre-wrap; }
-.ca-message-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--ck-space) calc(2 * var(--ck-space)); }
-.ca-message { padding: var(--ck-space) 0 var(--ck-space) calc(2 * var(--ck-space)); border-inline-start: .2rem solid var(--ca-topic-color, var(--ck-color-accent)); min-width: 0; }
-.ca-message:has(> .ca-topic-heading) { margin-top: calc(3 * var(--ck-space)); }
-.ca-topic-heading { margin: 0 0 var(--ck-space); font-size: var(--ck-text-title); color: var(--ca-topic-color, var(--ck-color-text)); overflow-wrap: anywhere; }
-.ca-message-meta { color: var(--ck-color-muted); }
-.ca-message-meta strong { color: var(--ck-color-text); }
-.ca-markdown, .ca-plain-text { overflow-wrap: anywhere; }
-.ca-plain-text { white-space: pre-wrap; }
-.ca-markdown > :first-child { margin-top: var(--ck-space); }
-.ca-markdown > :last-child { margin-bottom: var(--ck-space); }
-.ca-markdown p { white-space: pre-wrap; }
-.ca-markdown pre, .ca-receipt { margin: var(--ck-space) 0; padding: var(--ck-space); border: 1px solid var(--ck-color-border); border-radius: var(--ck-radius); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; font-size: var(--ck-text-body); }
-.ca-markdown code { white-space: break-spaces; overflow-wrap: anywhere; }
-.ca-markdown a { color: var(--ck-color-accent); text-decoration: underline; overflow-wrap: anywhere; }
-.ca-markdown blockquote { border-inline-start: .2rem solid var(--ck-color-border); margin-inline: 0; padding-inline-start: calc(2 * var(--ck-space)); }
-.ca-markdown table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-block: calc(2 * var(--ck-space)); }
-.ca-markdown th, .ca-markdown td { border: 1px solid var(--ck-color-border); padding: var(--ck-space); overflow-wrap: anywhere; vertical-align: top; }
-.ca-markdown th { text-align: start; }
-.ca-markdown hr { border: 0; border-top: 1px solid var(--ck-color-border); }
-.ca-markdown h1, .ca-markdown h2 { font-size: 1.25rem; }
-.ca-markdown h3, .ca-markdown h4, .ca-markdown h5, .ca-markdown h6 { font-size: 1rem; }
-.ca-markdown ul, .ca-markdown ol, .ca-question-choices { padding-inline-start: calc(3 * var(--ck-space)); }
-.ca-task-state { color: var(--ck-color-muted); margin-inline-end: var(--ck-space); }
+.ca-receipt { margin: var(--ck-space) 0; padding: var(--ck-space); border: 1px solid var(--ck-color-border); border-radius: var(--ck-radius); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; font-size: var(--ck-text-body); }
 .ca-operation { border-top: 1px solid var(--ck-color-border); padding-block: var(--ck-space); overflow-wrap: anywhere; }
 .ca-operation p { margin-block: var(--ck-space); }
 .ca-operation-title { font-weight: 600; }
@@ -54,8 +29,6 @@
 .ca-choices > button { white-space: normal; overflow-wrap: anywhere; text-align: start; max-width: 100%; }
 .ca-new-messages { margin-bottom: var(--ck-space); }
 @media (max-width: 40rem) {
-  .ca-content { padding: var(--ck-space); }
   .ca-facts { grid-template-columns: minmax(0, 1fr); gap: calc(.5 * var(--ck-space)); }
   .ca-facts dd { margin-bottom: var(--ck-space); }
-  .ca-message { padding-inline-start: var(--ck-space); }
 }

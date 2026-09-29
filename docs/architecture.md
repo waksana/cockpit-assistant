@@ -58,8 +58,9 @@ User content includes native attachment descriptors alongside text. The
 immutable input receipt, message versions, work source and each delivery retain
 the same captured content, even if routing happens later or a target session
 does not yet exist when input is accepted. A correction/reclassification cannot
-silently replace pending attachments. Publication/timeline attachments come
-from the recorded content version, not a live draft. Native prompt dispatch
+silently replace pending attachments. Immutable publications retain their
+recorded content version; the conversation projection can display a later
+corrected source version, never a live draft. Native prompt dispatch
 passes those descriptors directly; preview URLs are not native paths.
 
 Attachment-only input is valid. The coordinator reads its descriptions through
@@ -206,6 +207,15 @@ not token deltas. Reconnect after the last fully consumed event ID; duplicates
 can be discarded by that sequence. The stream applies backpressure and stops
 on request abort. Browser receipt is not an acknowledgment that the user read
 the message.
+
+The conversation is a read-only projection over that log, not a second source
+of truth. It renders only user speech, assistant answers and necessary questions.
+Hidden diagnostic publications still advance history and reconnect cursors.
+Current source revisions update already-published conversation bodies and
+attachments in place without rewriting the original publication or generating
+a new-message notification. Reclassification alone preserves published wording;
+destination clarifications are separate speech, not replacements for their
+source input. The same visible projection supplies the bounded Speech reference.
 
 Background publication never changes the foreground topic. Internal wake
 receipts, risk notices, and system status do not become new semantic input, so

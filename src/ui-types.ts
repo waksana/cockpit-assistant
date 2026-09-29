@@ -1,12 +1,18 @@
 import type { Delivery, Message, Publication, Question, Reception, Role, Work } from './types.ts';
-import type { ReceiptInput } from './attachments.ts';
+import type { NativeAttachment, ReceiptInput } from './attachments.ts';
 
 export interface TimelineItem extends Publication {
   topicTitle: string | null;
   speaker: 'user' | 'assistant' | 'system';
   sessionId: string | null;
+  revision?: {
+    version: number;
+    text: string;
+    attachments: NativeAttachment[];
+  };
   question: {
     state: Question['state'];
+    stateVersion: number;
     choices?: string[];
     allowFreeform?: boolean;
   } | null;

@@ -116,7 +116,7 @@ test('pure attachment acceptance needs no existing reception and does not fake t
   } finally { f.close(); }
 });
 
-test('versions, work, timeline, receipts and native prompt retain the same immutable snapshot', async () => {
+test('delivery and publication snapshots remain immutable while timeline projects corrected content', async () => {
   const f = fixture();
   try {
     const accepted = f.service.accept(input());
@@ -131,8 +131,11 @@ test('versions, work, timeline, receipts and native prompt retain the same immut
     assert.deepEqual(f.db.must('work', accepted.work.id).attachments, attachments);
     assert.deepEqual(f.db.must('deliveries', delivery!.id).attachments, attachments);
     const publication = timeline(f.service, undefined, undefined, 100).items.find(item => item.type === 'message')!;
-    assert.equal(publication.text, '');
-    assert.deepEqual(publication.attachments, attachments);
+    assert.equal(publication.text, 'Corrected later');
+    assert.deepEqual(publication.attachments, [{ type: 'file', path: '/new-version' }]);
+    const originalPublication = f.db.must('publications', publication.id);
+    assert.equal(originalPublication.text, '');
+    assert.deepEqual(originalPublication.attachments, attachments);
     const receipt = inputReceipt(f.service, 'attached');
     assert.equal(receipt.message.version, 1);
     assert.equal(receipt.message.raw, '');

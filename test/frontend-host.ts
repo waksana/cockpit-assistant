@@ -8,9 +8,11 @@ import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend
 execFileSync(process.execPath, ['scripts/browser-build.mjs', '--host-only'], { cwd: resolve('.') });
 const host = resolve(process.env.COCKPIT_FIXTURE_HOST ?? 'node_modules/.cache/assistant-browser/host');
 const outfile = resolve('node_modules/.cache/assistant-browser/store-runtime.mjs');
-await build({
+const bundled = await build({
   entryPoints: [`${host}/apps/web/src/lib/moduleRuntime.ts`], outfile,
-  bundle: true, platform: 'node', format: 'esm', packages: 'external',
+  bundle: true, platform: 'node', format: 'esm', jsx: 'automatic', metafile: true,
+  mainFields: ['module', 'main'],
+  external: ['react', 'react/*', 'react-dom', 'react-dom/*'],
   alias: {
     '@cockpit/module-api': `${host}/packages/module-api/src`,
     '@cockpit/protocol': `${host}/packages/protocol/src`,
@@ -27,6 +29,16 @@ await build({
     },
   }],
 });
+for (const output of Object.values(bundled.metafile.outputs)) {
+  for (const dependency of output.imports.filter(value => value.external)) {
+    if (!/^(?:react(?:-dom)?(?:\/|$)|zod\/v3$|node:)/.test(dependency.path)) {
+      throw new Error(`Host fixture leaked an unbundled non-React dependency: ${dependency.path}`);
+    }
+  }
+}
+if (Object.keys(bundled.metafile.inputs).some(path => /node_modules\/(?:\.pnpm\/[^/]+\/node_modules\/)?react(?:-dom)?\//.test(path))) {
+  throw new Error('Store fixture must reuse the test process React runtime');
+}
 const { ModuleRuntime } = await import(pathToFileURL(outfile).href);
 
 export async function hostState() {

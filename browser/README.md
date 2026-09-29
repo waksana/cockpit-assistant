@@ -6,7 +6,7 @@ module HTTP services, audio devices and model connections are synthetic.
 
 ## Run
 
-Use Node 24 and the repository's development dependencies:
+Use Node 24, pnpm 10.34.5 and the repository's development dependencies:
 
 ```sh
 npm ci --ignore-scripts

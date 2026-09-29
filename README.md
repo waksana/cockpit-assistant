@@ -28,7 +28,8 @@ and sequence cursors are preserved.
 
 ## Development
 
-Use Linux and Node.js 24. Authenticate to GitHub Packages with a token authorized
+Use Linux, Node.js 24 and pnpm 10.34.5 (for the pinned host test fixture).
+Authenticate to GitHub Packages with a token authorized
 to read `@waksana/cockpit-module-sdk`, supplied as `NODE_AUTH_TOKEN`; never put a
 token in a repository file.
 

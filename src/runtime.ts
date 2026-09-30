@@ -337,7 +337,7 @@ export class Runtime {
     let found = match(events);
     if (!found.roots.length || !found.calls.length) {
       const page = await this.native.read(identity.sessionId, null, true, false, true);
-      events = [...events, ...page.events.map(evidenceEvent)]
+      events = [...(this.evidence.get(identity.sessionId) ?? []), ...page.events.map(evidenceEvent)]
         .filter((event, i, all) => all.findIndex(item => item.id === event.id) === i).slice(-256);
       this.evidence.set(identity.sessionId, events);
       found = match(events);

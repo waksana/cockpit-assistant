@@ -471,3 +471,73 @@ test('a failed initial processing guard does not reserve active or send a native
     assert.equal(coordinatorPrompts(f).length, 1);
   } finally { f.close(); }
 });
+
+for (const endType of ['assistant.turn_end', 'abort'] as const)
+  test(`history read merges live ${endType} evidence while source observation is delayed`, async () => {
+    const f = fixture(), metadataEntered = deferred(), releaseMetadata = deferred(),
+      historyEntered = deferred(), releaseHistory = deferred();
+    let observation: Promise<void> | undefined;
+    try {
+      const first = f.service.accept({ requestId: 'history-first', text: 'First source' }).message;
+      const next = f.service.accept({ requestId: 'history-next', text: 'Next source' }).message;
+      await f.runtime.wake();
+      const receipt = f.sourceReceipts.get(first.id)!;
+      const identity = toolIdentity(f, first.id, 'during-history');
+      let delayed = false;
+      f.onGet(async sessionId => {
+        if (sessionId !== 's1' || delayed) return;
+        delayed = true; metadataEntered.resolve(); await releaseMetadata.promise;
+      });
+      observation = f.runtime.observe('s1');
+      await metadataEntered.promise;
+      const read = f.native.read.bind(f.native);
+      f.native.read = async (...args) => {
+        const page = await read(...args);
+        historyEntered.resolve();
+        await releaseHistory.promise;
+        return page;
+      };
+      const authorization = assert.rejects(f.runtime.authorize(identity, first.id),
+        { code: 'STALE_SOURCE' });
+      await historyEntered.promise;
+      f.runtime.noteEvent('coordinator', { id: 'tool-envelope:during-history', type: 'assistant.message',
+        data: { interactionId: `interaction:${receipt}`, toolRequests: [{ toolCallId: 'during-history' }] } });
+      f.runtime.noteEvent('coordinator', { id: `during-history:${endType}`, type: endType,
+        data: { interactionId: `interaction:${receipt}` } });
+      releaseHistory.resolve();
+      await authorization;
+      releaseMetadata.resolve();
+      await observation;
+      await f.runtime.wake();
+      assert.equal(f.db.must('messages', first.id).processed, false);
+      assert.match(f.runtime.visibleDiagnostic(f.db.must('messages', first.id))!, /finished without a saved result/);
+      assert.ok(f.errors.some(error => (error as { code?: string }).code === 'COORDINATOR_INCOMPLETE'));
+      assert.equal(coordinatorPrompts(f).length, 2);
+      assert.ok((coordinatorPrompts(f)[1]!.body as { text: string }).text.includes(next.id));
+    } finally { releaseHistory.resolve(); releaseMetadata.resolve(); await observation; f.close(); }
+  });
+
+test('history snapshot cannot discard a tool identity received while the native read is pending', async () => {
+  const f = fixture(), historyEntered = deferred(), releaseHistory = deferred();
+  try {
+    const source = f.service.accept({ requestId: 'live-tool', text: 'Original' }).message;
+    await f.runtime.wake();
+    const receipt = f.sourceReceipts.get(source.id)!;
+    const read = f.native.read.bind(f.native);
+    f.native.read = async (...args) => {
+      const page = await read(...args);
+      historyEntered.resolve();
+      await releaseHistory.promise;
+      return page;
+    };
+    const authorization = f.runtime.authorize({
+      sessionId: 'coordinator', runtimeSessionId: 'coordinator', subagent: false, toolCallId: 'live-only-tool',
+    }, source.id);
+    await historyEntered.promise;
+    f.runtime.noteEvent('coordinator', { id: 'live-only-tool-event', type: 'assistant.message',
+      data: { interactionId: `interaction:${receipt}`, toolRequests: [{ toolCallId: 'live-only-tool' }] } });
+    releaseHistory.resolve();
+    assert.equal((await authorization).messageId, source.id);
+    assert.deepEqual(f.errors, []);
+  } finally { releaseHistory.resolve(); await f.runtime.settled(); f.close(); }
+});

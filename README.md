@@ -65,6 +65,9 @@ native adapters, not production sessions.
 The browser harness builds pinned real Cockpit menu/runtime/page
 implementations against synthetic module HTTP fixtures; it never starts a native
 host or installs the module. Its checkout/cache stays under `node_modules/.cache`.
+`npm test` prepares that shared fixture once before starting parallel test workers.
+For focused frontend tests, run `npm run test:prepare` before invoking Node's
+test runner with the selected test files.
 
 The frontend uses the host's React and public module UI, not a separate React
 root. Its shared public Composer uses a durable owner draft; compatible

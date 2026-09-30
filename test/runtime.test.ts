@@ -1,89 +1,130 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fixture, proof } from './fixtures.ts';
-import { questionKey } from '../src/service.ts';
+import { fixture, stageDelivery } from './fixtures.ts';
 
-function route(f: ReturnType<typeof fixture>) {
-  const input = f.service.accept({ requestId: 'one', text: 'Hi' });
-  const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-  f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'T', independent: true },
-    reason: 'New', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0 } });
-  return f.db.find('deliveries', d => d.kind === 'prompt')[0]!;
+const reply = [
+  { id: 'user-envelope', type: 'user.message',
+    data: { messageId: 'prompt-receipt', interactionId: 'assistant-interaction' }, parentId: null },
+  { id: 'start', type: 'assistant.turn_start', data: {}, parentId: null },
+  { id: 'message', type: 'assistant.message', parentId: 'start',
+    data: { content: 'Complete', messageId: 'native-m', interactionId: 'assistant-interaction', toolRequests: [] } },
+  { id: 'end', type: 'assistant.turn_end', data: {}, parentId: 'message' },
+];
+function track(f: ReturnType<typeof fixture>) {
+  return stageDelivery(f, { state: 'accepted', nativeMessageId: 'prompt-receipt' });
 }
-test('accepted effects do not resend across pump and recovery', async () => {
+function replies(f: ReturnType<typeof fixture>) {
+  return f.db.find('messages', message => message.kind === 'reply');
+}
+
+test('ordinary directory discovery reads all business sessions without an Assistant delivery', async () => {
   const f = fixture();
   try {
-    const delivery = route(f);
+    await f.runtime.start();
+    await f.runtime.wake('s1');
+    assert.equal(f.calls.some(call => call.name === 'chat'), true);
+    assert.equal(f.db.list('native').items.length, 0);
+    assert.equal(f.db.list('messages').items.length, 0);
+  } finally { f.close(); }
+});
+
+test('all ordinary native asks are collected without receipts, while internal asks are excluded', async t => {
+  const f = fixture(); t.after(() => f.close());
+  const request = { requestId: 'actual-request', question: 'Select a path', choices: ['A', 'B'], allowFreeform: false };
+  f.metas.get('s1')!.ask = request;
+  f.metas.get('coordinator')!.ask = { ...request, requestId: 'internal-request' };
+  await f.runtime.wake('s1');
+  await f.runtime.wake('coordinator');
+  assert.deepEqual(f.db.list('questions').items.map(question => question.request), [request]);
+  assert.equal(f.db.find('messages', message => message.kind === 'ask').length, 1);
+  assert.equal(f.db.find('deliveries', delivery => delivery.kind === 'prompt').length, 0);
+});
+
+test('ordinary prompt acceptance does not require internal wake receipts and is never resent', async () => {
+  const f = fixture();
+  try {
+    const delivery = stageDelivery(f);
+    f.promptResult({ ok: true });
     await f.runtime.wake();
     assert.equal(f.db.must('deliveries', delivery.id).state, 'accepted');
-    f.service.recover();
-    await f.runtime.wake();
-    assert.equal(f.calls.filter(c => c.name === 'prompt').length, 1);
+    await f.runtime.wake('s1');
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+    assert.equal(f.calls.some(call => call.name === 'chat'), true);
   } finally { f.close(); }
 });
-test('native exception after call intent leaves unknown, never blindly retries', async () => {
+
+test('business replies before send acknowledgment are immediately visible without receipt filtering', async () => {
   const f = fixture();
   try {
-    const delivery = route(f);
-    f.fail(new Error('Connection dropped after native accepted'));
+    const delivery = stageDelivery(f);
+    f.promptResult({ ok: true, messageId: 'prompt-receipt' });
+    f.onPrompt(async () => {
+      f.onPrompt(null);
+      f.pages.push({ events: reply, cursor: 'tail', cursorStatus: 'ok', hasMore: false });
+      await f.runtime.consume('s1');
+      assert.equal(replies(f)[0]?.raw, 'Complete');
+    });
     await f.runtime.wake();
-    assert.equal(f.db.must('deliveries', delivery.id).state, 'unknown');
-    f.fail(null);
-    await f.runtime.wake();
-    assert.equal(f.calls.filter(c => c.name === 'prompt').length, 1);
+    assert.equal(f.db.must('deliveries', delivery.id).nativeMessageId, 'prompt-receipt');
+    assert.equal(replies(f)[0]?.deliveryId, undefined);
+    assert.equal(replies(f)[0]?.raw, 'Complete');
   } finally { f.close(); }
 });
-test('deleted reception never redirects an anchored message', async () => {
-  const f = fixture();
-  try {
-    const delivery = route(f);
-    f.metas.delete('s1');
-    await f.runtime.wake();
-    assert.equal(f.db.must('deliveries', delivery.id).state, 'rejected');
-    assert.equal(f.calls.filter(c => c.name === 'prompt' && JSON.stringify(c.body).includes('"s1"')).length, 0);
-  } finally { f.close(); }
+
+test('accepted and uncertain external effects never resend across pump and recovery', async () => {
+  for (const uncertain of [false, true]) {
+    const f = fixture();
+    try {
+      const delivery = stageDelivery(f);
+      if (uncertain) f.fail(new Error('Connection dropped after native accepted'));
+      await f.runtime.wake();
+      assert.equal(f.db.must('deliveries', delivery.id).state, uncertain ? 'unknown' : 'accepted');
+      f.fail(null);
+      f.service.recover();
+      await f.runtime.wake();
+      assert.equal(f.calls.filter(c => c.name === 'prompt').length, 1);
+      assert.equal(f.db.must('work', `message:${delivery.messageId}:1`).state, 'done');
+    } finally { f.close(); }
+  }
 });
-test('native answers use request interface, not prompt; stale request is rejected', async () => {
+
+test('cursor page commits atomically, overlap deduplicates, and replies publish before attribution', () => {
   const f = fixture();
   try {
-    const ask = { requestId: 'q', question: 'Proceed?', choices: ['Yes'], allowFreeform: false };
-    f.db.transaction(() => f.service.syncQuestions('s1', [ask], true));
-    f.metas.get('s1')!.ask = ask;
-    const q = f.db.must('questions', questionKey('s1', 'q'));
-    f.db.put('anchors', { id: q.messageId, messageId: q.messageId, sessionId: 's1', kind: 'ask', requestId: 'q' });
-    const input = f.service.accept({ requestId: 'answer', text: 'Yes' });
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-    f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'T', independent: true },
-      reason: 'Context selects answer', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0, answerQuestionId: q.id } });
-    await f.runtime.wake();
-    assert.equal(f.calls.filter(c => c.name === 'answer').length, 1);
-    assert.equal(f.calls.filter(c => c.name === 'prompt' && JSON.stringify(c.body).includes('"s1"')).length, 0);
-    assert.equal(f.db.must('questions', q.id).state, 'answered');
-  } finally { f.close(); }
-});
-test('cursor page commits atomically, overlap deduplicates, only evidenced complete primary responses qualify', async () => {
-  const f = fixture();
-  try {
-    const events = [
-      { id: 'start', type: 'assistant.turn_start', data: {}, parentId: null },
-      { id: 'message', type: 'assistant.message', data: { content: 'Complete', messageId: 'native-m', toolRequests: [] }, parentId: 'start' },
-      { id: 'end', type: 'assistant.turn_end', data: {}, parentId: 'message' },
-    ];
-    f.runtime.ingestion.apply('s1', 1, events.slice(0, 2), 'c1');
-    assert.equal(f.db.list('messages').items.length, 0);
-    f.runtime.ingestion.apply('s1', 1, events, 'c2');
-    assert.equal(f.db.list('messages').items.length, 1);
-    f.runtime.ingestion.apply('s1', 1, events, 'c2');
-    assert.equal(f.db.list('messages').items.length, 1);
-    f.runtime.ingestion.apply('s1', 1, events.map(e => ({ ...e, id: `child-${e.id}`, parentId: e.parentId ? `child-${e.parentId}` : null, agentId: 'child' })), 'c3');
-    assert.equal(f.db.list('messages').items.length, 1);
+    track(f);
+    f.runtime.ingestion.apply('s1', 1, reply.slice(0, 2), 'c1');
+    assert.equal(replies(f).length, 0);
+    f.runtime.ingestion.apply('s1', 1, reply, 'c2');
+    const message = replies(f)[0]!;
+    assert.equal(message.raw, 'Complete');
+    assert.equal(message.topicId, null);
+    assert.equal(f.db.find('publications', p => p.messageId === message.id && p.type === 'message').length, 1);
+    f.runtime.ingestion.apply('s1', 1, reply, 'c2');
+    f.runtime.ingestion.apply('s1', 1, reply.map(e => ({ ...e, id: `child-${e.id}`,
+      parentId: e.parentId ? `child-${e.parentId}` : null, agentId: 'child' })), 'c3');
+    assert.equal(replies(f).length, 1);
     assert.throws(() => f.runtime.ingestion.apply('s1', 1, [
-      { ...events[1]!, data: { content: 'Mutated event ID' } },
+      { ...reply[2]!, data: { ...reply[2]!.data, content: 'Mutated event ID' } },
     ], 'bad'), /changed its durable payload/);
     assert.equal(f.db.must('receptions', 's1').cursor, 'c3');
   } finally { f.close(); }
 });
-test('tool commentary and idle never become final replies; unenrolled input is rejected', () => {
+
+test('unidentified native events are neither retained nor turned into business inputs', () => {
+  const f = fixture();
+  try {
+    const events = [
+      { id: 'human-or-forward', type: 'user.message', data: { content: 'Identical text', attachments: [] } },
+      { id: 'another', type: 'user.message', data: { content: 'Identical text', source: 'unverified' } },
+    ];
+    f.runtime.ingestion.apply('s1', 1, events, 'cursor');
+    assert.deepEqual(f.db.list('native').items, []);
+    assert.equal(f.db.list('messages').items.length, 0);
+    assert.equal(f.db.list('work').items.length, 0);
+  } finally { f.close(); }
+});
+
+test('primary commentary is visible but lifecycle events are not replies; unobserved history is rejected', () => {
   const f = fixture();
   try {
     f.runtime.ingestion.apply('s1', 1, [
@@ -92,13 +133,15 @@ test('tool commentary and idle never become final replies; unenrolled input is r
       { id: 'end', type: 'assistant.turn_end', parentId: 'm', data: {} },
       { id: 'idle', type: 'session.idle', data: {} },
     ], 'c');
-    assert.equal(f.db.list('messages').items.length, 0);
+    assert.deepEqual(f.db.list('messages').items.map(message => message.raw), ['Working']);
     assert.throws(() => f.runtime.ingestion.apply('private', 1, [], 'c'), /not found/);
   } finally { f.close(); }
 });
-test('expired cursors expose gaps without taking a new tail', async () => {
+
+test('expired cursors expose gaps without silently taking a new tail', async () => {
   const f = fixture();
   try {
+    track(f);
     f.pages.push({ events: [], cursor: null, cursorStatus: 'expired', hasMore: false });
     await f.runtime.consume('s1');
     assert.match(f.db.must('receptions', 's1').gap!, /expired/);
@@ -106,18 +149,8 @@ test('expired cursors expose gaps without taking a new tail', async () => {
     assert.equal(f.calls.filter(c => c.name === 'chat').length, 1);
   } finally { f.close(); }
 });
-test('unknown create blocks a new attempt and replay does not create another session', async () => {
-  const f = fixture();
-  try {
-    f.fail(new Error('Creation acknowledgment lost'));
-    await assert.rejects(f.runtime.create({ requestId: 'create1', cwd: '/synthetic' }));
-    await f.runtime.create({ requestId: 'create1', cwd: '/synthetic' });
-    await assert.rejects(f.runtime.create({ requestId: 'create2', cwd: '/synthetic' }), /Resolve uncertain/);
-    assert.equal(f.calls.filter(c => c.name === 'session/new').length, 1);
-  } finally { f.close(); }
-});
 
-test('partial role creation retains native identity and notification recovery without claiming success', async () => {
+test('partial role creation retains native identity and never repeats its original intent', async () => {
   const f = fixture();
   try {
     const roleAssignment = { notificationId: 'notification-1', saved: true,
@@ -135,99 +168,45 @@ test('partial role creation retains native identity and notification recovery wi
   } finally { f.close(); }
 });
 
-test('bootstrap retains historical turn linkage for a newly completed reply', async () => {
+test('bootstrap retains receipt identity for a newly arriving related reply', async () => {
   const f = fixture();
   try {
+    track(f);
     f.db.put('receptions', { ...f.db.must('receptions', 's1'), baseline: false, cursor: null });
     f.pages.push(
-      { events: [{ id: 'start', type: 'assistant.turn_start', data: {} }],
-        cursor: 'back', liveCursor: 'live-tail', cursorStatus: 'ok', hasMore: true },
-      { events: [
-        { id: 'm', type: 'assistant.message', parentId: 'start',
-          data: { messageId: 'native', content: 'Completed after enrollment', toolRequests: [] } },
-        { id: 'end', type: 'assistant.turn_end', parentId: 'm', data: {} },
-      ], cursor: 'next', cursorStatus: 'ok', hasMore: false },
+      { events: [reply[0]!], cursor: 'back', liveCursor: 'live-tail', cursorStatus: 'ok', hasMore: true },
+      { events: reply.slice(1), cursor: 'next', cursorStatus: 'ok', hasMore: false },
     );
     await f.runtime.consume('s1');
-    assert.equal(f.db.list('messages').items[0]?.historical, false);
-    assert.equal(f.db.list('messages').items[0]?.raw, 'Completed after enrollment');
+    assert.equal(replies(f)[0]?.historical, false);
+    assert.equal(replies(f)[0]?.raw, 'Complete');
   } finally { f.close(); }
 });
 
-test('expired computational lease receives a new wake, not a replay of the accepted wake', async () => {
+test('bounded explicit history recovery preserves historical status and cursor evidence', async () => {
   const f = fixture();
   try {
-    const input = f.service.accept({ requestId: 'one', text: 'Work' });
-    await f.runtime.wake();
-    const wake = f.db.find('deliveries', d => d.kind === 'wake')[0]!;
-    f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id, wake.id);
-    f.advance(300_001);
-    await f.runtime.wake();
-    const wakes = f.db.find('deliveries', d => d.kind === 'wake');
-    assert.equal(wakes.length, 2);
-    assert.ok(wakes.every(w => w.state === 'accepted'));
-    await f.runtime.wake();
-    assert.equal(f.db.find('deliveries', d => d.kind === 'wake').length, 2);
-  } finally { f.close(); }
-});
-
-test('role replacement fences old leases while preserving accepted reception deliveries', async () => {
-  const f = fixture();
-  try {
-    const delivery = route(f);
-    await f.runtime.wake();
-    const next = f.service.accept({ requestId: 'two', text: 'More work' });
-    const oldWork = f.service.claim(f.identities.coordinator, 'coordinator', 1, next.work.id)!;
-    f.metas.set('replacement', { ...f.metas.get('coordinator')!, sessionId: 'replacement',
-      appliedRoles: [{ moduleId: 'assistant', moduleName: 'Assistant', name: 'Coordinator', roleId: 'coordinator' }] });
-    await f.runtime.bind({ requestId: 'replace', role: 'coordinator', sessionId: 'replacement',
-      expectedEpoch: 1, expectedModelId: 'synthetic', definitionVersion: '1' });
-    assert.equal(f.db.must('bindings', 'coordinator').epoch, 2);
-    assert.equal(f.db.must('work', oldWork.id).state, 'pending');
-    assert.throws(() => f.service.claim(f.identities.coordinator, 'coordinator', 1), /current role epoch/);
-    const current = f.service.claim({ sessionId: 'replacement', runtimeSessionId: 'replacement', subagent: false },
-      'coordinator', 2, next.work.id)!;
-    assert.equal(current.epoch, 2);
-    assert.equal(f.db.must('deliveries', delivery.id).state, 'accepted');
-    await f.runtime.wake();
-    assert.equal(f.calls.filter(c => c.name === 'prompt' && JSON.stringify(c.body).includes('"sessionId":"s1"')).length, 1);
-  } finally { f.close(); }
-});
-
-test('bounded explicit history recovery classifies historical data without new reply publication', async () => {
-  const f = fixture();
-  try {
+    const delivery = track(f);
     f.db.put('receptions', { ...f.db.must('receptions', 's1'), gap: 'expired' });
-    f.pages.push({ events: [
-      { id: 'start', type: 'assistant.turn_start', data: {} },
-      { id: 'm', type: 'assistant.message', parentId: 'start', data: { content: 'Old answer', toolRequests: [] } },
-      { id: 'end', type: 'assistant.turn_end', parentId: 'm', data: {} },
-    ], cursor: 'older', liveCursor: 'current-tail', cursorStatus: 'ok', hasMore: true });
+    f.pages.push({ events: reply, cursor: 'older', liveCursor: 'current-tail', cursorStatus: 'ok', hasMore: true });
     await f.runtime.recoverHistory('s1', 'recover', 1, 'Operator acknowledged bounded gap');
     assert.equal(f.db.must('receptions', 's1').cursor, 'current-tail');
-    const message = f.db.list('messages').items[0]!;
-    assert.equal(message.historical, true);
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1)!;
-    assert.throws(() => f.service.decide(f.identities.coordinator, { ...proof(work),
-      topic: { title: 'Old', independent: true }, reason: 'Imported history',
-      action: { kind: 'publish' } }), /newly received/);
+    assert.equal(replies(f)[0]!.historical, true);
+    assert.equal(f.db.find('publications', p => p.type === 'message' && p.messageId !== delivery.messageId).length, 0);
   } finally { f.close(); }
 });
 
-test('partial recovery preserves a progress receipt and never replays the same operation', async () => {
+test('partial recovery preserves progress and never repeats the same operation', async () => {
   const f = fixture();
   try {
+    track(f);
     let reads = 0;
     f.native.read = async () => {
       if (++reads > 1) throw new Error('Second page failed');
-      return { events: [
-        { id: 'start', type: 'assistant.turn_start', data: {} },
-        { id: 'm', type: 'assistant.message', parentId: 'start', data: { content: 'Old', toolRequests: [] } },
-        { id: 'end', type: 'assistant.turn_end', parentId: 'm', data: {} },
-      ], cursor: 'older', liveCursor: 'tail', cursorStatus: 'ok', hasMore: true };
+      return { events: reply, cursor: 'older', liveCursor: 'tail', cursorStatus: 'ok', hasMore: true };
     };
     await assert.rejects(f.runtime.recoverHistory('s1', 'partial', 2, 'Explicit bounded import'), /Second page/);
-    assert.equal(f.db.list('messages').items.length, 1);
+    assert.equal(replies(f).length, 1);
     assert.equal(f.db.must('operations', 'history-recovery:partial').state, 'unknown');
     assert.match(JSON.stringify(f.db.must('operations', 'history-recovery:partial').result), /"pages":1/);
     await f.runtime.recoverHistory('s1', 'partial', 2, 'Explicit bounded import');

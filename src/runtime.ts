@@ -1,12 +1,13 @@
 import type { McpInvocationMeta, ModuleHostApi, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fingerprint } from './database.ts';
 import { BusinessError, errorText, requireFact } from './errors.ts';
-import { Ingestion } from './ingestion.ts';
-import { AssistantService, askAnswer, questionKey, wakeOccupies, wakeText } from './service.ts';
-import type { Binding, Delivery, Operation, Reception, Role } from './types.ts';
+import { Ingestion, primary } from './ingestion.ts';
+import { AssistantService, askAnswer, questionKey } from './service.ts';
+import type { Batch, Binding, Delivery, Operation, Reception, Role } from './types.ts';
 import { activateRolesSchema, bindingSchema, createSessionSchema, enrollSchema, inputSchema } from './schema.ts';
 import type { Readiness, RoleReadiness, SessionInspection } from './ui-types.ts';
-import { recoverTopicObservations, topicObservationDeadlines } from './topic-session.ts';
+import { ensureTopicSession } from './topic-session.ts';
 
 export interface HistoryPage {
   events: NativeChatEvent[];
@@ -17,13 +18,23 @@ export interface HistoryPage {
 }
 export interface NativeAccess {
   host: ModuleHostApi;
-  read(sessionId: string, cursor: string | null, bootstrap: boolean, backward?: boolean): Promise<HistoryPage>;
+  read(sessionId: string, cursor: string | null, bootstrap: boolean, backward?: boolean, all?: boolean): Promise<HistoryPage>;
   answer(sessionId: string, requestId: string, answer: string, wasFreeform: boolean): Promise<{ accepted: boolean; result: unknown }>;
 }
 const tools: Record<Role, string[]> = {
-  coordinator: ['assistant_read', 'assistant_claim', 'assistant_decide', 'assistant_create_session'],
-  memory: ['assistant_read', 'assistant_claim', 'assistant_remember'],
+  coordinator: ['assistant_topics', 'assistant_topic', 'assistant_map', 'assistant_sessions',
+    'assistant_history', 'assistant_dispatch', 'assistant_attribute', 'assistant_clarify'],
+  memory: ['assistant_memory_read', 'assistant_memory_claim', 'assistant_remember'],
 };
+
+interface ConsumerRead {
+  cursor: string;
+}
+class SessionMetadataPending extends BusinessError {
+  constructor(readonly sessionId: string) {
+    super('SESSION_TRANSITION', 'Native session metadata is pending during a lifecycle transition');
+  }
+}
 
 export class Runtime {
   readonly ingestion: Ingestion;
@@ -32,7 +43,9 @@ export class Runtime {
   private again = false;
   private stopped = false;
   private leaseTimer: ReturnType<typeof setTimeout> | null = null;
-  private liveEnds = new Map<string, Set<string>>();
+  private liveEvents = new Map<string, Set<string>>();
+  private consumerReads = new Map<string, Promise<void>>();
+  private receiptWaiters = new Map<string, Set<() => void>>();
   constructor(readonly service: AssistantService, readonly native: NativeAccess,
     readonly report: (error: unknown) => void, readonly notify: () => void) {
     this.ingestion = new Ingestion(service);
@@ -66,6 +79,8 @@ export class Runtime {
     this.stopped = true;
     if (this.leaseTimer) clearTimeout(this.leaseTimer);
     this.leaseTimer = null;
+    for (const waiters of this.receiptWaiters.values()) for (const done of waiters) done();
+    this.receiptWaiters.clear();
   }
   async settled(): Promise<void> { await this.running; }
   wake(sessionId?: string): Promise<void> {
@@ -93,9 +108,8 @@ export class Runtime {
           await this.consume(id);
         } catch (error) { this.problem(`reception:${id}`, error); }
       }
-      await recoverTopicObservations(this.service, this);
       if (this.stopped) return;
-      this.queueWorkers();
+      await this.queueWorkers();
       for (const delivery of this.service.db.find('deliveries', d => d.state === 'pending')) {
         if (this.stopped) return;
         await this.send(delivery.id);
@@ -108,14 +122,12 @@ export class Runtime {
     if (this.leaseTimer) clearTimeout(this.leaseTimer);
     this.leaseTimer = null;
     if (this.stopped) return;
-    const deadlines = this.service.db.find('work', w => w.state === 'leased'
+    const deadlines = this.service.db.find('work', w => w.role === 'memory' && w.state === 'leased'
       && w.leaseUntil > this.service.now()).map(w => w.leaseUntil);
     deadlines.push(...this.service.db.find('deliveries', d => d.state === 'pending'
       && (d.preparation?.nextAttemptAt ?? 0) > 0).map(d => d.preparation!.nextAttemptAt));
-    deadlines.push(...this.service.db.find('deliveries', d => d.kind === 'wake'
-      && d.wake?.claimedAt !== null && d.wake?.drainedAt === null
-      && d.wake.leaseUntil > this.service.now()).map(d => d.wake!.leaseUntil));
-    deadlines.push(...topicObservationDeadlines(this.service));
+    deadlines.push(...this.service.db.find('work', work => work.state === 'pending'
+      && (work.retryAfter ?? 0) > 0).map(work => work.retryAfter!));
     if (!deadlines.length) return;
     this.leaseTimer = setTimeout(() => {
       this.leaseTimer = null;
@@ -124,6 +136,8 @@ export class Runtime {
     this.leaseTimer.unref();
   }
   private problem(key: string, error: unknown): void {
+    if (error instanceof SessionMetadataPending
+      || this.stopped && error instanceof BusinessError && error.code === 'STOPPING') return;
     this.service.db.transaction(() => {
       this.service.db.setMeta(`error:${key}`, errorText(error));
       this.service.publish({ type: 'status', text: `${key}: ${errorText(error)}` });
@@ -131,7 +145,37 @@ export class Runtime {
     this.report(error);
   }
   private async meta(sessionId: string): Promise<PublicSessionMeta | null> {
-    return (await this.native.host.call('session/get', { sessionId })).meta;
+    const { db } = this.service;
+    const key = `metadata:${sessionId}`;
+    for (let attempt = 0; ; attempt++) {
+      requireFact(!this.stopped, 'STOPPING', 'Assistant stopped during metadata observation');
+      let meta: PublicSessionMeta | null;
+      try {
+        meta = (await this.native.host.call('session/get', { sessionId })).meta;
+      } catch (error) {
+        if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'SESSION_TRANSITION') throw error;
+        const pending = new SessionMetadataPending(sessionId);
+        db.transaction(() => {
+          if (!db.meta(key, null))
+            this.service.publish({ type: 'status', text: `${sessionId}: ${pending.message}` });
+          db.setMeta(key, { state: 'pending', attempts: attempt + 1, exhausted: attempt === 2 });
+          for (const binding of db.find('bindings', item => item.sessionId === sessionId)) {
+            binding.ready = false;
+            binding.evidence = { pending: true, code: pending.code, detail: pending.message, checkedAt: this.service.now() };
+            db.put('bindings', binding);
+          }
+        });
+        if (attempt === 2) throw pending;
+        await delay(attempt === 0 ? 50 : 150);
+        continue;
+      }
+      requireFact(!meta || meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
+      if (db.meta(key, null)) db.transaction(() => {
+        db.setMeta(key, null);
+        this.service.publish({ type: 'status', text: `${sessionId}: Native session metadata observation recovered.` });
+      });
+      return meta;
+    }
   }
   private internal(meta: PublicSessionMeta): boolean {
     return [...(meta.roles ?? []), ...(meta.appliedRoles ?? [])].some(item =>
@@ -139,10 +183,11 @@ export class Runtime {
       || this.service.db.find('bindings', binding => binding.sessionId === meta.sessionId).length > 0;
   }
   noteEvent(sessionId: string, event: NativeChatEvent): void {
-    if (event.type !== 'assistant.turn_end' || this.service.db.get('receptions', sessionId)?.baseline) return;
-    const ends = this.liveEnds.get(sessionId) ?? new Set<string>();
-    ends.add(event.id);
-    this.liveEnds.set(sessionId, ends);
+    if (event.type !== 'assistant.message' || event.ephemeral || !primary(event)
+      || this.service.db.get('receptions', sessionId)?.baseline) return;
+    const events = this.liveEvents.get(sessionId) ?? new Set<string>();
+    events.add(event.id);
+    this.liveEvents.set(sessionId, events);
   }
   private async stillOrdinary(sessionId: string): Promise<boolean> {
     const meta = await this.meta(sessionId);
@@ -175,7 +220,8 @@ export class Runtime {
             delivery.state = 'cancelled';
             delivery.error = excluded ? 'Target is an internal role carrier' : 'Target no longer exists';
             db.put('deliveries', delivery);
-            this.recoverDeliveryWork(delivery, null);
+            this.service.publish({ type: 'status', messageId: delivery.messageId,
+              topicId: delivery.topicId ?? null, text: delivery.error });
           }
           if (excluded) for (const work of db.find('work', item => item.state !== 'done'
             && !!item.messageId && db.get('messages', item.messageId)?.sessionId === sessionId)) {
@@ -184,7 +230,7 @@ export class Runtime {
           }
           this.service.changed();
         }
-        this.liveEnds.delete(sessionId);
+        this.liveEvents.delete(sessionId);
         return;
       }
       if (!existing) {
@@ -331,7 +377,7 @@ export class Runtime {
         requireFact(!db.find('bindings', item => item.id !== role && item.sessionId === sessionId).length,
           'ROLE_CONFLICT', 'One session cannot carry both internal roles');
         const binding: Binding = { id: role, sessionId, epoch: (before?.epoch ?? 0) + 1,
-          definitionVersion: '1', modelId: meta.currentModelId ?? null, cwd: meta.cwd,
+          definitionVersion: '2', modelId: meta.currentModelId ?? null, cwd: meta.cwd,
           ready: false, evidence: { registeredBy: requestId, saved: true, readiness: 'unchecked' } };
         db.put('bindings', binding);
         this.retireRoleWork(role, before);
@@ -339,11 +385,21 @@ export class Runtime {
       db.put('operations', { id: key, fingerprint: fingerprint(input), state: 'accepted', result: input });
       this.service.changed();
     });
+    for (const role of requested) this.retireBatch(previous.get(role));
     await this.observe(sessionId);
+  }
+  private retireBatch(previous: Binding | undefined): void {
+    if (!previous) return;
+    const current = this.service.db.get('bindings', previous.id);
+    if (current?.sessionId === previous.sessionId && current.epoch === previous.epoch) return;
+    const batch = this.service.activeBatch(previous.id);
+    if (batch?.sessionId === previous.sessionId && batch.epoch === previous.epoch)
+      this.service.finishBatch(batch.id, 'unknown');
   }
   private retireRoleWork(role: Role, previous: Binding | undefined): void {
     const { db } = this.service;
-    for (const work of db.find('work', item => item.role === role && item.state === 'leased')) {
+    for (const work of db.find('work', item => item.role === role && item.state === 'leased'
+      && (role === 'memory' || !this.service.activeBatch()?.workIds.includes(item.id)))) {
       work.state = 'pending'; work.epoch = null; work.token = null; work.leaseUntil = 0;
       db.put('work', work);
     }
@@ -469,14 +525,14 @@ export class Runtime {
       requireFact(typeof page.liveCursor === 'string', 'NO_LIVE_CURSOR', 'Native bootstrap returned no continuation cursor');
       db.transaction(() => {
         this.ingestion.applyWithinTransaction(sessionId, reception.generation, page.events, page.liveCursor!,
-          true, false, this.liveEnds.get(sessionId));
+          true, false, this.liveEvents.get(sessionId));
         const current = db.must('receptions', sessionId);
         requireFact(current.generation === reception.generation, 'STALE_READER', 'Enrollment changed during bootstrap');
         current.baseline = true;
         current.cursor = page.liveCursor!;
         db.put('receptions', current);
       });
-      this.liveEnds.delete(sessionId);
+      this.liveEvents.delete(sessionId);
     }
     for (let count = 0; count < 16; count++) {
       const current = db.must('receptions', sessionId);
@@ -492,6 +548,8 @@ export class Runtime {
         return;
       }
       requireFact(typeof page.cursor === 'string', 'NO_CURSOR', 'Native read did not return a usable cursor');
+      requireFact(!page.hasMore || page.cursor !== current.cursor, 'CURSOR_STALLED',
+        'Native history cursor did not advance');
       this.ingestion.apply(sessionId, reception.generation, page.events, page.cursor);
       if (!page.hasMore) return;
     }
@@ -517,7 +575,10 @@ export class Runtime {
     db.transaction(() => db.put('operations', { id: key, fingerprint: fingerprint(input),
       state: 'calling', result: { sessionId, pages, evidence } }));
     try {
-      requireFact((await this.meta(sessionId))?.loaded, 'SESSION_UNAVAILABLE', 'Load the original native session before recovery');
+      const meta = await this.meta(sessionId);
+      requireFact(meta?.loaded, 'SESSION_UNAVAILABLE', 'Load the original native session before recovery');
+      requireFact(meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned a different session');
+      requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Internal carrier history cannot be recovered as business input');
       while (pages < maxPages && hasMore) {
         const page = await this.native.read(sessionId, cursor, pages === 0, true);
         requireFact(!this.stopped, 'STOPPING', 'Runtime stopped during recovery');
@@ -538,7 +599,7 @@ export class Runtime {
             result: { sessionId, pages, backwardCursor: cursor, liveCursor, evidence } });
         });
       }
-      return db.transaction(() => {
+      db.transaction(() => {
         const current = db.must('receptions', sessionId);
         requireFact(current.generation === reception.generation, 'STALE_READER', 'Enrollment changed during recovery');
         current.cursor = liveCursor;
@@ -552,8 +613,9 @@ export class Runtime {
         this.service.publish({ type: 'status', text: result.warning });
         this.service.changed();
         db.put('operations', { id: key, fingerprint: fingerprint(input), state: 'accepted', result });
-        return result;
       });
+      this.sessions.add(sessionId);
+      return db.must('operations', key);
     } catch (error) {
       db.transaction(() => {
         const operation = db.must('operations', key);
@@ -581,6 +643,8 @@ export class Runtime {
       requireFact(meta.rolesNeedReload !== true, 'ROLE_NOT_READY', 'Native role assembly requires reload');
     };
     try {
+      requireFact(binding.definitionVersion === '2', 'ROLE_CONFIGURATION',
+        'The role carrier must use the current Assistant definition');
       const meta = await this.meta(binding.sessionId);
       checkMeta(meta);
       const readiness = await this.native.host.call('roles/readiness', { sessionId: binding.sessionId,
@@ -604,23 +668,68 @@ export class Runtime {
         const current = this.service.db.get('bindings', binding.id);
         if (current && matches(current)) {
           current.ready = false;
-          current.evidence = { error: errorText(error), checkedAt: this.service.now() };
+          current.evidence = { ...(error instanceof SessionMetadataPending ? { pending: true, code: error.code } : {}),
+            error: errorText(error), checkedAt: this.service.now() };
           this.service.db.put('bindings', current);
         }
       });
       throw error;
     }
   }
-  async authorize(identity: McpInvocationMeta, role: Role, epoch: number): Promise<void> {
+  async authorize(identity: McpInvocationMeta, role: Role, epoch?: number): Promise<Binding> {
+    requireFact(!this.stopped, 'STOPPING', 'Assistant is stopping', 503);
     const binding = this.service.authorize(identity, role, epoch);
-    try { await this.verifyBinding(binding); }
-    catch (error) {
-      this.service.db.transaction(() => {
-        const current = this.service.db.must('bindings', role);
-        if (current.epoch === epoch) { current.ready = false; this.service.db.put('bindings', current); }
+    requireFact('toolCallId' in identity && typeof identity.toolCallId === 'string' && identity.toolCallId.length,
+      'TOOL_ID_REQUIRED', 'Native MCP tool-call identity is required', 403);
+    const toolCallId = identity.toolCallId;
+    const batch = this.service.activeBatch(role);
+    requireFact(batch && batch.sessionId === binding.sessionId && batch.epoch === binding.epoch,
+      'NO_ACTIVE_BATCH', 'No current batch is assigned to this native role', 403);
+    const id = `batch:${batch.id}`;
+    let delivery = this.service.db.get('deliveries', id);
+    if (delivery?.state === 'calling') {
+      // A native hook may arrive before send() returns its receipt. Never infer its
+      // batch from whichever wake happens to be calling; wait for the actual receipt.
+      await new Promise<void>(resolve => {
+        const waiters = this.receiptWaiters.get(id) ?? new Set<() => void>();
+        const done = (): void => { clearTimeout(timer); waiters.delete(done); resolve(); };
+        const timer = setTimeout(done, 5000);
+        timer.unref();
+        waiters.add(done);
+        this.receiptWaiters.set(id, waiters);
       });
-      throw error;
+      delivery = this.service.db.get('deliveries', id);
     }
+    requireFact(delivery?.state === 'accepted' && delivery.nativeMessageId,
+      'RECEIPT_UNCONFIRMED', 'The native wake receipt is not confirmed; no decision was applied', 403);
+    let calls: NativeChatEvent[] = [];
+    let roots: NativeChatEvent[] = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await this.readConsumer(delivery);
+      calls = this.service.db.consumerEvidence(binding.sessionId, 'toolCallId', toolCallId);
+      roots = this.service.db.consumerEvidence(binding.sessionId, 'messageId', delivery.nativeMessageId);
+      if (calls.length && roots.length) break;
+      if (attempt < 2) await delay(attempt === 0 ? 10 : 25);
+    }
+    requireFact(calls.length === 1 && typeof calls[0]!.data.interactionId === 'string'
+      && Array.isArray(calls[0]!.data.toolRequests)
+      && calls[0]!.data.toolRequests.filter(request => request && typeof request === 'object'
+        && 'toolCallId' in request && request.toolCallId === toolCallId).length === 1,
+      'TOOL_PROVENANCE', 'Native tool identity has missing or ambiguous interaction evidence', 403);
+    const interactionId = calls[0]!.data.interactionId;
+    requireFact(roots.length === 1 && roots[0]!.data.interactionId === interactionId
+      && this.service.db.consumerEvidence(binding.sessionId, 'interactionId', interactionId).length === 1,
+      'TOOL_PROVENANCE', 'Native tool does not belong to this batch receipt', 403);
+    const wakes = this.service.db.find('deliveries', item => item.kind === 'wake'
+      && item.sessionId === binding.sessionId && item.nativeMessageId === delivery.nativeMessageId);
+    requireFact(wakes.length === 1, 'RECEIPT_CONFLICT', 'Wake receipt is ambiguous', 403);
+    const verified = await this.verifyBinding(binding);
+    requireFact(!this.stopped, 'STOPPING', 'Assistant stopped during native authorization', 503);
+    requireFact(this.service.activeBatch(role)?.id === batch.id
+      && ['pending', 'running'].includes(this.service.db.must('batches', batch.id).state),
+    'STALE_CONSUMER', 'The native tool belongs to a retired batch', 403);
+    this.service.grantConsumer(identity, batch);
+    return verified;
   }
   async bind(input: unknown): Promise<unknown> {
     const value = bindingSchema.parse(input);
@@ -639,6 +748,7 @@ export class Runtime {
       db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'calling', result: null });
     });
     let result: unknown;
+    const previous = db.get('bindings', value.role);
     try {
       const meta = await this.meta(value.sessionId);
       requireFact(meta?.loaded && meta.currentModelId === value.expectedModelId,
@@ -658,7 +768,6 @@ export class Runtime {
         requireFact(!db.get('receptions', value.sessionId)?.enabled
           && !db.find('bindings', b => b.id !== value.role && b.sessionId === value.sessionId).length,
         'ROLE_CONFLICT', 'Candidate was enrolled or assigned another role during preparation');
-        const previous = db.get('bindings', value.role);
         const binding: Binding = { id: value.role, sessionId: value.sessionId, epoch: value.expectedEpoch + 1,
           definitionVersion: value.definitionVersion, modelId: value.expectedModelId, cwd: meta.cwd,
           ready: true, evidence: { preparation, readiness } };
@@ -673,6 +782,7 @@ export class Runtime {
         state: 'unknown', result: { error: errorText(error), warning: 'Preparation may have applied; inspect native state before a new operation.' } }));
       throw error;
     }
+    this.retireBatch(previous);
     return result;
   }
   async create(input: unknown): Promise<unknown> {
@@ -686,9 +796,6 @@ export class Runtime {
     }
     db.transaction(() => {
       requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before session creation');
-      requireFact(db.find('operations', op => op.id.startsWith('create:')
-        && (op.state === 'unknown' || op.state === 'calling')).length === 0,
-        'UNRESOLVED_CREATE', 'Resolve uncertain native creation before creating another session');
       db.put('operations', { id: key, fingerprint: fingerprint(value), state: 'calling', result: null });
     });
     try {
@@ -707,60 +814,133 @@ export class Runtime {
       throw error;
     }
   }
-  private queueWorkers(): void {
-    const db = this.service.db;
+  private idle(meta: PublicSessionMeta | null): boolean {
+    const activity = meta?.activity;
+    return !!meta?.loaded && !meta.closing && meta.status === 'idle'
+      && !meta.ask && !meta.decisions?.length && !!activity && !activity.processing
+      && !activity.hasActiveWork && activity.queue.pendingCount === 0
+      && activity.queue.steeringCount === 0 && activity.queue.inFlightSteeringCount === 0;
+  }
+  private async queueWorkers(): Promise<void> {
+    const { db } = this.service;
+    // Consume due wake-ups once, even when native readiness still prevents sending.
+    // A busy carrier then waits for its next event instead of spinning on an expired timer.
     db.transaction(() => {
-      for (const binding of db.find('bindings', b => b.ready)) {
-        const pending = db.find('work', w => w.role === binding.id && (w.state === 'pending'
-          || w.state === 'leased' && w.leaseUntil <= this.service.now()));
-        if (!pending.length) continue;
-        const occupied = db.find('deliveries', d => d.kind === 'wake' && d.sessionId === binding.sessionId
-          && d.roleEpoch === binding.epoch && wakeOccupies(d, this.service.now()));
-        if (occupied.length) continue;
-        // A definite wake rejection is not permission to fill the native queue on every event.
-        const failed = db.find('deliveries', d => d.kind === 'wake' && d.sessionId === binding.sessionId
-          && d.roleEpoch === binding.epoch && d.state === 'rejected' && !d.wake?.claimedAt
-          && !db.meta<string | null>(`wakeRetry:${d.id}`, null));
-        if (failed.length) continue;
-        const id = `wake:${binding.id}:${binding.epoch}:${db.next('wakeSequence')}`;
-        db.put('deliveries', { id, kind: 'wake', messageId: null, sessionId: binding.sessionId,
-          attachments: [],
-          requestId: null, text: wakeText(binding.id, binding.epoch, id),
-          supplement: null, answerFreeform: null, state: 'pending', result: null, error: null,
-          createdAt: this.service.now(), roleEpoch: binding.epoch,
-          wake: { claimedAt: null, leaseUntil: 0, drainedAt: null } });
+      for (const work of db.find('work', work => work.state === 'pending'
+        && (work.retryAfter ?? 0) > 0 && work.retryAfter! <= this.service.now())) {
+        work.retryAfter = 0;
+        db.put('work', work);
       }
     });
+    for (const binding of db.find('bindings', () => true)) {
+      try {
+        {
+          const active = this.service.activeBatch(binding.id);
+          if (active) {
+            try { await this.consumeBatch(active); }
+            catch (error) {
+              if (error instanceof BusinessError && ['EVENT_ID_CONFLICT', 'SESSION_MISMATCH', 'CONSUMER_CURSOR'].includes(error.code))
+                this.service.finishBatch(active.id, 'unknown');
+              throw error;
+            }
+          }
+          if (this.service.activeBatch(binding.id)) continue;
+        }
+        if (!binding.ready) continue;
+        const pending = db.find('work', w => w.role === binding.id && (w.retryAfter ?? 0) <= this.service.now() && (w.state === 'pending'
+          || binding.id === 'memory' && w.state === 'leased' && w.leaseUntil <= this.service.now()));
+        if (!pending.length || !this.idle(await this.meta(binding.sessionId))) continue;
+        await this.verifyBinding(binding);
+        if (this.stopped) return;
+        // Take a native boundary before the new consumer exists. Old busy/queued turns cannot
+        // receive tools for a new batch, and an idle status alone never completes an old batch.
+        const boundary = await this.native.read(binding.sessionId, null, true, false, true);
+        requireFact(typeof boundary.liveCursor === 'string', 'NO_LIVE_CURSOR',
+          'Consumer requires a native history boundary');
+        if (this.stopped || !this.idle(await this.meta(binding.sessionId))) continue;
+        requireFact('promptReceiptVersion' in this.native.host && this.native.host.promptReceiptVersion === 1,
+          'HOST_CAPABILITY', 'Internal consumers require native prompt receipts and MCP tool-call identity');
+        this.service.startBatch(binding, batch => {
+          const id = `batch:${batch.id}`;
+          db.setMeta(`consumer:${id}`, { cursor: boundary.liveCursor! } satisfies ConsumerRead);
+          db.put('deliveries', { id, kind: 'wake', messageId: null, sessionId: binding.sessionId,
+            batchId: batch.id, attachments: [],
+            requestId: null, text: binding.id === 'coordinator' ? this.service.batchText(batch)
+              : `Memory extraction work is available. Use assistant_memory_claim with role=memory, epoch=${binding.epoch}, `
+                + 'then assistant_memory_read and assistant_remember with the returned source-bound proof. '
+                + 'Drain pending extraction work. This is internal context, not new user authorization.',
+            supplement: null, answerFreeform: null, state: 'pending', result: null, error: null,
+            createdAt: this.service.now(), roleEpoch: binding.epoch });
+        });
+      } catch (error) { this.problem(`consumer:${binding.id}`, error); }
+    }
   }
-  private recoverDeliveryWork(delivery: Delivery, observed: PublicSessionMeta | null): void {
+  private async consumeBatch(batch: Batch): Promise<void> {
     const { db } = this.service;
-    if (delivery.kind === 'wake' || !delivery.messageId) return;
-    const message = db.must('messages', delivery.messageId);
-    const work = db.get('work', `message:${message.id}:${message.version}`);
-    const outcomes = db.find('deliveries', item => item.messageId === message.id);
-    const failed = outcomes.filter(item => ['rejected', 'cancelled'].includes(item.state));
-    const recoveryKey = `delivery-recovery:${work?.id}`;
-    if (!work || work.state !== 'done' || work.kind !== 'input' || !failed.length
-      || db.meta(recoveryKey, false)
-      || outcomes.some(item => ['pending', 'calling', 'unknown'].includes(item.state))
-      || outcomes.some(item => (item.inputVersion ?? 1) !== message.version
-        || item.text !== message.raw || fingerprint(item.attachments) !== fingerprint(message.attachments))) return;
-    const currentQuestions = observed?.decisions?.filter(item => item.kind === 'ask').map(item => item.request)
-      ?? (observed?.ask ? [observed.ask] : []);
-    work.state = 'pending';
-    work.token = null;
-    work.epoch = null;
-    work.leaseUntil = 0;
-    work.result = { recovery: { deliveryId: delivery.id, reason: failed[0]!.error,
-      failures: failed.map(item => ({ deliveryId: item.id, sessionId: item.sessionId, reason: item.error, result: item.result })),
-      acceptedSessionIds: outcomes.filter(item => item.state === 'accepted').map(item => item.sessionId),
-      questionObservation: observed?.loaded ? 'pre-dispatch' : 'unavailable', currentQuestions,
-      next: 'Preparation or dispatch definitively failed for the listed targets. Read the original input and current facts, then deliberately decide once with a fresh lease/requestId. Preserve accepted targets; never automatically answer a replacement question. Another failure remains visible without automatic routing loops.' } };
-    db.setMeta(recoveryKey, true);
-    db.put('work', work);
-    this.service.changed();
-    this.sessions.add(delivery.sessionId);
-    this.again = true;
+    const id = `batch:${batch.id}`;
+    const delivery = db.get('deliveries', id);
+    if (!delivery) {
+      if (!this.service.recoverOrphanBatch(batch.id)) this.service.finishBatch(batch.id, 'unknown');
+      return;
+    }
+    if (delivery.state === 'calling') return;
+    if (delivery.state === 'pending') return;
+    if (delivery.state === 'rejected' || delivery.state === 'cancelled') {
+      this.service.finishBatch(batch.id, 'rejected', this.service.now() + 1000);
+      return;
+    }
+    if (delivery.state === 'unknown') {
+      this.service.finishBatch(batch.id, 'unknown');
+      return;
+    }
+    if (batch.workIds.every(workId => ['done', 'invalidated', 'failed'].includes(db.must('work', workId).state))) {
+      this.service.finishBatch(batch.id, 'finished');
+      return;
+    }
+    await this.readConsumer(delivery);
+  }
+  private async readConsumer(delivery: Delivery): Promise<void> {
+    const prior = this.consumerReads.get(delivery.id);
+    if (prior) return prior;
+    const pending = this.readConsumerPages(delivery).finally(() => this.consumerReads.delete(delivery.id));
+    this.consumerReads.set(delivery.id, pending);
+    return pending;
+  }
+  private async readConsumerPages(delivery: Delivery): Promise<void> {
+    const { db } = this.service;
+    const key = `consumer:${delivery.id}`;
+    for (let count = 0; count < 16; count++) {
+      const read = db.meta<ConsumerRead | null>(key, null);
+      requireFact(read, 'CONSUMER_CURSOR', 'Native consumer history boundary is unavailable');
+      const page = await this.native.read(delivery.sessionId, read.cursor, false, false, true);
+      if (this.stopped) return;
+      requireFact(page.cursorStatus !== 'expired' && typeof page.cursor === 'string'
+        && (!page.hasMore || page.cursor !== read.cursor), 'CONSUMER_CURSOR', 'Native consumer cursor is unavailable');
+      db.transaction(() => {
+        for (const event of page.events) {
+          if (event.ephemeral || !primary(event) || !['user.message', 'assistant.message'].includes(event.type)) continue;
+          const string = (value: unknown): string | null => typeof value === 'string' && value.length ? value : null;
+          const fact: NativeChatEvent = { id: event.id, type: event.type, data: {
+            messageId: string(event.data.messageId), interactionId: string(event.data.interactionId),
+            ...(event.type === 'assistant.message' ? { toolRequests: Array.isArray(event.data.toolRequests)
+              ? event.data.toolRequests.flatMap(request => request && typeof request === 'object'
+                && 'toolCallId' in request && string(request.toolCallId)
+                ? [{ toolCallId: request.toolCallId }] : []) : [] } : {}),
+          } };
+          const id = fingerprint([delivery.sessionId, event.id]);
+          const old = db.get('native', id);
+          requireFact(!old || fingerprint(old.event) === fingerprint(fact),
+            'EVENT_ID_CONFLICT', 'Consumer event identity changed');
+          if (!old) db.put('native', { id, sessionId: delivery.sessionId, event: fact, historical: false });
+        }
+        db.setMeta(key, { cursor: page.cursor });
+      });
+      if (page.hasMore) {
+        if (count === 15) this.again = true;
+        continue;
+      }
+      return;
+    }
   }
   private async prepareDelivery(delivery: Delivery): Promise<PublicSessionMeta | null> {
     const { db } = this.service;
@@ -768,6 +948,21 @@ export class Runtime {
     delivery.preparation = { attempts: (delivery.preparation?.attempts ?? 0) + 1,
       nextAttemptAt: 0, error: null };
     db.put('deliveries', delivery);
+    if (delivery.kind !== 'wake') {
+      const sources = delivery.messageIds ?? (delivery.messageId ? [delivery.messageId] : []);
+      requireFact(!sources.some(id => {
+        const source = db.get('messages', id);
+        return source?.kind === 'user' && source.sessionId !== null;
+      }), 'NATIVE_INPUT_ALREADY_SENT',
+      'Ordinary Chat input was already sent to its session and cannot be dispatched again');
+    }
+    if (delivery.kind !== 'wake' && !delivery.sessionId) {
+      await ensureTopicSession(this.service, this, delivery.id);
+      Object.assign(delivery, db.must('deliveries', delivery.id));
+    }
+    if (delivery.kind !== 'wake' && !db.get('receptions', delivery.sessionId)) {
+      await this.observe(delivery.sessionId);
+    }
     let meta = await this.meta(delivery.sessionId);
     if (this.stopped) return null;
     requireFact(meta, 'SESSION_MISSING', 'The selected session no longer exists; it was not recreated');
@@ -825,7 +1020,6 @@ export class Runtime {
     const db = this.service.db;
     let delivery = db.must('deliveries', id);
     if (delivery.state !== 'pending') return;
-    let observed: PublicSessionMeta | null = null;
     const validateAnswer = (meta: PublicSessionMeta): void => {
       const asks = meta.decisions?.filter(d => d.kind === 'ask').map(d => d.request) ?? (meta.ask ? [meta.ask] : []);
       if (delivery.kind === 'wake') {
@@ -834,7 +1028,8 @@ export class Runtime {
       } else if (delivery.kind === 'ask') {
         const ask = asks.find(q => q.requestId === delivery.requestId);
         const stored = db.must('questions', questionKey(delivery.sessionId, delivery.requestId!));
-        requireFact(ask && ['pending', 'unknown'].includes(stored.state) && fingerprint(ask) === fingerprint(stored.request),
+        requireFact(asks.filter(q => q.requestId === delivery.requestId).length === 1
+          && ask && stored.state === 'pending' && fingerprint(ask) === fingerprint(stored.request),
           'STALE_ASK', 'The exact original native question is no longer pending');
         requireFact(askAnswer(ask, delivery.text, delivery.attachments) === delivery.answerFreeform,
           'ANSWER_CHANGED', 'Frozen answer mode does not match the original native question');
@@ -847,11 +1042,11 @@ export class Runtime {
     try {
       const meta = await this.prepareDelivery(delivery);
       if (!meta) return;
-      observed = meta;
       if (delivery.kind === 'wake') {
         const binding = db.find('bindings', b => b.sessionId === delivery.sessionId && b.epoch === delivery.roleEpoch)[0];
         requireFact(binding, 'STALE_ROLE', 'Wake belongs to a retired role epoch');
         await this.verifyBinding(binding);
+        if (!this.idle(await this.meta(delivery.sessionId))) return;
       } else {
         requireFact(!this.internal(meta), 'INTERNAL_TARGET', 'Target now has an internal role identity');
         this.service.reception(delivery.sessionId);
@@ -882,7 +1077,7 @@ export class Runtime {
           'STALE_ROLE', 'ROLE_CONFIGURATION', 'STALE_ASK', 'PENDING_ASK',
           'ANSWER_CHANGED', 'FREEFORM_FORBIDDEN', 'INTERNAL_ATTACHMENTS',
           'ASK_ATTACHMENTS_UNSUPPORTED', 'AMBIGUOUS_CHOICE',
-          'ATTACHMENTS_NOT_SUPPORTED', 'PREPARATION_EXHAUSTED'];
+          'ATTACHMENTS_NOT_SUPPORTED', 'PREPARATION_EXHAUSTED', 'TOPIC_CREATE_UNKNOWN', 'NATIVE_INPUT_ALREADY_SENT'];
         // Only preparation is retried. A calling/unknown message is never returned here.
         if (!permanent.includes(String(code))
           && delivery.preparation && delivery.preparation.attempts < 3) {
@@ -891,18 +1086,19 @@ export class Runtime {
           db.put('deliveries', delivery);
           return;
         }
-        delivery.state = 'rejected'; delivery.error = errorText(error);
+        delivery.state = code === 'TOPIC_CREATE_UNKNOWN' ? 'unknown' : 'rejected';
+        delivery.error = errorText(error);
         db.put('deliveries', delivery);
         if (delivery.kind === 'ask' && error instanceof BusinessError && error.code === 'STALE_ASK') {
           const question = db.must('questions', questionKey(delivery.sessionId, delivery.requestId!));
-          if (question.state === 'pending') {
-            question.state = 'stale';
-            db.put('questions', question);
-          }
+          if (question.state === 'pending') this.service.questionState(question, 'stale');
         }
-        this.recoverDeliveryWork(delivery, observed);
-        this.service.publish({ type: 'status', messageId: delivery.messageId, text: delivery.error });
+        this.service.publish({ type: 'status', messageId: delivery.messageId,
+          topicId: delivery.topicId ?? null, text: delivery.error });
       });
+      const failed = db.must('deliveries', id);
+      if (failed.batchId && ['rejected', 'unknown'].includes(failed.state))
+        this.service.finishBatch(failed.batchId, failed.state === 'rejected' ? 'rejected' : 'unknown', this.service.now() + 1000);
       return;
     }
     let state: Delivery['state'];
@@ -917,27 +1113,52 @@ export class Runtime {
         result = await this.native.host.call('prompt', { sessionId: delivery.sessionId, mode: 'enqueue',
           text: delivery.supplement ? `${delivery.text}\n\n---\n${delivery.supplement}` : delivery.text,
           ...(delivery.attachments.length ? { attachments: delivery.attachments } : {}) });
-        state = typeof result === 'object' && result !== null && 'ok' in result && result.ok === true ? 'accepted' : 'rejected';
+        state = typeof result === 'object' && result !== null && 'ok' in result
+          ? result.ok === true ? 'accepted' : result.ok === false ? 'rejected' : 'unknown' : 'unknown';
       }
     } catch (failure) {
       state = 'unknown'; result = null; error = errorText(failure);
     }
     db.transaction(() => {
-      // A native tool call may have claimed/drained this wake before prompt returned.
+      // Re-read after the asynchronous native call; other durable observations may have advanced.
       delivery = db.must('deliveries', id);
       delivery.state = state; delivery.result = result; delivery.error = error;
+      if (delivery.kind !== 'ask' && state === 'accepted') {
+        const receipt = result !== null && typeof result === 'object' && 'messageId' in result
+          && typeof result.messageId === 'string' && result.messageId.length > 0 ? result.messageId : null;
+        if (receipt) {
+          delivery.nativeMessageId = receipt;
+          delivery.interactionState = 'pending';
+        } else if (delivery.kind === 'wake') {
+          state = 'unknown';
+          delivery.state = state;
+          delivery.error = 'Native acceptance omitted its message receipt; the effect was not repeated.';
+        }
+      }
       db.put('deliveries', delivery);
       if (delivery.kind === 'ask') {
         const question = db.must('questions', questionKey(delivery.sessionId, delivery.requestId!));
-        if (state === 'accepted') question.state = 'answered';
-        if (state === 'unknown') question.state = 'unknown';
-        db.put('questions', question);
+        if (state === 'accepted') this.service.questionState(question, 'answered');
+        if (state === 'unknown') this.service.questionState(question, 'unknown');
       }
       if (state === 'rejected') delivery.error = `Native ${delivery.kind} explicitly rejected the original input`;
       db.put('deliveries', delivery);
-      this.recoverDeliveryWork(delivery, observed);
-      this.service.publish({ type: 'status', messageId: delivery.messageId,
-        text: `Native ${delivery.kind} ${state}${error ? `: ${error}` : ''}. Acceptance is not proof the model read it.` });
+      if (delivery.kind === 'wake' && state === 'accepted' && delivery.batchId) {
+        const batch = db.must('batches', delivery.batchId);
+        if (batch.state === 'pending') { batch.state = 'running'; db.put('batches', batch); }
+      }
+      if (state !== 'accepted') this.service.publish({ type: 'status', messageId: delivery.messageId,
+        topicId: delivery.topicId ?? null,
+        text: state === 'unknown' ? 'Delivery could not be confirmed and was not repeated.'
+          : 'Delivery was not accepted. Please clarify or try a new request.' });
     });
+    for (const done of this.receiptWaiters.get(id) ?? []) done();
+    this.receiptWaiters.delete(id);
+    if (delivery.batchId && state !== 'accepted')
+      this.service.finishBatch(delivery.batchId, state === 'rejected' ? 'rejected' : 'unknown', this.service.now() + 1000);
+    if (delivery.kind === 'ask' || state === 'accepted' && delivery.kind === 'prompt') {
+      this.sessions.add(delivery.sessionId);
+      this.again = true;
+    }
   }
 }

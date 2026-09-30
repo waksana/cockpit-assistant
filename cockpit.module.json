@@ -18,7 +18,7 @@
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_read", "assistant_claim", "assistant_decide", "assistant_create_session"]
+          "tools": ["assistant_topics", "assistant_topic", "assistant_map", "assistant_sessions", "assistant_history", "assistant_dispatch", "assistant_attribute", "assistant_clarify"]
         }
       }
     },
@@ -30,7 +30,7 @@
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_read", "assistant_claim", "assistant_remember"]
+          "tools": ["assistant_memory_read", "assistant_memory_claim", "assistant_remember"]
         }
       }
     }

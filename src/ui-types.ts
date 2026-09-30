@@ -3,6 +3,8 @@ import type { NativeAttachment, ReceiptInput } from './attachments.ts';
 
 export interface TimelineItem extends Publication {
   topicTitle: string | null;
+  topicColor: string | null;
+  topicAssignmentVersion?: number;
   speaker: 'user' | 'assistant' | 'system';
   sessionId: string | null;
   revision?: {

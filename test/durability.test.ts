@@ -34,7 +34,7 @@ test('killed writer preserves acknowledged input and turns in-flight effects int
       service.recover();
       assert.equal(db.list('messages').items[0]?.raw, 'Persist before acknowledgment');
       assert.equal(db.must('deliveries', 'effect').state, 'unknown');
-      assert.match(db.must('deliveries', 'effect').error!, /Do not resend/);
+      assert.match(db.must('deliveries', 'effect').error!, /not repeated/);
       assert.equal(service.accept({ requestId: 'durable', text: 'Persist before acknowledgment' }).message.id,
         db.list('messages').items[0]?.id);
     } finally { db.close(); }

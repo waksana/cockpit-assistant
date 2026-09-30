@@ -36,16 +36,11 @@ const inputFields = {
   requestId: z.string().min(1).max(200),
   text: z.string().max(100_000),
   attachments: attachmentsSchema.default([]),
-  topicId: z.string().min(1).max(200).optional(),
 };
 export const inputSchema = z.strictObject(inputFields).refine(value => value.text.length > 0 || value.attachments.length > 0,
   'Text or at least one native attachment is required');
 export type NativeInput = z.infer<typeof inputSchema>;
-/** Read-only compatibility for immutable receipts accepted before natural routing. */
-export const receiptInputSchema = z.strictObject({
-  ...inputFields, replyTo: z.string().min(1).max(200).optional(),
-}).refine(value => value.text.length > 0 || value.attachments.length > 0,
-  'Text or at least one native attachment is required');
+export const receiptInputSchema = inputSchema;
 export type ReceiptInput = z.infer<typeof receiptInputSchema>;
 
 /** Only absent legacy fields normalize; malformed present data must fail visibly. */

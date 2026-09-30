@@ -1,32 +1,45 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fixture, proof } from './fixtures.ts';
+import type { AskRequest } from '@waksana/cockpit-module-sdk/backend';
+import { fixture, topic } from './fixtures.ts';
 import { questionKey } from '../src/service.ts';
-import { inputSchema, receiptInputSchema } from '../src/attachments.ts';
+import { inputSchema } from '../src/attachments.ts';
 import { inputReceipt } from '../src/ui.ts';
-import { fingerprint } from '../src/database.ts';
 
-function question(f: ReturnType<typeof fixture>, sessionId = 's1', requestId = 'q') {
+function batch(f: ReturnType<typeof fixture>) {
+  return f.service.startBatch(f.db.must('bindings', 'coordinator'))!;
+}
+
+function question(f: ReturnType<typeof fixture>, sessionId = 's1', requestId = 'q',
+  options: Partial<AskRequest> = {}) {
   const request = { requestId, question: 'Apply the proposed change?',
-    choices: ['Approve', 'Decline'], allowFreeform: true };
+    choices: ['Approve', 'Decline'], allowFreeform: true, ...options };
   f.service.syncQuestions(sessionId, [request], true);
   f.metas.get(sessionId)!.ask = request;
   return f.db.must('questions', questionKey(sessionId, requestId));
 }
 
-function answer(f: ReturnType<typeof fixture>, text: string) {
-  const q = question(f);
-  const input = f.service.accept({ requestId: 'natural-answer', text });
-  const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-  const decision = { ...proof(work), topic: { title: 'Implementation', independent: true },
-    reason: 'The latest question and ongoing topic identify the recipient',
-    action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0, answerQuestionId: q.id } };
-  f.service.decide(f.identities.coordinator, decision);
-  const delivery = f.db.find('deliveries', item => item.messageId === input.message.id)[0]!;
-  return { q, input, work, decision, delivery };
+function classify(f: ReturnType<typeof fixture>, questions: { messageId: string }[], topicIds: string[]) {
+  const current = batch(f);
+  f.service.attribute(f.identities.coordinator, {
+    items: questions.map((q, index) => ({ messageId: q.messageId, topicId: topicIds[index]! })),
+  });
+  f.service.finishBatch(current.id, 'finished');
 }
 
-test('natural reservations, comments and follow-up questions reach the native ask verbatim', async () => {
+function answer(f: ReturnType<typeof fixture>, text: string) {
+  topic(f, 'implementation');
+  const q = question(f);
+  classify(f, [q], ['implementation']);
+  const input = f.service.accept({ requestId: 'natural-answer', text });
+  const current = batch(f);
+  const dispatch = { items: [{ topicId: 'implementation', prompt: text }] };
+  f.service.dispatch(f.identities.coordinator, dispatch);
+  const delivery = f.db.find('deliveries', item => item.messageId === input.message.id)[0]!;
+  return { q, input, current, dispatch, delivery };
+}
+
+test('natural reservations, comments and exact choices reach the attributed native ask verbatim', async () => {
   for (const text of [
     'Yes, but does that remain inside the same application?',
     'I prefer the current design; can you explain the alternatives?',
@@ -42,189 +55,260 @@ test('natural reservations, comments and follow-up questions reach the native as
       }]);
       assert.equal(f.db.must('deliveries', result.delivery.id).state, 'accepted');
       assert.equal(f.db.find('publications', item => item.type === 'clarification').length, 0);
-      assert.equal(f.db.find('anchors', () => true).length, 0);
       assert.equal(f.calls.some(call => call.name === 'prompt'
         && (call.body as { sessionId: string }).sessionId === 's1'), false);
+      assert.equal(inputReceipt(f.service, 'natural-answer').input.text, text);
     } finally { f.close(); }
   }
 });
 
-test('context chooses one freeform ask among parallel topics and validates its session identity', async () => {
+test('topic mapping selects one attributed ask among parallel sessions without public request identifiers', async () => {
   const f = fixture();
   try {
-    question(f, 's1', 'one');
+    topic(f, 'first', 's1'); topic(f, 'second', 's2');
+    const first = question(f, 's1', 'one');
     const target = question(f, 's2', 'two');
+    classify(f, [first, target], ['first', 'second']);
     const input = f.service.accept({ requestId: 'comment', text: 'For the second project, why is this needed?' });
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-    const value = { ...proof(work), topic: { title: 'Second project', independent: true },
-      reason: 'User names the second project', action: { kind: 'route', sessionIds: ['s1'],
-        answerQuestionId: target.id, routeVersion: 0 } };
-    assert.throws(() => f.service.decide(f.identities.coordinator, value), { code: 'QUESTION_TARGET_MISMATCH' });
-    f.service.decide(f.identities.coordinator, { ...value, action: { ...value.action, sessionIds: ['s2'] } });
+    batch(f);
+    assert.throws(() => f.service.dispatch(f.identities.coordinator, { items: [{
+      topicId: 'second', prompt: input.message.raw, answerQuestionId: first.id,
+    }] }), /Unrecognized key/);
+    f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'second', prompt: input.message.raw }] });
     await f.runtime.wake();
     assert.deepEqual(f.calls.filter(call => call.name === 'answer').map(call => call.body), [{
       sessionId: 's2', requestId: 'two', answer: input.message.raw, wasFreeform: true,
     }]);
-    assert.equal(f.db.must('questions', questionKey('s1', 'one')).state, 'pending');
+    assert.equal(f.db.must('questions', first.id).state, 'pending');
   } finally { f.close(); }
 });
 
-test('new topics and ordinary comments use context without being captured by another session ask', async () => {
+test('unclassified and wrong-topic native questions block dispatch atomically', () => {
+  for (const attributed of [false, true]) {
+    const f = fixture();
+    try {
+      topic(f, 'first'); topic(f, 'other');
+      const q = question(f);
+      if (attributed) classify(f, [q], ['other']);
+      const input = f.service.accept({ requestId: 'comment', text: 'Please explain that option.' });
+      batch(f);
+      const before = f.db.list('publications').items;
+      assert.throws(() => f.service.dispatch(f.identities.coordinator, {
+        items: [{ topicId: 'first', prompt: input.message.raw }],
+      }), { code: 'AMBIGUOUS_NATIVE_ASK' });
+      assert.equal(f.db.list('deliveries').items.length, 0);
+      assert.equal(f.db.must('work', input.work.id).state, 'leased');
+      assert.deepEqual(f.db.list('publications').items, before);
+      f.service.clarify(f.identities.coordinator, { text: 'Which project is this about?' });
+      assert.equal(f.db.must('work', input.work.id).state, 'done');
+    } finally { f.close(); }
+  }
+});
+
+test('coalesced independent answers retain their uniquely matching original source and native request', async t => {
+  const f = fixture(); t.after(() => f.close());
+  topic(f, 'first', 's1'); topic(f, 'second', 's2');
+  const first = question(f, 's1', 'first-ask', { choices: ['blue'], allowFreeform: false });
+  const second = question(f, 's2', 'second-ask', { choices: ['green'], allowFreeform: false });
+  classify(f, [first, second], ['first', 'second']);
+  const blue = f.service.accept({ requestId: 'blue', text: 'blue' });
+  const green = f.service.accept({ requestId: 'green', text: 'green' });
+  batch(f);
+  f.service.dispatch(f.identities.coordinator, { items: [
+    { topicId: 'first', prompt: 'blue' }, { topicId: 'second', prompt: 'green' },
+  ] });
+  assert.deepEqual(f.db.find('deliveries', d => d.kind === 'ask').map(d => [d.messageIds, d.requestId]),
+    [[[blue.message.id], 'first-ask'], [[green.message.id], 'second-ask']]);
+  await f.runtime.wake();
+  assert.deepEqual(f.calls.filter(call => call.name === 'answer').map(call => call.body), [
+    { sessionId: 's1', requestId: 'first-ask', answer: 'blue', wasFreeform: false },
+    { sessionId: 's2', requestId: 'second-ask', answer: 'green', wasFreeform: false },
+  ]);
+});
+
+test('a coalesced native answer and normal request dispatch without merging the answer source', t => {
+  const f = fixture(); t.after(() => f.close());
+  topic(f, 'ask', 's1'); topic(f, 'normal', 's2');
+  const q = question(f);
+  classify(f, [q], ['ask']);
+  const answer = f.service.accept({ requestId: 'answer', text: 'Approve' });
+  const normal = f.service.accept({ requestId: 'normal', text: 'Write a plan' });
+  batch(f);
+  f.service.dispatch(f.identities.coordinator, { items: [
+    { topicId: 'ask', prompt: 'Approve' }, { topicId: 'normal', prompt: 'Write a plan' },
+  ] });
+  const deliveries = f.db.list('deliveries').items;
+  assert.deepEqual(deliveries.find(d => d.kind === 'ask')!.messageIds, [answer.message.id]);
+  assert.equal(deliveries.find(d => d.kind === 'prompt')!.text, normal.message.raw);
+  assert.equal(f.db.must('work', answer.work.id).state, 'done');
+  assert.equal(f.db.must('work', normal.work.id).state, 'done');
+});
+
+test('identical coalesced answers and reused answer sources fail atomically rather than guessing', () => {
+  for (const originals of [1, 2]) {
+    const f = fixture();
+    try {
+      topic(f, 'first', 's1'); topic(f, 'second', 's2');
+      classify(f, [question(f, 's1', 'one'), question(f, 's2', 'two')], ['first', 'second']);
+      for (let i = 0; i < originals; i++) f.service.accept({ requestId: `${i}`, text: 'Approve' });
+      const active = batch(f);
+      assert.throws(() => f.service.dispatch(f.identities.coordinator, { items: [
+        { topicId: 'first', prompt: 'Approve' }, { topicId: 'second', prompt: 'Approve' },
+      ] }), { code: 'AMBIGUOUS_ANSWER_SOURCE' });
+      assert.equal(f.db.list('deliveries').items.length, 0);
+      assert.ok(active.workIds.every(id => f.db.must('work', id).state === 'leased'));
+    } finally { f.close(); }
+  }
+});
+
+test('a changed topic mapping never redirects an answer away from its original native request', async t => {
+  const f = fixture(); t.after(() => f.close());
+  topic(f, 'question-topic', 's1');
+  const q = question(f, 's1', 'original');
+  classify(f, [q], ['question-topic']);
+  const input = f.service.accept({ requestId: 'answer', text: 'Approve' });
+  batch(f);
+  f.service.map(f.identities.coordinator, { topicId: 'question-topic', sessionId: 's2' });
+  f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'question-topic', prompt: input.message.raw }] });
+  await f.runtime.wake();
+  assert.deepEqual(f.calls.filter(call => call.name === 'answer').map(call => call.body), [
+    { sessionId: 's1', requestId: 'original', answer: 'Approve', wasFreeform: false },
+  ]);
+  assert.equal(f.db.must('topics', 'question-topic').sessionId, 's2');
+});
+
+test('ordinary comments are not captured by a question in another session', async () => {
   const f = fixture();
   try {
     question(f);
-    const prior = f.service.addMessage({ kind: 'reply', raw: 'A draft for the other project', sessionId: 's2' });
+    topic(f, 'other', 's2');
     const input = f.service.accept({ requestId: 'new-topic', text: 'Change the second paragraph of that draft.' });
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-    f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'Other project', independent: true },
-      reason: `Continuation of source ${prior.id}`, action: { kind: 'route', sessionIds: ['s2'], routeVersion: 0 } });
+    batch(f);
+    f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'other', prompt: input.message.raw }] });
     await f.runtime.wake();
     assert.equal(f.calls.filter(call => call.name === 'answer').length, 0);
-    assert.equal(f.calls.filter(call => call.name === 'prompt'
-      && (call.body as { sessionId: string }).sessionId === 's2').length, 1);
+    const sent = f.calls.filter(call => call.name === 'prompt'
+      && (call.body as { sessionId: string }).sessionId === 's2');
+    assert.equal(sent.length, 1);
+    assert.equal((sent[0]!.body as { text: string }).text, input.message.raw);
     assert.equal(f.db.must('questions', questionKey('s1', 'q')).state, 'pending');
   } finally { f.close(); }
 });
 
-test('recipient clarification retains source and topic; its continuation does not require an anchor', () => {
+test('recipient clarification retains the original input and continuation uses the identified topic', () => {
   const f = fixture();
   try {
+    topic(f, 'first', 's1'); topic(f, 'second', 's2');
     const one = question(f, 's1', 'one');
-    question(f, 's2', 'two');
+    const two = question(f, 's2', 'two');
+    classify(f, [one, two], ['first', 'second']);
     const input = f.service.accept({ requestId: 'unclear', text: 'Please explain that option.' });
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-    f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'Discussion', independent: false },
-      reason: 'Both projects are equally plausible recipients',
-      action: { kind: 'clarify', text: 'The first project or the second?' } });
+    const current = batch(f);
+    f.service.clarify(f.identities.coordinator, { text: 'The first project or the second?' });
     const clarification = f.db.find('publications', item => item.type === 'clarification')[0]!;
     assert.equal(clarification.messageId, input.message.id);
-    assert.equal(clarification.sources[0]!.messageId, input.message.id);
-    assert.equal(clarification.anchorId, null);
+    assert.equal(f.db.must('messages', input.message.id).raw, input.message.raw);
+    assert.equal(f.db.list('deliveries').items.length, 0);
+    f.service.finishBatch(current.id, 'finished');
     const followup = f.service.accept({ requestId: 'clarified', text: 'The first, and explain the risks too.' });
-    const next = f.service.claim(f.identities.coordinator, 'coordinator', 1, followup.work.id)!;
-    f.service.decide(f.identities.coordinator, { ...proof(next), topic: { id: clarification.topicId! },
-      reason: 'The clarification and follow-up identify the first project',
-      action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0, answerQuestionId: one.id } });
+    batch(f);
+    f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'first', prompt: followup.message.raw }] });
     assert.equal(f.db.find('publications', item => item.type === 'clarification').length, 1);
-    assert.equal(f.db.find('deliveries', item => item.messageId === followup.message.id)[0]!.text, followup.message.raw);
+    const delivery = f.db.find('deliveries', item => item.messageId === followup.message.id)[0]!;
+    assert.equal(delivery.text, followup.message.raw);
+    assert.equal(delivery.requestId, 'one');
+    assert.equal(delivery.kind, 'ask');
   } finally { f.close(); }
 });
 
-test('a disappeared or replaced ask before dispatch recovers the original work without answering another request', async () => {
+test('choice-only and duplicate-choice restrictions reject answers without consuming the batch', () => {
+  for (const options of [
+    { choices: ['Approve'], allowFreeform: false },
+    { choices: ['Approve', 'Approve'], allowFreeform: true },
+  ]) {
+    const f = fixture();
+    try {
+      topic(f);
+      const q = question(f, 's1', 'q', options);
+      classify(f, [q], ['topic']);
+      const input = f.service.accept({ requestId: 'answer', text: options.allowFreeform ? 'Approve' : 'Sure' });
+      batch(f);
+      assert.throws(() => f.service.dispatch(f.identities.coordinator, {
+        items: [{ topicId: 'topic', prompt: options.allowFreeform ? 'Approve' : 'Sure' }],
+      }), /exactly match|duplicate literal choices/);
+      assert.equal(f.db.must('work', input.work.id).state, 'leased');
+      assert.equal(f.db.list('deliveries').items.length, 0);
+    } finally { f.close(); }
+  }
+});
+
+test('native answer dispatch cannot trim or paraphrase the original user answer into an allowed choice', () => {
+  const f = fixture();
+  try {
+    topic(f);
+    const q = question(f, 's1', 'q', { choices: ['Approve'], allowFreeform: false });
+    classify(f, [q], ['topic']);
+    const input = f.service.accept({ requestId: 'answer', text: ' Approve ' });
+    batch(f);
+    assert.throws(() => f.service.dispatch(f.identities.coordinator, {
+      items: [{ topicId: 'topic', prompt: 'Approve' }],
+    }), { code: 'ANSWER_NOT_VERBATIM' });
+    assert.throws(() => f.service.dispatch(f.identities.coordinator, {
+      items: [{ topicId: 'topic', prompt: input.message.raw }],
+    }), { code: 'FREEFORM_FORBIDDEN' });
+    assert.equal(f.db.list('deliveries').items.length, 0);
+  } finally { f.close(); }
+});
+
+test('a disappeared or replaced ask never answers the replacement or replays the frozen dispatch', async () => {
   for (const replacement of [false, true]) {
     const f = fixture();
     try {
       const result = answer(f, 'Please explain the tradeoff first.');
+      f.service.grantConsumer(f.identities.coordinator, f.service.activeBatch()!);
       const replacementAsk = { requestId: 'replacement', question: 'Unrelated new choice?', choices: ['Other'], allowFreeform: true };
       f.metas.get('s1')!.ask = replacement ? replacementAsk : null;
       await f.runtime.wake();
       assert.equal(f.db.must('deliveries', result.delivery.id).state, 'rejected');
       assert.equal(f.db.must('questions', result.q.id).state, 'stale');
-      const recovered = f.db.must('work', result.work.id);
-      assert.equal(recovered.state, 'pending');
-      assert.equal(recovered.token, null);
-      assert.deepEqual((recovered.result as { recovery: { currentQuestions: unknown[] } }).recovery.currentQuestions,
-        replacement ? [replacementAsk] : []);
       assert.equal(f.calls.some(call => call.name === 'answer'), false);
       assert.equal(f.calls.some(call => call.name === 'prompt'
         && (call.body as { sessionId: string }).sessionId === 's1'), false);
-      assert.deepEqual(f.service.decide(f.identities.coordinator, result.decision), { deliveries: [result.delivery] },
-        'old decision request returns its receipt, not a replay');
-      assert.equal(f.db.must('work', result.work.id).state, 'pending');
-      if (replacement) {
-        f.service.syncQuestions('s1', [replacementAsk], true);
-      }
-      const fresh = f.service.claim(f.identities.coordinator, 'coordinator', 1, result.work.id)!;
-      const topicId = f.db.must('messages', result.input.message.id).topicId!;
-      f.service.decide(f.identities.coordinator, { ...proof(fresh, 'reconsider-stale-ask'),
-        topic: { id: topicId }, reason: 'Original request ended; clarify whether the new conversation is intended',
-        action: { kind: 'clarify', text: 'The earlier question has closed. Is this about the current discussion?' } });
-      assert.equal(f.db.find('publications', item => item.type === 'message'
-        && item.messageId === result.input.message.id).length, 1);
+      assert.throws(() => f.service.dispatch(f.identities.coordinator, result.dispatch), /retired batch/);
+      await f.runtime.wake();
       assert.equal(f.db.find('deliveries', item => item.messageId === result.input.message.id).length, 1);
-      assert.equal(f.db.must('work', result.work.id).state, 'done');
+      assert.equal(f.db.must('deliveries', result.delivery.id).state, 'rejected');
+      assert.equal(f.db.must('messages', result.input.message.id).raw, result.input.message.raw);
     } finally { f.close(); }
   }
 });
 
-test('a definitive callback rejection reopens computation, but an unknown callback never does or resends', async () => {
+test('definite callback rejection and unknown acknowledgment remain distinct and never resend automatically', async () => {
   for (const uncertain of [false, true]) {
     const f = fixture();
     try {
       const result = answer(f, 'What is the expected impact?');
-      if (uncertain) f.fail(new Error('Lost native acknowledgment'));
-      else f.native.answer = async () => ({ accepted: false, result: { ok: false } });
+      let attempts = 0;
+      f.native.answer = async () => {
+        attempts++;
+        if (uncertain) throw new Error('Lost native acknowledgment');
+        return { accepted: false, result: { ok: false } };
+      };
       await f.runtime.wake();
       assert.equal(f.db.must('deliveries', result.delivery.id).state, uncertain ? 'unknown' : 'rejected');
-      assert.equal(f.db.must('work', result.work.id).state, uncertain ? 'done' : 'pending');
-      f.fail(null);
       await f.runtime.wake();
-      if (uncertain) {
-        f.service.recover();
-        assert.equal(f.db.must('work', result.work.id).state, 'done');
-        assert.equal(f.calls.filter(call => call.name === 'answer').length, 1);
-      }
+      f.service.recover();
+      await f.runtime.wake();
+      assert.equal(attempts, 1);
+      assert.equal(f.db.find('deliveries', item => item.messageId === result.input.message.id).length, 1);
+      assert.equal(f.db.must('operations', 'input:natural-answer').state, 'accepted');
     } finally { f.close(); }
   }
 });
 
-test('unavailable native ask targets retain recoverable input rather than completing a rejected answer', async () => {
-  const f = fixture();
-  try {
-    const result = answer(f, 'Explain the consequences first.');
-    f.metas.delete('s1');
-    await f.runtime.wake();
-    assert.equal(f.db.must('deliveries', result.delivery.id).state, 'rejected');
-    const work = f.db.must('work', result.work.id);
-    assert.equal(work.state, 'pending');
-    assert.equal((work.result as { recovery: { questionObservation: string } }).recovery.questionObservation, 'unavailable');
-    assert.equal(f.calls.some(call => call.name === 'answer'), false);
-    assert.equal(f.db.find('deliveries', item => item.messageId === result.input.message.id).length, 1);
-  } finally { f.close(); }
-});
-
-for (const change of ['deleted', 'internal'] as const) {
-  test(`session-scoped wake recovers an unsent ask when its target becomes ${change}`, async () => {
-    const f = fixture();
-    try {
-      const result = answer(f, 'Please explain the consequences first.');
-      if (change === 'deleted') f.metas.delete('s1');
-      else f.metas.get('s1')!.roles = [{
-        moduleId: 'assistant', roleId: 'memory', moduleName: 'Assistant', name: 'memory',
-      }];
-      await f.runtime.wake('s1');
-      const delivery = f.db.must('deliveries', result.delivery.id);
-      assert.equal(delivery.state, 'cancelled');
-      assert.equal(delivery.error, change === 'deleted' ? 'Target no longer exists' : 'Target is an internal role carrier');
-      const recovered = f.db.must('work', result.work.id);
-      assert.equal(recovered.state, 'pending');
-      assert.equal(recovered.token, null);
-      assert.equal(recovered.epoch, null);
-      assert.equal(recovered.leaseUntil, 0);
-      const recovery = (recovered.result as { recovery: {
-        deliveryId: string; reason: string; questionObservation: string;
-      } }).recovery;
-      assert.equal(recovery.deliveryId, delivery.id);
-      assert.equal(recovery.reason, delivery.error);
-      assert.equal(recovery.questionObservation, 'unavailable');
-      assert.equal(f.db.must('questions', result.q.id).state, 'unknown');
-      assert.equal(f.db.must('messages', result.input.message.id).raw, result.input.message.raw);
-      assert.equal(f.db.find('deliveries', item => item.messageId === result.input.message.id).length, 1);
-      assert.equal(f.calls.some(call => call.name === 'answer'), false);
-      assert.equal(f.calls.some(call => call.name === 'prompt'
-        && (call.body as { sessionId: string }).sessionId === 's1'), false);
-      assert.equal(f.service.claim(f.identities.coordinator, 'coordinator', 1, result.work.id)!.id, result.work.id);
-      await f.runtime.wake('s1');
-      assert.equal(f.db.must('work', result.work.id).state, 'leased');
-      assert.equal(f.db.must('deliveries', delivery.id).state, 'cancelled');
-      assert.equal(f.calls.some(call => call.name === 'answer'), false);
-    } finally { f.close(); }
-  });
-}
-
-test('session-scoped target retirement never restores work for calling, accepted or unknown native answers', async () => {
+test('session retirement cancels only unsent answers and preserves uncertain or completed effects', async () => {
   for (const change of ['deleted', 'internal'] as const) {
-    for (const state of ['calling', 'accepted', 'unknown'] as const) {
+    for (const state of ['pending', 'calling', 'accepted', 'unknown'] as const) {
       const f = fixture();
       try {
         const result = answer(f, 'Please explain before proceeding.');
@@ -234,80 +318,55 @@ test('session-scoped target retirement never restores work for calling, accepted
           moduleId: 'assistant', roleId: 'coordinator', moduleName: 'Assistant', name: 'coordinator',
         }];
         await f.runtime.wake('s1');
-        assert.equal(f.db.must('deliveries', result.delivery.id).state, state);
-        assert.equal(f.db.must('work', result.work.id).state, 'done');
-        assert.throws(() => f.service.claim(f.identities.coordinator, 'coordinator', 1, result.work.id),
-          { code: 'WORK_UNAVAILABLE' });
+        const delivery = f.db.must('deliveries', result.delivery.id);
+        assert.equal(delivery.state, state === 'pending' ? 'cancelled' : state);
+        if (state === 'pending') assert.equal(delivery.error,
+          change === 'deleted' ? 'Target no longer exists' : 'Target is an internal role carrier');
+        assert.equal(f.db.must('questions', result.q.id).state, 'unknown');
         assert.equal(f.calls.some(call => call.name === 'answer'), false);
-        assert.equal(f.db.find('deliveries', item => item.messageId === result.input.message.id).length, 1);
+        assert.equal(f.calls.some(call => call.name === 'prompt'
+          && (call.body as { sessionId: string }).sessionId === 's1'), false);
+        assert.equal(inputReceipt(f.service, 'natural-answer').input.text, result.input.message.raw);
+        await f.runtime.wake('s1');
+        assert.equal(f.db.must('deliveries', delivery.id).state, delivery.state);
       } finally { f.close(); }
     }
   }
 });
 
-test('recovered computation gets a new wake without replaying an earlier accepted wake', async () => {
-  const f = fixture();
-  try {
-    const q = question(f);
-    const output = f.service.claim(f.identities.coordinator, 'coordinator', 1, `message:${q.messageId}:1`)!;
-    f.service.decide(f.identities.coordinator, { ...proof(output), topic: { title: 'Question', independent: true },
-      reason: 'Publish native question before handling input', action: { kind: 'publish' } });
-    const input = f.service.accept({ requestId: 'recover-wake', text: 'Explain the proposal.' });
-    await f.runtime.wake();
-    const wakeCount = () => f.calls.filter(call => call.name === 'prompt'
-      && (call.body as { sessionId: string }).sessionId === 'coordinator').length;
-    assert.equal(wakeCount(), 1);
-    const wake = f.db.find('deliveries', d => d.kind === 'wake').at(-1)!;
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id, wake.id)!;
-    f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'Project', independent: true },
-      reason: 'Context selects this request', action: { kind: 'route', sessionIds: ['s1'],
-        routeVersion: 0, answerQuestionId: q.id } });
-    assert.equal(f.service.claim(f.identities.coordinator, 'coordinator', 1, undefined, wake.id), null);
-    f.metas.get('s1')!.ask = null;
-    await f.runtime.wake();
-    assert.equal(wakeCount(), 2);
-    await f.runtime.wake();
-    assert.equal(wakeCount(), 2);
-    assert.equal(f.db.must('work', work.id).state, 'pending');
-    assert.equal(f.calls.some(call => call.name === 'answer'), false);
-  } finally { f.close(); }
-});
-
-test('existing pending, accepted or unknown delivery blocks duplicate rerouting even with reclaimed computation', () => {
+test('pending or uncertain answers cannot be duplicated by a later input batch', () => {
   for (const state of ['pending', 'calling', 'accepted', 'unknown'] as const) {
     const f = fixture();
     try {
       const result = answer(f, 'Please explain before making a decision.');
       f.db.put('deliveries', { ...result.delivery, state });
-      f.db.put('work', { ...f.db.must('work', result.work.id), state: 'pending' });
-      const fresh = f.service.claim(f.identities.coordinator, 'coordinator', 1, result.work.id)!;
-      assert.throws(() => f.service.decide(f.identities.coordinator, { ...result.decision,
-        ...proof(fresh, 'must-not-resend'), topic: { id: f.db.must('messages', result.input.message.id).topicId! } }),
-      { code: 'INPUT_ALREADY_ROUTED' });
-      assert.equal(f.db.find('deliveries', item => item.messageId === result.input.message.id).length, 1);
+      f.service.finishBatch(result.current.id, 'finished');
+      const next = f.service.accept({ requestId: 'second-answer', text: 'Approve' });
+      batch(f);
+      assert.throws(() => f.service.dispatch(f.identities.coordinator, {
+        items: [{ topicId: 'implementation', prompt: 'Approve' }],
+      }), { code: 'ASK_IN_FLIGHT' });
+      assert.equal(f.db.must('work', next.work.id).state, 'leased');
+      assert.equal(f.db.find('deliveries', item => item.kind === 'ask').length, 1);
       assert.equal(f.db.must('deliveries', result.delivery.id).state, state);
     } finally { f.close(); }
   }
 });
 
-test('new API rejects legacy reply fields and GET receipts retain their exact historical identity', () => {
+test('semantic routing rejects untrusted role identities and legacy explicit reply fields', () => {
   const f = fixture();
   try {
-    for (const replyTo of ['old-anchor', null]) {
-      assert.equal(inputSchema.safeParse({ requestId: 'new', text: 'Comment', replyTo }).success, false);
+    topic(f);
+    f.service.accept({ requestId: 'new', text: 'Comment' });
+    batch(f);
+    for (const identity of [f.identities.memory, { ...f.identities.coordinator, subagent: true },
+      { ...f.identities.coordinator, runtimeSessionId: 'different' }]) {
+      assert.throws(() => f.service.dispatch(identity, { items: [{ topicId: 'topic', prompt: 'Comment' }] }),
+        /Internal agents|ready current role/);
     }
-    assert.equal(Object.hasOwn(inputSchema.parse({ requestId: 'new', text: 'Comment' }), 'replyTo'), false);
-    const old = f.service.accept({ requestId: 'old', text: 'Original' });
-    const legacy = { requestId: 'old', text: 'Original', attachments: [], replyTo: 'old-anchor' };
-    const message = { ...old.message, replyTo: 'old-anchor' };
-    f.db.put('messages', message);
-    f.db.put('operations', { id: 'input:old', fingerprint: fingerprint(legacy), state: 'accepted',
-      result: { ...old, message, input: legacy } });
-    f.db.put('anchors', { id: 'old-anchor', messageId: 'historical', sessionId: 's1', requestId: null, kind: 'comment' });
-    assert.deepEqual(inputReceipt(f.service, 'old').input, receiptInputSchema.parse(legacy));
-    assert.throws(() => f.service.accept(legacy), /Unrecognized key/);
-    assert.throws(() => f.service.accept({ requestId: 'old', text: 'Original' }), /different input/);
-    assert.equal(f.db.must('anchors', 'old-anchor').sessionId, 's1');
-    assert.equal(f.db.find('deliveries', () => true).length, 0);
+    for (const fields of [{ replyTo: 'old-anchor' }, { replyTo: null }, { topicId: 'topic' }]) {
+      assert.equal(inputSchema.safeParse({ requestId: 'new', text: 'Comment', ...fields }).success, false);
+    }
+    assert.equal(f.db.list('deliveries').items.length, 0);
   } finally { f.close(); }
 });

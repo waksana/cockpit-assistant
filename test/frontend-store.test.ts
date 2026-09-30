@@ -14,8 +14,8 @@ const ready: Readiness = { canSend: true, roles: ['coordinator', 'memory'].map(r
   baseline: true, gap: null, generation: 1, version: 1 }] };
 const item = (sequence: number, topicId = 'a'): TimelineItem => ({
   id: `p${sequence}`, sequence, type: 'message', text: `message ${sequence}`, messageId: `m${sequence}`,
-  topicId, anchorId: `anchor${sequence}`, sources: [], createdAt: sequence * 1000,
-  topicTitle: topicId, speaker: 'assistant', sessionId: 'reception', question: null, attachments: [],
+  topicId, sources: [], createdAt: sequence * 1000,
+  topicTitle: topicId, topicColor: '#2563eb', speaker: 'assistant', sessionId: 'reception', question: null, attachments: [],
 });
 const frame = (record: TimelineItem) =>
   `id: ${record.sequence}\nevent: publication\ndata: ${JSON.stringify(record)}\n\n`;
@@ -162,6 +162,39 @@ test('a displayed choice-only question does not bind new natural input or disabl
     const body = JSON.parse(String(f.requests.find(request => request.path === '/messages')?.init?.body));
     assert.equal(body.text, 'I am asking about a different topic.');
     assert.equal(Object.hasOwn(body, 'replyTo'), false);
+  } finally { f.store.dispose(); }
+});
+
+test('uncertain sends recover automatically while preserving newer draft edits, never reposting', async t => {
+  const f = await fixture(path => path === '/messages' ? Promise.reject(new Error('connection lost')) : undefined);
+  try {
+    f.store.open(); await turn(); f.store.edit('captured');
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await f.store.send();
+    f.store.edit('newer draft');
+    assert.equal(f.store.getSnapshot().draft.unconfirmed, true);
+    t.mock.timers.tick(1500); await turn();
+    assert.equal(f.store.getSnapshot().draft.unconfirmed, false);
+    assert.equal(f.store.getSnapshot().draft.text, 'newer draft');
+    assert.equal(f.store.getSnapshot().submissions[0]?.state, 'accepted');
+    assert.equal(f.requests.filter(request => request.path === '/messages').length, 1);
+  } finally { f.store.dispose(); }
+});
+
+test('automatic draft recovery pauses when closed and resumes on reopening', async t => {
+  const f = await fixture(path => path === '/messages' ? Promise.reject(new Error('connection lost')) : undefined);
+  try {
+    f.store.open(); await turn(); f.store.edit('preserved');
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    await f.store.send();
+    f.store.close();
+    t.mock.timers.tick(30_000); await turn();
+    assert.equal(f.requests.filter(request => request.path.startsWith('/inputs/')).length, 0);
+    f.store.open(); await turn();
+    t.mock.timers.tick(1500); await turn();
+    assert.equal(f.store.getSnapshot().draft.text, '');
+    assert.equal(f.store.getSnapshot().draft.unconfirmed, false);
+    assert.equal(f.requests.filter(request => request.path === '/messages').length, 1);
   } finally { f.store.dispose(); }
 });
 

@@ -10,8 +10,7 @@ import { Database, fingerprint } from '../src/database.ts';
 import { AssistantService, questionKey } from '../src/service.ts';
 import { routes } from '../src/http.ts';
 import { inputReceipt, timeline } from '../src/ui.ts';
-import type { Work } from '../src/types.ts';
-import { fixture, proof } from './fixtures.ts';
+import { fixture, stageDelivery, topic } from './fixtures.ts';
 
 const attachments: NativeAttachment[] = [
   { type: 'file', path: '/synthetic/input.txt', displayName: 'Input' },
@@ -21,20 +20,26 @@ const attachments: NativeAttachment[] = [
   { type: 'blob', data: 'aGk=', mimeType: 'text/plain', displayName: 'Inline' },
 ];
 const input = (requestId = 'attached') => ({ requestId, text: '', attachments: structuredClone(attachments) });
-function route(f: ReturnType<typeof fixture>, work: Work, sessionIds = ['s1'], answerQuestionId?: string) {
-  const claimed = f.service.claim(f.identities.coordinator, 'coordinator', 1, work.id)!;
-  f.service.decide(f.identities.coordinator, { ...proof(claimed),
-    topic: { title: 'Attachments', independent: true }, reason: 'Explicit input',
-    action: { kind: 'route', sessionIds, routeVersion: 0, ...(answerQuestionId ? { answerQuestionId } : {}) } });
-  return f.db.find('deliveries', delivery => delivery.messageId === work.messageId);
+function batch(f: ReturnType<typeof fixture>) {
+  return f.service.startBatch(f.db.must('bindings', 'coordinator'))!;
+}
+function route(f: ReturnType<typeof fixture>, sessionIds = ['s1']) {
+  for (const sessionId of sessionIds) topic(f, `attachments:${sessionId}`, sessionId);
+  batch(f);
+  f.service.dispatch(f.identities.coordinator, {
+    items: sessionIds.map(sessionId => ({ topicId: `attachments:${sessionId}`, prompt: `Read attachments for ${sessionId}` })),
+  });
+  return f.db.find('deliveries', delivery => delivery.kind !== 'wake');
 }
 function ask(f: ReturnType<typeof fixture>) {
   const request = { requestId: 'q', question: 'Proceed?', choices: ['Yes', 'No'], allowFreeform: false };
   f.db.transaction(() => f.service.syncQuestions('s1', [request], true));
   f.metas.get('s1')!.ask = request;
   const question = f.db.must('questions', questionKey('s1', 'q'));
-  f.db.put('anchors', { id: question.messageId, messageId: question.messageId, sessionId: 's1',
-    requestId: 'q', kind: 'ask' });
+  topic(f, 'answer');
+  const current = batch(f);
+  f.service.attribute(f.identities.coordinator, { items: [{ messageId: question.messageId, topicId: 'answer' }] });
+  f.service.finishBatch(current.id, 'finished');
   return question;
 }
 function api(f: ReturnType<typeof fixture>) {
@@ -120,8 +125,8 @@ test('delivery and publication snapshots remain immutable while timeline project
   const f = fixture();
   try {
     const accepted = f.service.accept(input());
-    const [delivery] = route(f, accepted.work);
-    const topicId = f.db.must('messages', accepted.message.id).topicId!;
+    const [delivery] = route(f);
+    const topicId = delivery!.topicId!;
     f.db.transaction(() => f.service.memory.schedule(topicId));
     assert.deepEqual(f.db.find('work', work => work.role === 'memory')[0]!.attachments, []);
     f.service.correct(accepted.message.id, 'Corrected later', 1, 'Correct source',
@@ -145,7 +150,7 @@ test('delivery and publication snapshots remain immutable while timeline project
     const sent = f.calls.filter(call => call.name === 'prompt'
       && (call.body as { sessionId: string }).sessionId === 's1');
     assert.deepEqual(sent.map(call => call.body), [
-      { sessionId: 's1', mode: 'enqueue', text: '', attachments },
+      { sessionId: 's1', mode: 'enqueue', text: 'Read attachments for s1', attachments },
     ]);
     for (const wake of f.calls.filter(call => call.name === 'prompt'
       && ['coordinator', 'memory'].includes((call.body as { sessionId: string }).sessionId))) {
@@ -155,23 +160,22 @@ test('delivery and publication snapshots remain immutable while timeline project
   } finally { f.close(); }
 });
 
-test('ordinary input accepts attachments and free text; actual ask routes enforce their restrictions', () => {
+test('ordinary attachment input remains accepted when a native question cannot consume it', () => {
   const f = fixture();
   try {
     const question = ask(f);
     assert.throws(() => f.service.accept({ ...input(), replyTo: question.messageId }), /Unrecognized key/);
-    const badChoice = f.service.accept({ requestId: 'bad-choice', text: 'Sure' });
-    assert.throws(() => route(f, badChoice.work, ['s1'], question.id), /exactly match/);
-    const unanchored = f.service.accept({ ...input(), text: 'Yes' });
-    const claimed = f.service.claim(f.identities.coordinator, 'coordinator', 1, unanchored.work.id)!;
-    assert.throws(() => f.service.decide(f.identities.coordinator, { ...proof(claimed),
-      topic: { title: 'Answer', independent: true }, reason: 'Literal answer',
-      action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0, answerQuestionId: question.id } }),
-    /cannot accept attachments/);
+    const accepted = f.service.accept({ ...input(), text: 'Yes' });
+    batch(f);
+    assert.throws(() => f.service.dispatch(f.identities.coordinator, {
+      items: [{ topicId: 'answer', prompt: 'Yes' }],
+    }), /cannot accept attachments/);
     assert.equal(f.db.list('deliveries').items.length, 0);
-    const valid = f.service.accept({ requestId: 'text-answer', text: 'Yes' });
-    f.service.correct(valid.message.id, 'Yes', 1, 'Added attachments', attachments);
-    assert.throws(() => route(f, f.db.must('work', `message:${valid.message.id}:2`), ['s1'], question.id), /cannot accept attachments/);
+    assert.equal(f.db.must('work', accepted.work.id).state, 'leased');
+    assert.deepEqual(inputReceipt(f.service, 'attached').input.attachments, attachments);
+    f.service.clarify(f.identities.coordinator, { text: 'Answer this native question without attachments in its original session.' });
+    assert.equal(f.db.must('work', accepted.work.id).state, 'done');
+    assert.equal(f.db.must('questions', question.id).state, 'pending');
   } finally { f.close(); }
 });
 
@@ -183,9 +187,11 @@ test('native send rechecks ask attachment and choice restrictions against frozen
   ]) {
     const f = fixture();
     try {
-      const question = ask(f);
-      const accepted = f.service.accept({ requestId: 'answer', text: 'Yes' });
-      const [delivery] = route(f, accepted.work, ['s1'], question.id);
+      ask(f);
+      f.service.accept({ requestId: 'answer', text: 'Yes' });
+      batch(f);
+      f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'answer', prompt: 'Yes' }] });
+      const delivery = f.db.find('deliveries', item => item.kind === 'ask')[0]!;
       f.db.put('deliveries', { ...delivery!, ...change });
       await f.runtime.wake();
       const result = f.db.must('deliveries', delivery!.id);
@@ -199,38 +205,31 @@ test('native send rechecks ask attachment and choice restrictions against frozen
   }
 });
 
-test('a late pending ask blocks ordinary routing only to its session and keeps work available', () => {
+test('a late pending ask rolls back the whole multi-topic dispatch and keeps original attachments', () => {
   const f = fixture();
   try {
-    const original = f.service.addMessage({ kind: 'reply', raw: 'Earlier comment', sessionId: 's1' });
-    f.db.put('anchors', { id: original.id, messageId: original.id, sessionId: 's1',
-      requestId: null, kind: 'comment' });
+    topic(f, 'available', 's2'); topic(f, 'blocked', 's1');
     const accepted = f.service.accept(input());
-    ask(f);
-    const claimed = f.service.claim(f.identities.coordinator, 'coordinator', 1, accepted.work.id)!;
+    batch(f);
+    f.service.syncQuestions('s1', [{ requestId: 'late', question: 'Which?', choices: ['A'] }], true);
     const snapshot = () => ({
-      tables: Object.fromEntries((['messages', 'topics', 'publications', 'deliveries', 'routes', 'exposures',
-        'risks', 'work', 'memories', 'operations', 'questions'] as const)
+      tables: Object.fromEntries((['messages', 'topics', 'publications', 'deliveries', 'messageTopics',
+        'batches', 'work', 'memories', 'operations', 'questions'] as const)
         .map(table => [table, f.db.find(table, () => true)])),
       metadata: f.db.sql.prepare('SELECT key,value FROM meta ORDER BY key').all(),
     });
     const before = snapshot();
-    assert.throws(() => f.service.decide(f.identities.coordinator, {
-      ...proof(claimed, 'blocked-comment-route'), topic: { title: 'New topic', independent: true },
-      reason: 'Reply to earlier comment', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0 },
-    }), /pending native question/);
+    assert.throws(() => f.service.dispatch(f.identities.coordinator, {
+      items: [{ topicId: 'available', prompt: 'Read file' }, { topicId: 'blocked', prompt: 'Explain file' }],
+    }), /unclassified or ambiguous native question/);
     assert.deepEqual(snapshot(), before, 'failed routing must roll back classification, publication and completion');
     assert.equal(f.db.must('work', accepted.work.id).state, 'leased');
-    assert.equal(f.db.get('operations', 'decision:blocked-comment-route'), undefined);
-    const reclaimed = f.service.claim(f.identities.coordinator, 'coordinator', 1, accepted.work.id)!;
-    f.service.decide(f.identities.coordinator, {
-      ...proof(reclaimed, 'clarify-comment'), topic: { title: 'Attachment reply', independent: true },
-      reason: 'A native question appeared after input acceptance',
-      action: { kind: 'clarify', text: 'This session is waiting for a native answer and cannot accept these attachments as an answer.' },
+    f.service.clarify(f.identities.coordinator, {
+      text: 'This session is waiting for a native answer and cannot accept these attachments as an answer.',
     });
     assert.equal(f.db.must('work', accepted.work.id).state, 'done');
     assert.equal(f.db.list('deliveries').items.length, 0);
-    assert.deepEqual(f.db.list('publications').items.map(item => item.type), ['message', 'clarification']);
+    assert.deepEqual(f.db.list('publications').items.map(item => item.type), ['message', 'question', 'clarification']);
     assert.deepEqual(inputReceipt(f.service, 'attached').input.attachments, attachments);
   } finally { f.close(); }
 });
@@ -238,8 +237,10 @@ test('a late pending ask blocks ordinary routing only to its session and keeps w
 test('multi-target partial acceptance never resends or bypasses an ask that appears before send', async () => {
   const f = fixture();
   try {
-    const accepted = f.service.accept(input());
-    const deliveries = route(f, accepted.work, ['s1', 's2']);
+    f.service.accept(input());
+    const deliveries = route(f, ['s1', 's2']);
+    assert.deepEqual(deliveries.map(delivery => delivery.attachments), [attachments, attachments]);
+    assert.deepEqual(deliveries.map(delivery => delivery.topicId), ['attachments:s1', 'attachments:s2']);
     f.onPrompt(async () => {
       f.metas.get('s2')!.ask = { requestId: 'late', question: 'Which?', choices: ['A'], allowFreeform: false };
     });
@@ -257,6 +258,26 @@ test('multi-target partial acceptance never resends or bypasses an ask that appe
     const receipt = inputReceipt(f.service, 'attached');
     assert.deepEqual(receipt.input, input());
     assert.equal(f.db.must('operations', 'input:attached').state, 'accepted');
+  } finally { f.close(); }
+});
+
+test('multi-topic dispatch forwards the complete original attachments once to every mapped session', async () => {
+  const f = fixture();
+  try {
+    const accepted = f.service.accept(input());
+    const deliveries = route(f, ['s1', 's2']);
+    await f.runtime.wake();
+    await f.runtime.wake();
+    const sent = f.calls.filter(call => call.name === 'prompt'
+      && ['s1', 's2'].includes((call.body as { sessionId: string }).sessionId));
+    assert.deepEqual(sent.map(call => call.body), ['s1', 's2'].map(sessionId => ({
+      sessionId, mode: 'enqueue', text: `Read attachments for ${sessionId}`, attachments,
+    })));
+    assert.deepEqual(deliveries.map(delivery => f.db.must('deliveries', delivery.id).state), ['accepted', 'accepted']);
+    assert.equal(f.db.find('publications', publication => publication.type === 'message'
+      && publication.messageId === accepted.message.id).length, 1);
+    assert.deepEqual(inputReceipt(f.service, 'attached').input, input());
+    assert.equal(f.db.must('messages', accepted.message.id).raw, '');
   } finally { f.close(); }
 });
 
@@ -286,27 +307,10 @@ test('database restart preserves captured attachments and unknown delivery indep
   }
 });
 
-test('legacy text-only documents normalize only missing attachment fields including revision and receipt reads', async () => {
+test('stored attachment descriptors are validated rather than silently normalized', () => {
   const f = fixture();
   try {
-    const request = api(f);
-    const accepted = f.service.accept({ requestId: 'old', text: 'Original' });
-    route(f, accepted.work);
-    f.service.correct(accepted.message.id, 'Current', 1, 'Correction');
-    for (const table of ['messages', 'work', 'deliveries', 'publications']) {
-      f.db.sql.exec(`UPDATE ${table} SET document=json_remove(document, '$.attachments')`);
-    }
-    f.db.sql.exec(`UPDATE operations SET document=json_remove(document,
-      '$.result.input', '$.result.message.attachments', '$.result.work.attachments') WHERE id='input:old'`);
-    f.db.sql.prepare('UPDATE meta SET value=json_remove(value, ?) WHERE key=?')
-      .run('$.attachments', `revision:${accepted.message.id}:1`);
-    assert.deepEqual(f.db.must('messages', accepted.message.id).attachments, []);
-    assert.deepEqual(inputReceipt(f.service, 'old').message.attachments, []);
-    assert.deepEqual(f.service.accept({ requestId: 'old', text: 'Original', attachments: [] }).work.attachments, []);
-    assert.deepEqual(timeline(f.service, undefined, undefined, 20).items[0]!.attachments, []);
-    const revision = await request('GET', '/messages/:id/versions/:version',
-      { params: { id: accepted.message.id, version: '1' } });
-    assert.deepEqual((revision.body as { message: { attachments: NativeAttachment[] } }).message.attachments, []);
+    const accepted = f.service.accept(input());
     f.db.sql.prepare('UPDATE messages SET document=json_set(document, ?, json(?)) WHERE id=?')
       .run('$.attachments', JSON.stringify([{ type: 'file', path: '/a', unknown: true }]), accepted.message.id);
     assert.throws(() => f.db.must('messages', accepted.message.id));
@@ -314,47 +318,21 @@ test('legacy text-only documents normalize only missing attachment fields includ
   } finally { f.close(); }
 });
 
-test('legacy input receipts preserve original topic and reply identity independently of classification', () => {
-  const f = fixture();
-  try {
-    f.db.put('topics', { id: 'original-topic', title: 'Original', independent: true, domain: null,
-      relatedTo: [], pinned: false, archived: false, version: 1, dirtyThrough: 0, memoryThrough: 0 });
-    const parent = f.service.addMessage({ kind: 'reply', raw: 'Reply source', sessionId: 's1' });
-    f.db.put('anchors', { id: parent.id, messageId: parent.id, sessionId: 's1', kind: 'comment', requestId: null });
-    const captured = { ...input(), topicId: 'original-topic', replyTo: parent.id };
-    const accepted = f.service.accept(input());
-    const legacyMessage = { ...accepted.message, topicId: captured.topicId, replyTo: parent.id };
-    f.db.put('messages', legacyMessage);
-    f.db.put('operations', { ...f.db.must('operations', 'input:attached'), fingerprint: fingerprint(captured),
-      result: { ...accepted, message: legacyMessage, input: captured } });
-    const stored = f.db.must('operations', 'input:attached').result as { input: unknown };
-    assert.deepEqual(stored.input, captured);
-    route(f, accepted.work);
-    assert.notEqual(f.db.must('messages', accepted.message.id).topicId, captured.topicId);
-    f.service.correct(accepted.message.id, 'Different text', 1, 'Correction', []);
-    assert.deepEqual(inputReceipt(f.service, 'attached').input, captured);
-    assert.deepEqual((f.db.must('operations', 'input:attached').result as { input: unknown }).input, captured);
-    assert.throws(() => f.service.accept(captured), /Unrecognized key/);
-    assert.throws(() => f.service.accept({ ...input(), topicId: captured.topicId }), /different input/);
-  } finally { f.close(); }
-});
-
-test('HTTP acceptance, receipt and coordinator work reads expose real attachment snapshots', async () => {
+test('HTTP acceptance, receipt and semantic batch expose captured attachments', async () => {
   const f = fixture();
   try {
     const request = api(f);
     const accepted = await request('POST', '/messages', { body: input() });
     assert.equal(accepted.status, undefined);
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1)!;
-    const response = await request('POST', '/mcp', { body: {
-      jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
-        name: 'assistant_read', arguments: { role: 'coordinator', epoch: 1, resource: 'work', workId: work.id },
-        _meta: { 'cockpit/invocation': f.identities.coordinator },
-      },
-    } });
-    const result = (response.body as { result: { isError: boolean; content: { text: string }[] } }).result;
-    assert.equal(result.isError, false);
-    assert.deepEqual(JSON.parse(result.content[0]!.text).items[0].attachments, attachments);
+    const current = batch(f);
+    const batchText = f.service.batchText(current);
+    assert.match(batchText, /synthetic\/input.txt/);
+    assert.match(batchText, /"type":"blob","mimeType":"text\/plain","displayName":"Inline","bytes":4/);
+    assert.equal(batchText.includes('aGk='), false, 'coordinator receives descriptors, not inline blob payloads');
+    const message = f.db.list('messages').items[0]!;
+    f.service.correct(message.id, 'Corrected', 1, 'Source correction', []);
+    const revision = f.db.meta<{ attachments: NativeAttachment[] } | null>(`revision:${message.id}:1`, null);
+    assert.deepEqual(revision?.attachments, attachments);
     const receipt = await request('GET', '/inputs/:requestId', { params: { requestId: 'attached' } });
     assert.equal(receipt.status, undefined);
     assert.deepEqual((receipt.body as { input: unknown }).input, input());
@@ -365,15 +343,28 @@ test('HTTP acceptance, receipt and coordinator work reads expose real attachment
 test('ingestion preserves attachments and treats changed native attachments as a new immutable revision', () => {
   const f = fixture();
   try {
+    stageDelivery(f, { state: 'accepted', nativeMessageId: 'assistant-prompt',
+      interactionId: 'assistant-interaction', interactionState: 'active',
+      result: { ok: true, messageId: 'assistant-prompt' } });
     const events = (suffix: string, value: NativeAttachment[]) => [
-      { id: `start${suffix}`, type: 'assistant.turn_start', data: {}, parentId: null },
+      { id: 'assistant-prompt-event', type: 'user.message', parentId: null,
+        data: { content: 'Relevant split prompt', messageId: 'assistant-prompt', interactionId: 'assistant-interaction' } },
+      { id: `start${suffix}`, type: 'assistant.turn_start',
+        data: { turnId: '0' }, parentId: 'assistant-prompt-event' },
       { id: `message${suffix}`, type: 'assistant.message', parentId: `start${suffix}`,
-        data: { content: '', messageId: 'native-message', toolRequests: [], attachments: value } },
-      { id: `end${suffix}`, type: 'assistant.turn_end', data: {}, parentId: `message${suffix}` },
+        data: { content: '', messageId: 'native-message', toolRequests: [], attachments: value,
+          interactionId: 'assistant-interaction' } },
+      { id: `end${suffix}`, type: 'assistant.turn_end',
+        data: { turnId: '0' }, parentId: `message${suffix}` },
     ];
     f.runtime.ingestion.apply('s1', 1, events('1', attachments), 'cursor1');
-    const message = f.db.list('messages').items[0]!;
+    const message = f.db.find('messages', item => item.kind === 'reply')[0]!;
     assert.deepEqual(message.attachments, attachments);
+    const originalEvidence = f.db.must('native', fingerprint(['s1', 'message1']));
+    assert.deepEqual(originalEvidence.event.data, {
+      messageId: 'native-message', interactionId: 'assistant-interaction',
+      contentFingerprint: fingerprint(['', attachments]),
+    });
     f.runtime.ingestion.apply('s1', 1, events('2', [attachments[0]!]), 'cursor2');
     assert.equal(f.db.must('messages', message.id).version, 2);
     assert.deepEqual(f.db.meta<{ attachments: NativeAttachment[] }>(`revision:${message.id}:1`, { attachments: [] }).attachments,
@@ -381,29 +372,68 @@ test('ingestion preserves attachments and treats changed native attachments as a
     assert.deepEqual(f.db.must('work', `message:${message.id}:2`).attachments, [attachments[0]]);
     assert.throws(() => f.runtime.ingestion.apply('s1', 1, events('1', []), 'bad'), /changed its durable payload/);
     assert.equal(f.db.must('receptions', 's1').cursor, 'cursor2');
-    assert.deepEqual(f.db.must('native', fingerprint(['s1', 'message1'])).event.data.attachments, attachments);
+    assert.deepEqual(f.db.must('native', fingerprint(['s1', 'message1'])), originalEvidence);
     const descriptors = [{ type: 'blob', mimeType: 'image/png', omittedReason: 'too_large' }];
     f.runtime.ingestion.apply('s1', 1, [
       { id: 'native-user', type: 'user.message', data: { content: '', attachments: descriptors } },
     ], 'cursor3');
-    assert.deepEqual(f.db.must('native', fingerprint(['s1', 'native-user'])).event.data.attachments, descriptors);
+    assert.equal(f.db.get('native', fingerprint(['s1', 'native-user'])), undefined);
+    assert.equal(f.db.find('messages', item => item.kind === 'reply').length, 1);
   } finally { f.close(); }
 });
 
-test('legacy native retention can regain omitted attachment facts once without accepting later payload mutation', () => {
+test('related native content and attachments cannot change under the same event identity', () => {
   const f = fixture();
   try {
-    const event = { id: 'legacy-native', type: 'user.message', data: { content: 'Original' } };
+    stageDelivery(f, { state: 'accepted', nativeMessageId: 'receipt' });
+    const root = { id: 'root-event', type: 'user.message',
+      data: { messageId: 'receipt', interactionId: 'interaction', content: 'Forwarded prompt' } };
+    const event = { id: 'reply-event', type: 'assistant.message',
+      data: { messageId: 'reply', interactionId: 'interaction', content: 'Original', attachments } };
     const id = fingerprint(['s1', event.id]);
-    f.db.put('native', { id, sessionId: 's1', event, historical: true });
-    const restored = { ...event, data: { ...event.data, attachments } };
-    f.runtime.ingestion.apply('s1', 1, [restored], 'restored');
-    assert.deepEqual(f.db.must('native', id).event.data.attachments, attachments);
-    assert.equal(f.db.must('native', id).attachmentRetentionVersion, 1);
-    assert.throws(() => f.runtime.ingestion.apply('s1', 1,
-      [{ ...restored, data: { ...restored.data, attachments: [] } }], 'changed'), /changed its durable payload/);
-    f.runtime.ingestion.apply('s1', 1, [{ ...event, id: 'new-native' }], 'new');
-    assert.throws(() => f.runtime.ingestion.apply('s1', 1,
-      [{ ...restored, id: 'new-native' }], 'changed'), /changed its durable payload/);
+    f.runtime.ingestion.apply('s1', 1, [root, event], 'retained');
+    const evidence = f.db.must('native', id);
+    assert.deepEqual(evidence.event.data, {
+      messageId: 'reply', interactionId: 'interaction', contentFingerprint: fingerprint(['Original', attachments]),
+    });
+    f.runtime.ingestion.apply('s1', 1, [event], 'replayed');
+    for (const changed of [
+      { ...event.data, attachments: [] },
+      { ...event.data, content: 'Changed' },
+    ]) {
+      assert.throws(() => f.runtime.ingestion.apply('s1', 1,
+        [{ ...event, data: changed }], 'changed'), /changed its durable payload/);
+    }
+    assert.equal(f.db.must('receptions', 's1').cursor, 'replayed');
+    assert.deepEqual(f.db.must('native', id), evidence);
+    const message = f.db.find('messages', item => item.kind === 'reply')[0]!;
+    assert.equal(message.raw, 'Original');
+    assert.deepEqual(message.attachments, attachments);
+    assert.equal(message.version, 1);
+  } finally { f.close(); }
+});
+
+test('ordinary reply attachments are retained once while native user attachments are not input', () => {
+  const f = fixture();
+  try {
+    stageDelivery(f, { state: 'accepted', nativeMessageId: 'assistant-receipt' });
+    for (const value of [attachments, attachments]) {
+      f.runtime.ingestion.apply('s1', 1, [
+        { id: 'ordinary-user', type: 'user.message', data: {
+          messageId: 'ordinary-receipt', interactionId: 'ordinary-interaction', content: 'Private Chat input', attachments: value,
+        } },
+        { id: 'ordinary-reply', type: 'assistant.message', data: {
+          messageId: 'ordinary-reply', interactionId: 'ordinary-interaction', content: 'Private Chat reply', attachments: value,
+        } },
+      ], 'ignored');
+    }
+    assert.equal(f.db.list('native').items.length, 1);
+    assert.equal(f.db.list('messageTopics').items.length, 0);
+    const replies = f.db.find('messages', message => message.kind === 'reply');
+    assert.equal(replies.length, 1);
+    assert.deepEqual(replies[0]!.attachments, attachments);
+    assert.equal(f.db.find('messages', message => message.raw === 'Private Chat input').length, 0);
+    assert.equal(f.db.find('work', work => work.kind === 'output').length, 1);
+    assert.equal(f.db.must('receptions', 's1').cursor, 'ignored');
   } finally { f.close(); }
 });

@@ -5,6 +5,16 @@ import App from '@fixture/app';
 import { ModuleRuntime } from '@fixture/runtime';
 import { ModuleRuntimeProvider } from '@fixture/components';
 
+// The synthetic server's homepage padding must not style real shared Chat frames.
+for (const sheet of document.styleSheets) {
+  if (sheet.href) continue;
+  for (const rule of sheet.cssRules) {
+    if (rule instanceof CSSStyleRule && rule.selectorText === 'main' && rule.style.padding === '24px') {
+      rule.selectorText = '.fixture-workspace > main';
+    }
+  }
+}
+
 window.fixtureNativeSends = 0;
 if (new URL(location.href).searchParams.has('probes')) sessionStorage.setItem('fixture-probes', '1');
 const runtime = new ModuleRuntime({

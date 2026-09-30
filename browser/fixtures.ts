@@ -18,7 +18,7 @@ export const longMarkdown = [
 export function publication(sequence: number, text: string, patch: Partial<TimelineItem> = {}): TimelineItem {
   return {
     id: `publication-${sequence}`, sequence, type: 'message', messageId: `message-${sequence}`,
-    topicId: 'topic-a', topicTitle: '旅行计划 A', text, anchorId: null,
+    topicId: 'topic-a', topicTitle: '旅行计划 A', topicColor: '#2563eb', text,
     sources: [], createdAt: 1_750_000_000_000 + sequence * 1000, speaker: 'assistant',
     sessionId: 'synthetic-reception', question: null, attachments: [], ...patch,
   };
@@ -125,7 +125,7 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
             attachments: structuredClone(body.attachments ?? []) as InputReceipt['message']['attachments'], topicId: null,
             assignmentVersion: 0, assignmentReason: null, sessionId: null, nativeEventId: null,
             nativeMessageId: null, nativeParentId: null, correlation: 'unknown',
-            replyTo: typeof body.replyTo === 'string' ? body.replyTo : null, historical: false,
+            historical: false,
             sequence: 100, createdAt: 1_750_000_100_000,
           }, work: [], deliveries: [], hasMore: { work: false, deliveries: false },
         });

@@ -11,8 +11,8 @@ function fixture(t: TestContext) {
   t.after(() => db.close());
   const engine = new MemoryEngine(db);
   const topic = (id: string): Topic => {
-    const value: Topic = { id, title: id, domain: null, relatedTo: [], pinned: false,
-      archived: false, independent: true, version: 1, dirtyThrough: 0, memoryThrough: 0 };
+    const value: Topic = { id, title: id, content: '', color: '#336699', sessionId: null,
+      archived: false, version: 1, dirtyThrough: 0, memoryThrough: 0 };
     db.transaction(() => db.put('topics', value));
     return value;
   };
@@ -21,7 +21,7 @@ function fixture(t: TestContext) {
     const value: Message = { id: `message-${sequence}`, kind: 'user', raw, attachments: [], version: 1, topicId,
       assignmentVersion: 1, assignmentReason: 'Initial classification', sessionId: null,
       nativeEventId: null, nativeMessageId: null, nativeParentId: null, correlation: 'unknown',
-      replyTo: null, historical: false, sequence, createdAt: sequence };
+      historical: false, sequence, createdAt: sequence };
     db.put('messages', value);
     const current = db.must('topics', topicId);
     current.dirtyThrough = sequence;

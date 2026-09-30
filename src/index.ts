@@ -89,7 +89,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return track(async () => route.handler({ ...request, signal: AbortSignal.any([request.signal, local.signal]) }));
       },
     })),
-    publicConfig: { backendOnly: true, protocolVersion: 1 },
+    publicConfig: { backendOnly: true, protocolVersion: 2 },
     async onReady() {
       if (disposed || context.signal.aborted) return;
       ready = true;
@@ -107,7 +107,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         if (event.type === 'session/added') wake(event.session.sessionId);
         else if ('sessionId' in event) {
           if (event.type === 'session/patch') {
-            const relevant = ['ask', 'decisions', 'loaded', 'status', 'closing', 'currentModelId',
+            const relevant = ['ask', 'decisions', 'loaded', 'status', 'activity', 'closing', 'currentModelId',
               'roles', 'appliedRoles', 'rolesNeedReload'];
             if (!relevant.some(key => key in event)) return;
           }

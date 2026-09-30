@@ -28,34 +28,38 @@ const cycleKey = (topicId: string, kind: 'memory' | 'handoff'): string =>
 export class MemoryEngine {
   constructor(private readonly db: Database) {}
 
+  private messages(topicId: string): Message[] {
+    const ids = new Set(this.db.find('messageTopics', item => item.topicId === topicId).map(item => item.messageId));
+    return this.db.find('messages', message => message.topicId === topicId || ids.has(message.id));
+  }
+
   schedule(topicId: string, kind: 'memory' | 'handoff' = 'memory'): Work | null {
     this.db.must('topics', topicId);
     requireFact(kind === 'memory' || kind === 'handoff', 'WORK_KIND', 'Unsupported memory work kind', 400);
-    const messages = this.db.find('messages', message => message.topicId === topicId)
+    const messages = this.messages(topicId)
       .sort((left, right) => left.sequence - right.sequence);
     if (!messages.length) return null;
     const cutoff = messages[messages.length - 1]!.sequence;
     this.db.setMeta(cycleKey(topicId, kind), Math.max(cutoff, this.db.meta(cycleKey(topicId, kind), 0)));
     const active = this.db.find('work', work => work.topicId === topicId && work.kind === kind
       && (work.state === 'pending' || work.state === 'leased'));
-    if (kind === 'handoff' && !active.length && messages.every(message => this.covered(message, kind))) {
+    if (kind === 'handoff' && !active.length && messages.every(message => this.covered(message, kind, topicId))) {
       // Only an explicit request can start another handoff over already covered evidence.
       for (const message of messages) this.db.setMeta(coverageKey(topicId, message.id, kind), null);
     }
     return this.enqueue(topicId, kind);
   }
 
-  private covered(message: Message, kind: 'memory' | 'handoff'): boolean {
-    return message.topicId !== null
-      && this.db.meta<string | null>(coverageKey(message.topicId, message.id, kind), null) === sourceKey(sourceOf(message));
+  private covered(message: Message, kind: 'memory' | 'handoff', topicId: string): boolean {
+    return this.db.meta<string | null>(coverageKey(topicId, message.id, kind), null) === sourceKey(sourceOf(message));
   }
 
   private completedThrough(topicId: string): number {
-    const messages = this.db.find('messages', message => message.topicId === topicId)
+    const messages = this.messages(topicId)
       .sort((left, right) => left.sequence - right.sequence);
     let through = 0;
     for (const message of messages) {
-      if (!this.covered(message, 'memory')) break;
+      if (!this.covered(message, 'memory', topicId)) break;
       through = message.sequence;
     }
     return through;
@@ -63,8 +67,8 @@ export class MemoryEngine {
 
   private enqueue(topicId: string, kind: 'memory' | 'handoff'): Work | null {
     const cutoff = this.db.meta(cycleKey(topicId, kind), 0);
-    const dirty = this.db.find('messages', message => message.topicId === topicId
-      && message.sequence <= cutoff && !this.covered(message, kind))
+    const dirty = this.messages(topicId).filter(message =>
+      message.sequence <= cutoff && !this.covered(message, kind, topicId))
       .sort((left, right) => left.sequence - right.sequence);
     const active = this.db.find('work', work => work.topicId === topicId && work.kind === kind
       && (work.state === 'pending' || work.state === 'leased'));
@@ -100,7 +104,7 @@ export class MemoryEngine {
     const allowed = new Set(saved.sources.map(sourceKey));
     for (const source of saved.sources) {
       const message = this.db.get('messages', source.messageId);
-      requireFact(message && message.topicId === topic.id && message.sequence <= saved.through
+      requireFact(message && this.messages(topic.id).some(item => item.id === message.id) && message.sequence <= saved.through
         && message.version === source.version && message.assignmentVersion === source.assignmentVersion,
       'STALE_SOURCE', 'Memory source was changed, removed, or reclassified');
     }
@@ -157,6 +161,8 @@ export class MemoryEngine {
     const message = this.db.must('messages', messageId);
     const affected = new Set<string>();
     if (message.topicId) affected.add(message.topicId);
+    for (const relation of this.db.find('messageTopics', item => item.messageId === messageId))
+      affected.add(relation.topicId);
     for (const memory of this.db.find('memories', item =>
       item.valid && item.sources.some(source => source.messageId === messageId))) {
       memory.valid = false;
@@ -207,6 +213,8 @@ export class MemoryEngine {
     const topics = new Set(this.db.find('work', work => work.role === 'memory'
       && work.sources.some(source => source.messageId === messageId)).flatMap(work => work.topicId ? [work.topicId] : []));
     if (current.topicId) topics.add(current.topicId);
+    for (const relation of this.db.find('messageTopics', item => item.messageId === messageId))
+      topics.add(relation.topicId);
     for (const topicId of topics) {
       const topic = this.db.must('topics', topicId);
       topic.memoryThrough = this.completedThrough(topicId);

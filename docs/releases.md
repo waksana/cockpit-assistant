@@ -23,7 +23,8 @@ credentials are not persisted; package read credentials are limited to install.
 Source package, lock and module manifests remain `0.0.0-dev`. A private packaging
 stage receives `0.0.0-rolling.N`; no generated version is committed. The immutable
 lightweight tag `v0.0.0-rolling.N` points to that exact merged commit.
-The npm SDK dependency remains exactly `0.9.0`, independently versioned.
+The npm SDK dependency is exactly `0.11.1`, independently published to GitHub
+Packages. Its version is not a substitute for the host capability checks below.
 
 Each Release contains exactly four assets:
 
@@ -41,15 +42,16 @@ archive root and as a sidecar. Format 2, channel `rolling`, uses the public
 Independent checksum files avoid a self-referential archive digest.
 
 The product is module **`assistant`**, backend API 1, requiring public frontend
-API 3, public components/owner drafts v1, draft submission v2,
+API 3, public components/conversation presentation/owner drafts v1, draft submission v2,
 module pages/message presentation/menu/UI/surfaces v1, service readiness, chat reads, ask
 responses, resource preparation, role assignments, session discovery and session
-load v1. These capabilities are available in host
-commit `4c1b9e31911e7a121faff13521552135b712f93f` (Rolling.23).
+load v1. Internal coordinator and memory batch isolation additionally requires
+`promptReceipt.v1` and native MCP `toolCallId` metadata. Earlier hosts without
+these capabilities cannot run protocol 2 consumers.
 Required intents are extracted from actual host calls. The database declaration
 is derived from the real database initialized **in memory**, enumerating all
 application tables/columns for preservation. It declares `assistant.sqlite`,
-schema 1, and `migrations: []`. A different existing schema is not compatible;
+schema 2, and `migrations: []`. A different existing schema is not compatible;
 there is no automatic migration and no production data is inspected by packaging.
 
 Publication creates a draft prerelease, uploads each asset once, downloads every

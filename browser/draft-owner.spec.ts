@@ -17,10 +17,9 @@ async function close(page: Page) {
   await expect(page).toHaveURL(/\/$/);
   await expect(page.locator('.ca-page')).toHaveCount(0);
 }
-async function receipts(page: Page) {
-  const toggle = page.getByRole('button', { name: '发送回执', exact: true });
-  await expect(toggle).toBeVisible();
-  if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click();
+async function pendingRecovery(page: Page) {
+  await expect(page.getByText(/暂时无法确认发送状态/)).toBeVisible();
+  await expect(page.getByRole('button', { name: '发送回执', exact: true })).toHaveCount(0);
 }
 function clean(fixture: Awaited<ReturnType<typeof installFixture>>) {
   expect(fixture.consoleErrors).toEqual([]);
@@ -49,7 +48,7 @@ for (const selected of [false, true]) {
     await expect(page.locator('[data-ca-item]').getByText('history.txt')).toBeVisible();
     const events = await page.evaluate(() => window.assistantProbe.events);
     expect(events.some(event => event.boundary === 'message'
-      && JSON.stringify(event.identity) === JSON.stringify({ owner: 'assistant', id: 'publication-1', kind: 'message', role: 'user' }))).toBe(true);
+      && JSON.stringify(event.identity) === JSON.stringify({ owner: 'assistant', id: 'message:message-1', kind: 'message', role: 'user' }))).toBe(true);
     expect(events.some(event => event.boundary === 'attachment'
       && JSON.stringify(event.attachment) === JSON.stringify(attachment))).toBe(true);
     expect(events.every(event => event.origin === undefined)).toBe(true);
@@ -100,7 +99,7 @@ test('late receipt ACK only removes captured file/text, preserving concurrent ed
   clean(fixture);
 });
 
-test('unknown receipt restores after page refresh and inspection settles without reposting', async ({ page }) => {
+test('unknown input restores after page refresh and automatically settles without reposting', async ({ page }) => {
   const fixture = await installFixture(page, { items: [], hasOlder: false,
     post: async (_post, route) => { await route.abort('failed'); return true; },
   });
@@ -108,17 +107,15 @@ test('unknown receipt restores after page refresh and inspection settles without
   await editor(page).fill('uncertain');
   await page.evaluate(() => window.assistantProbe.add('persisted.txt'));
   await send(page).click();
-  await receipts(page);
-  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('未知');
+  await pendingRecovery(page);
   const requestId = fixture.posts[0]?.body.requestId;
   await close(page); await open(page);
   await expect(send(page)).toBeDisabled();
   await page.reload(); await open(page);
-  await receipts(page);
+  await pendingRecovery(page);
   await expect(editor(page)).toHaveValue('uncertain');
   await expect(page.getByTestId('synthetic-files')).toHaveText('persisted.txt');
   await expect(send(page)).toBeDisabled();
-  await page.getByRole('button', { name: '检查发送回执' }).click();
   await expect(editor(page)).toHaveValue('');
   await expect(page.getByTestId('synthetic-files')).toHaveText('');
   expect(fixture.posts).toHaveLength(1);
@@ -135,8 +132,6 @@ test('field ACK failure retains its file and reconciliation retries ACK, never t
   await expect.poll(() => page.evaluate(() => window.assistantProbe.snapshot().unconfirmed)).toBe(true);
   await expect(page.getByTestId('synthetic-files')).toHaveText('retain.txt');
   await page.evaluate(() => { window.assistantProbe.failAck = false; });
-  await receipts(page);
-  await page.getByRole('button', { name: '检查发送回执' }).click();
   await expect(page.getByTestId('synthetic-files')).toHaveText('');
   expect(fixture.posts).toHaveLength(1);
   expect(fixture.seenUnexpected).toEqual([]);
@@ -144,7 +139,7 @@ test('field ACK failure retains its file and reconciliation retries ACK, never t
   expect(fixture.consoleErrors.every(error => error.includes('Synthetic file ACK failure'))).toBe(true);
 });
 
-test('historical replyTo unknown transaction is reconciled by GET with its frozen input, never replayed', async ({ page }) => {
+test('historical flat unknown transaction is reconciled by GET with its frozen input, never replayed', async ({ page }) => {
   const fixture = await installFixture(page, { items: [], hasOlder: false,
     post: async (_post, route) => { await route.abort('failed'); return true; },
   });
@@ -152,8 +147,7 @@ test('historical replyTo unknown transaction is reconciled by GET with its froze
   await editor(page).fill('历史未确认输入');
   await page.evaluate(() => window.assistantProbe.add('legacy.txt'));
   await send(page).click();
-  await receipts(page);
-  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('未知');
+  await pendingRecovery(page);
   const requestId = String(fixture.posts[0]!.body.requestId);
   await close(page);
   await page.evaluate(() => window.stopFixture());
@@ -168,7 +162,6 @@ test('historical replyTo unknown transaction is reconciled by GET with its froze
         const transaction = (value as { transaction?: { request?: { version?: number; payload?: Record<string, unknown> } } }).transaction;
         if (transaction?.request?.payload?.requestId !== requestId) continue;
         transaction.request.version = 1;
-        transaction.request.payload.replyTo = 'legacy-anchor-frozen';
         sessionStorage.setItem(key, JSON.stringify(root));
         changed++;
       }
@@ -176,16 +169,12 @@ test('historical replyTo unknown transaction is reconciled by GET with its froze
     return changed;
   }, requestId);
   expect(changed).toBe(1);
-  const legacy = fixture.receipts.get(requestId)!;
-  legacy.input = { ...legacy.input, replyTo: 'legacy-anchor-frozen' };
-  legacy.message.replyTo = 'legacy-anchor-frozen';
   await page.reload(); await open(page);
-  await receipts(page);
+  await pendingRecovery(page);
   await expect(send(page)).toBeDisabled();
-  await page.getByRole('button', { name: '检查发送回执' }).click();
   await expect(editor(page)).toHaveValue('');
   await expect(page.getByTestId('synthetic-files')).toHaveText('');
-  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('已接受');
+  await expect(page.getByText(/暂时无法确认发送状态/)).toHaveCount(0);
   expect(fixture.posts).toHaveLength(1);
   expect(fixture.requests.filter(request => request.path === `/inputs/${requestId}`).length).toBeGreaterThan(0);
   clean(fixture);
@@ -198,7 +187,7 @@ test('legacy selected reply business state migrates without attaching an anchor 
   await close(page);
   await page.evaluate(() => window.stopFixture());
   const legacyReply = publication(1, '旧版被选中的问题', {
-    anchorId: 'legacy-selected-anchor', type: 'question',
+    type: 'question',
     question: { state: 'pending', stateVersion: 1, choices: ['旧选项'], allowFreeform: false },
   });
   const changed = await page.evaluate(reply => {
@@ -251,14 +240,11 @@ test('restored unknown ACK preserves newly edited text and attachment identities
   await editor(page).fill('original text');
   await page.evaluate(() => window.assistantProbe.add('original.txt'));
   await send(page).click();
-  await receipts(page);
-  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('未知');
+  await pendingRecovery(page);
   await page.reload(); await open(page);
   await editor(page).fill('edited after restoration');
   await page.evaluate(() => window.assistantProbe.add('new.txt'));
   const newItem = await page.evaluate(() => window.assistantProbe.snapshot().items.at(-1));
-  await receipts(page);
-  await page.getByRole('button', { name: '检查发送回执' }).click();
   await expect(page.getByTestId('synthetic-files')).toHaveText('new.txt');
   await expect(editor(page)).toHaveValue('edited after restoration');
   expect(await page.evaluate(() => window.assistantProbe.snapshot().items)).toEqual([newItem]);
@@ -300,11 +286,9 @@ test('pending receipt lookup survives reload; all native descriptor shapes are c
   await page.reload();
   release();
   await open(page);
-  await receipts(page);
-  await expect(page.getByRole('article', { name: '发送回执' })).toContainText('未知');
+  await pendingRecovery(page);
   await expect(page.getByTestId('synthetic-files')).toHaveText('tree, selection, blob');
   await expect(send(page)).toBeDisabled();
-  await page.getByRole('button', { name: '检查发送回执' }).click();
   await expect(page.getByTestId('synthetic-files')).toHaveText('');
   expect(fixture.posts).toHaveLength(1);
   clean(fixture);
@@ -350,7 +334,9 @@ test('choice-only historical asks do not bind the owner or forbid ordinary text 
   await expect(editor(page)).toHaveCount(1);
   await page.evaluate(() => window.assistantProbe.edit('freeform'));
   await expect(send(page)).toBeEnabled();
-  await page.getByRole('button', { name: 'yes', exact: true }).click();
+  await expect(page.getByRole('listitem')).toHaveText(['yes', 'no']);
+  await expect(page.getByRole('button', { name: 'yes', exact: true })).toHaveCount(0);
+  await editor(page).fill('yes');
   await page.evaluate(() => window.assistantProbe.capture());
   await expect(editor(page)).toHaveValue('yes');
   await page.evaluate(() => window.assistantProbe.sendCaptured());

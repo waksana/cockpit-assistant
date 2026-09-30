@@ -6,15 +6,17 @@ import { nativeTypes } from './ingestion.ts';
 export function nativeAccess(host: ModuleHostApi): NativeAccess {
   requireFact(host.chatReadVersion === 1 && host.askResponseVersion === 1
     && host.resourcePreparationVersion === 1 && host.roleAssignmentVersion === 1
-    && host.sessionDirectoryVersion === 1 && host.sessionLoadVersion === 1,
+    && host.sessionDirectoryVersion === 1 && host.sessionLoadVersion === 1
+    && 'promptReceiptVersion' in host && host.promptReceiptVersion === 1,
   'HOST_CAPABILITY', 'Assistant requires chatReadVersion, askResponseVersion, resourcePreparationVersion, '
-    + 'roleAssignmentVersion, sessionDirectoryVersion and sessionLoadVersion 1');
+    + 'roleAssignmentVersion, sessionDirectoryVersion, sessionLoadVersion and promptReceiptVersion 1');
   return {
     host,
-    async read(sessionId, cursor, bootstrap, backward = false) {
+    async read(sessionId, cursor, bootstrap, backward = false, all = false) {
       return host.call('session/chat', {
         sessionId, source: 'live', direction: bootstrap || backward ? 'backward' : 'forward',
-        max: 64, waitMs: 0, bootstrap, agentScope: 'primary', types: nativeTypes,
+        max: 64, waitMs: 0, bootstrap, agentScope: 'primary',
+        types: all ? ['user.message', 'assistant.message'] : nativeTypes,
         ...(cursor === null ? {} : { cursor }),
       });
     },

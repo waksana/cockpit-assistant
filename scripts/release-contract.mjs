@@ -46,8 +46,10 @@ export async function product(root) {
     ['src/native.ts', 'host.roleAssignmentVersion === 1'],
     ['src/native.ts', 'host.sessionDirectoryVersion === 1'],
     ['src/native.ts', 'host.sessionLoadVersion === 1'],
+    ['src/native.ts', 'host.promptReceiptVersion === 1'],
     ['frontend/index.ts', 'context.apiVersion !== 3'],
     ['frontend/index.ts', 'context.publicComponentsVersion !== 1'],
+    ['frontend/index.ts', 'context.conversationPresentationVersion !== 1'],
     ['frontend/index.ts', 'context.draftOwnerVersion !== 1'],
     ['frontend/index.ts', 'context.draftSubmissionVersion !== 2'],
     ['frontend/index.ts', 'context.pageVersion !== 1'],
@@ -61,17 +63,17 @@ export async function product(root) {
   const db = new Database(':memory:');
   try {
     const schema = db.sql.prepare('PRAGMA user_version').get().user_version;
-    assert.equal(schema, 1, 'Review schema changes; no automatic migration is declared');
+    assert.equal(schema, 2, 'Review schema changes; no automatic migration is declared');
     const preserve = db.sql.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
       .all().map(({ name }) => {
-        assert.match(name, /^[a-z_]+$/);
+        assert.match(name, /^[a-zA-Z_][a-zA-Z0-9_]*$/);
         return { table: name, columns: db.sql.prepare(`PRAGMA table_info("${name}")`).all().map(row => row.name) };
       });
     return {
       kind: 'module', id: manifest.id, hostApi: { min: 1, max: 1 },
       requiresCapabilities: ['module-api.v1', 'serviceReady.v1', 'chatRead.v1', 'askResponse.v1',
-        'resourcePreparation.v1', 'roleAssignment.v1', 'sessionDirectory.v1', 'sessionLoad.v1',
-        'frontend-api.v3', 'publicComponents.v1', 'draftOwner.v1', 'draftSubmission.v2',
+        'resourcePreparation.v1', 'roleAssignment.v1', 'sessionDirectory.v1', 'sessionLoad.v1', 'promptReceipt.v1',
+        'frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2',
         'page.v1', 'messagePresentation.v1', 'menu.v1', 'ui.v1', 'uiSurface.v1'],
       requiredIntents: [...new Set(Object.values(sources).flatMap(source =>
         [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1])))].sort(),
@@ -106,7 +108,7 @@ export function verifyAssets(directory, expected, expectedProduct) {
     assert.equal(value.version, expected.version);
     if (name === 'module-build.json') {
       assert.equal(value.sourceSha, expected.sourceSha);
-      assert.equal(value.sdk, '0.9.0');
+      assert.equal(value.sdk, '0.11.1');
       assert.equal(value.platform, 'linux');
       assert.match(value.node, /^24\./);
     }

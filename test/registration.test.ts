@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { NativeChatEvent } from '@waksana/cockpit-module-sdk/backend';
-import { fixture, proof } from './fixtures.ts';
+import { fixture, stageDelivery } from './fixtures.ts';
 
 const coordinator = { moduleId: 'assistant', roleId: 'coordinator', moduleName: 'Assistant', name: 'coordinator' };
 const memory = { ...coordinator, roleId: 'memory', name: 'memory' };
@@ -30,7 +30,7 @@ test('saved roles register before readiness, retire old work, and replay without
   const f = fixture();
   try {
     const input = f.service.accept({ requestId: 'input', text: 'Hello' });
-    f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id);
+    f.db.put('work', { ...input.work, state: 'leased', epoch: 1 });
     f.metas.delete('coordinator');
     f.metas.set('new-carrier', { ...f.metas.get('s1')!, sessionId: 'new-carrier', roles: [coordinator],
       loaded: false, currentModelId: undefined, rolesNeedReload: true });
@@ -70,7 +70,7 @@ test('carrier event verifies a registered loaded replacement and resumes retired
   const f = fixture();
   try {
     const input = f.service.accept({ requestId: 'resume-input', text: 'Waiting for coordinator' });
-    f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id);
+    f.db.put('work', { ...input.work, state: 'leased', epoch: 1 });
     f.metas.delete('coordinator');
     f.metas.set('replacement', { ...f.metas.get('s1')!, sessionId: 'replacement',
       roles: [coordinator], appliedRoles: [coordinator], rolesNeedReload: false });
@@ -140,10 +140,7 @@ test('ordinary sessions need no enrollment while saved and applied internal role
 test('converting an observed session to an internal role cancels pending ordinary effects once', async () => {
   const f = fixture();
   try {
-    const input = f.service.accept({ requestId: 'input', text: 'Hello' });
-    const work = f.service.claim(f.identities.coordinator, 'coordinator', 1, input.work.id)!;
-    f.service.decide(f.identities.coordinator, { ...proof(work), topic: { title: 'T', independent: true },
-      reason: 'Target existing ordinary session', action: { kind: 'route', sessionIds: ['s1'], routeVersion: 0 } });
+    stageDelivery(f);
     f.metas.get('s1')!.roles = [coordinator];
     await f.runtime.observe('s1');
     assert.equal(f.db.list('deliveries').items[0]!.state, 'cancelled');
@@ -163,7 +160,7 @@ test('initial history stays historical but a completed response observed live be
     await f.runtime.observe('fresh');
     const old = reply('old');
     const live = reply('live');
-    f.runtime.noteEvent('fresh', live[2]!);
+    f.runtime.noteEvent('fresh', live.find(event => event.type === 'assistant.message')!);
     f.pages.push({ events: [...old, ...live], cursor: 'back', liveCursor: 'tail', cursorStatus: 'ok', hasMore: false });
     await f.runtime.consume('fresh');
     const messages = f.db.list('messages').items;

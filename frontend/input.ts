@@ -58,12 +58,15 @@ export function createInput(context: InputContext, changed: () => void) {
           .parse(JSON.parse(z.string().parse(stored.value)));
         return { version: 2 as const, actionRevision: saved.actionRevision,
           submissions: saved.submissions.map(entry => entry.state === 'pending'
-          ? { ...entry, state: 'unknown' as const, detail: '页面已重新加载；请检查原提交回执，不会重发' } : entry) };
+          ? { ...entry, state: 'unknown' as const, detail: '正在恢复发送状态，草稿已保留' } : entry) };
       },
     },
   });
   let availability = { open: false, ready: false, referenceText: undefined as string | undefined };
   let disposed = false;
+  let recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  let recovering = false;
+  let recoveryDelay = 1500;
   const request = async (path: string, init?: RequestInit): Promise<unknown> => {
     const response = await context.request(path, { ...init, signal: context.signal });
     const value: unknown = await response.json();
@@ -126,7 +129,7 @@ export function createInput(context: InputContext, changed: () => void) {
           const error = z.object({ error: z.object({ code: z.string(), message: z.string() }) })
             .safeParse(await response.json());
           if (error.success && response.status < 500) {
-            const reason = `${error.data.error.code}: ${error.data.error.message}`;
+            const reason = error.data.error.message;
             setSubmission(saved.payload.requestId, { state: 'error', detail: reason });
             return { status: 'rejected', reason };
           }
@@ -170,7 +173,33 @@ export function createInput(context: InputContext, changed: () => void) {
       ...(availability.referenceText ? { referenceText: availability.referenceText } : {}),
     };
   };
-  const sync = () => { if (!disposed) owner.update(facts()); };
+  const scheduleRecovery = () => {
+    const draft = owner.reference.getSnapshot();
+    if (disposed || !availability.open || !draft.unconfirmed) {
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      recoveryTimer = null;
+      recoveryDelay = 1500;
+      return;
+    }
+    if (recoveryTimer || recovering || draft.pending || !draft.submissionId) return;
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = null;
+      const submissionId = owner.reference.getSnapshot().submissionId;
+      if (!submissionId || disposed || !availability.open) return;
+      recovering = true;
+      // Reconciliation reads the saved request only; it never repeats the POST.
+      void owner.reconcile(submissionId).catch(error => context.report(error)).finally(() => {
+        recovering = false;
+        recoveryDelay = Math.min(recoveryDelay * 2, 30_000);
+        scheduleRecovery();
+      });
+    }, recoveryDelay);
+  };
+  const sync = () => {
+    if (disposed) return;
+    owner.update(facts());
+    scheduleRecovery();
+  };
   const offBusiness = scope.subscribe(() => { sync(); changed(); });
   const offDraft = owner.reference.subscribe(() => { sync(); changed(); });
   sync();
@@ -209,6 +238,10 @@ export function createInput(context: InputContext, changed: () => void) {
           detail: `输入已保存；投递：${deliveryDetail(proof.deliveries)}（接受不代表完成）` });
       }
     },
-    dispose() { disposed = true; offBusiness(); offDraft(); },
+    dispose() {
+      disposed = true;
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      offBusiness(); offDraft();
+    },
   };
 }

@@ -8,7 +8,7 @@ import { prepareReleases } from '../browser/release-fixtures.mjs';
 
 export const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const output = join(root, 'node_modules/.cache/assistant-browser');
-export const hostRevision = '4c1b9e31911e7a121faff13521552135b712f93f';
+export const hostRevision = 'e54d3d160852d0ea78b18184de84f160f8aad519';
 export const host = process.env.COCKPIT_FIXTURE_HOST
   ? resolve(process.env.COCKPIT_FIXTURE_HOST) : join(output, 'host');
 const require = createRequire(import.meta.url);

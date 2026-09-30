@@ -63,7 +63,7 @@ async function measureRows(rows: Locator) {
 test('complete public messages match real native Chat rows, Markdown, spacing, time and attachments', async ({ page }) => {
   const items = chatReference.map((message, index) => publication(index + 1, message.content, {
     id: message.id, messageId: message.id, speaker: message.role, createdAt: message.timestamp,
-    attachments: message.attachments ?? [],
+    attachments: message.attachments ?? [], topicId: null, topicTitle: null, topicColor: null,
   }));
   const fixture = await installFixture(page, { items, hasOlder: false });
   await page.goto('/?transcript=1');
@@ -89,6 +89,55 @@ test('complete public messages match real native Chat rows, Markdown, spacing, t
   await expect(assistantRows.nth(4)).toContainText('已经收到附件，最后一条回答完整可见。');
   await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toBeInViewport();
   await expect(page.locator('.ca-topic-heading, .ca-message-sources')).toHaveCount(0);
+  clean(fixture);
+});
+
+test('the shared Composer dock matches native Chat geometry and stays within the page with a long draft', async ({ page }) => {
+  const fixture = await installFixture(page, { items: chatReference.map((message, index) =>
+    publication(index + 1, message.content, { speaker: message.role, attachments: message.attachments ?? [] })),
+  hasOlder: false });
+  const measure = (root: Locator) => root.locator('.chat-input-area').evaluate(dock => {
+    const properties = ['font-family', 'font-size', 'line-height', 'color', 'background-color',
+      'border', 'border-radius', 'padding', 'margin', 'gap', 'max-height'];
+    const nodes = [dock, ...dock.querySelectorAll('.chat-input-card, .chat-input-card-body, textarea, .chat-input-btn')];
+    return nodes.map(node => {
+      const rect = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      return {
+        tag: node.tagName, x: rect.x, bottomInset: window.innerHeight - rect.bottom,
+        width: rect.width, height: rect.height,
+        css: Object.fromEntries(properties.map(property => [property, style.getPropertyValue(property)])),
+      };
+    });
+  });
+  const draftText = Array.from({ length: 30 }, (_, index) => `第 ${index + 1} 行：保留原始输入的完整内容。`).join('\n');
+  await page.goto('/?transcript=1');
+  await page.getByRole('button', { name: '选择合成会话', exact: true }).click();
+  const nativeRoot = page.getByTestId('selected-session');
+  const nativeEditor = nativeRoot.getByRole('textbox', { name: '消息输入', exact: true });
+  await nativeEditor.fill('短草稿');
+  const nativeShort = await measure(nativeRoot);
+  await nativeEditor.fill(draftText);
+  const nativeLong = await measure(nativeRoot);
+  await page.getByRole('button', { name: '全局菜单', exact: true }).click();
+  await page.getByRole('menuitem', { name: '助手', exact: true }).click();
+  await ready(page);
+  const assistantRoot = page.locator('.ca-page');
+  await expect(assistantRoot.locator('> .chat')).toHaveCount(1);
+  await expect(assistantRoot.locator('> .pane-header.chat-topbar')).toHaveCount(1);
+  await expect(assistantRoot.locator('> .chat > .chat-transcript')).toHaveCount(1);
+  await expect(assistantRoot.locator('.chat-input-notices')).toHaveCount(1);
+  const editor = assistantRoot.getByRole('textbox', { name: '消息输入', exact: true });
+  await editor.fill('短草稿');
+  expect(await measure(assistantRoot)).toEqual(nativeShort);
+  await editor.fill(draftText);
+  expect(await measure(assistantRoot)).toEqual(nativeLong);
+  await expect(assistantRoot.locator('.chat-input-area')).toBeInViewport({ ratio: 1 });
+  await expect(assistantRoot.getByRole('button', { name: '发送', exact: true })).toBeInViewport({ ratio: 1 });
+  await expect(editor).toHaveValue(draftText);
+  expect(await page.locator('.ca-scroller').evaluate(element => element.clientHeight)).toBeGreaterThan(100);
+  await expect(assistantRoot.locator('.chat-input-area')).toHaveCount(1);
+  await expect(assistantRoot.locator('.chat-input-card')).toHaveCount(1);
   clean(fixture);
 });
 
@@ -132,7 +181,7 @@ test('interleaved status, wake, risk and correction retain only natural conversa
     system(2, '内部状态消息不得显示'),
     publication(3, '需要修正的旧正文', { messageId: target, sources: [source(target)], sessionId: provenance }),
     system(4, '唤醒通知不得显示'),
-    system(5, '风险报告不得显示', 'risk'),
+    system(5, '风险报告不得显示', 'attribution'),
     publication(6, '第二个自然问题', { speaker: 'user', topicId: 'another-topic', topicTitle: '内部主题标题' }),
     publication(7, '内部修正通知不得显示', {
       type: 'correction', speaker: 'system', messageId: target, sources: [source(target, 2)],
@@ -151,13 +200,14 @@ test('interleaved status, wake, risk and correction retain only natural conversa
   const conversation = page.getByRole('region', { name: '对话记录', exact: true });
   await expect(conversation).not.toContainText(/内部|唤醒通知|风险报告|需要修正的旧正文|synthetic-reception|topic-a/);
   await expect(conversation).not.toContainText(provenance);
-  await expect(conversation.locator('.ca-topic-heading, .message.is-system')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: /条新消息，查看最新/ })).toHaveCount(0);
+  await expect(conversation.locator('.ca-topic-heading')).toHaveCount(2);
+  await expect(conversation.locator('.message.is-system')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
   clean(fixture);
 });
 
 test('a system-only history is an empty conversation, not notification bubbles or an empty-state card', async ({ page }) => {
-  const items = [system(1, '内部状态'), system(2, '内部唤醒'), system(3, '内部风险', 'risk'),
+  const items = [system(1, '内部状态'), system(2, '内部唤醒'), system(3, '内部风险', 'attribution'),
     system(4, '内部修正', 'correction'), system(5, '内部 carrier 原文', 'message')];
   const fixture = await installFixture(page, { items, hasOlder: false });
   await page.goto('/modules/assistant/main');
@@ -173,13 +223,13 @@ test('a system-only history is an empty conversation, not notification bubbles o
   clean(fixture);
 });
 
-test('revision projection preserves same-version summaries and clarification while applying only newer target snapshots', async ({ page }) => {
+test('revision projection shows original replies and clarification while applying newer target snapshots', async ({ page }) => {
   const summaryId = 'summary-message';
   const correctedId = 'status-corrected-message';
   const items = [
     publication(1, 'coordinator 已发布的同版本自然摘要', {
       messageId: summaryId, sources: [source(summaryId)],
-      revision: { version: 1, text: '同版本原始正文不得覆盖摘要', attachments: [] },
+      revision: { version: 1, text: '同版本完整原始正文', attachments: [] },
     }),
     publication(2, '待修正的第二条正文', { messageId: correctedId, sources: [source(correctedId)] }),
     publication(3, '请补充这条输入的背景', { type: 'clarification', messageId: correctedId }),
@@ -198,25 +248,25 @@ test('revision projection preserves same-version summaries and clarification whi
   await ready(page);
   const rows = page.locator('[data-ca-item]');
   await expect(rows).toHaveCount(3);
-  await expect(rows.nth(0)).toContainText('coordinator 已发布的同版本自然摘要');
+  await expect(rows.nth(0)).toContainText('同版本完整原始正文');
   await expect(rows.nth(1)).toContainText('只更新第二条的完整正文');
   await expect(rows.nth(1)).toContainText('revised.txt');
   await expect(rows.nth(2)).toContainText('请补充这条输入的背景');
   await expect(page.getByRole('region', { name: '对话记录', exact: true }))
-    .not.toContainText(/内部|同版本原始正文|旧版本不得回退|待修正的第二条/);
-  await expect(page.getByRole('button', { name: /条新消息，查看最新/ })).toHaveCount(0);
+    .not.toContainText(/内部|coordinator 已发布|旧版本不得回退|待修正的第二条/);
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
   clean(fixture);
 });
 
 test('multiple system-only history pages are traversed until older real conversation becomes readable', async ({ page }) => {
   const visited: number[] = [];
   const fixture = await installFixture(page, {
-    items: [system(90, '最新内部状态'), system(91, '最新内部风险', 'risk')], hasOlder: true,
+    items: [system(90, '最新内部状态'), system(91, '最新内部风险', 'attribution')], hasOlder: true,
     read: async (url, route) => {
       if (!url.pathname.endsWith('/timeline') || !url.searchParams.has('before')) return false;
       const before = Number(url.searchParams.get('before'));
       visited.push(before);
-      const items = before === 90 ? [system(60, '第二页内部状态'), system(61, '第二页内部风险', 'risk')]
+      const items = before === 90 ? [system(60, '第二页内部状态'), system(61, '第二页内部风险', 'attribution')]
         : before === 60 ? [system(30, '第三页内部唤醒'), system(31, '第三页内部修正', 'correction')]
           : before === 30 ? [publication(1, '较早的真实用户问题', { speaker: 'user' }),
             publication(2, '较早的完整助手回答')] : [];
@@ -260,12 +310,64 @@ test('a later history read with newer question state overrides a higher-sequence
   await expect(page.locator('[data-ca-item]')).toHaveCount(1);
   await expect(page.getByText('应该仍可选择的原始问题', { exact: true })).toBeVisible();
   await expect(page.getByRole('region', { name: '对话记录', exact: true })).not.toContainText('内部');
-  await page.getByRole('button', { name: '使用新状态的选项', exact: true }).click();
+  await expect(page.getByRole('listitem')).toHaveText(['使用新状态的选项']);
+  await expect(page.getByRole('button', { name: '使用新状态的选项', exact: true })).toHaveCount(0);
+  await page.getByRole('textbox', { name: '消息输入', exact: true }).fill('使用新状态的选项');
   await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toHaveValue('使用新状态的选项');
   clean(fixture);
 });
 
-test('hidden SSE advances the raw cursor and corrects text without unread; only new dialogue increments unread', async ({ page }) => {
+test('classification SSE adds a colored heading to the original visible reply without another bubble', async ({ page }) => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const unclassified = { topicId: null, topicTitle: null, topicColor: null, topicAssignmentVersion: 0 };
+  const initial = [
+    publication(1, '查天气，再检查代码', { ...unclassified, speaker: 'user' }),
+    publication(2, '这是分类前已经显示的完整原回复', unclassified),
+    publication(3, longMarkdown, unclassified),
+  ];
+  const assignment = publication(4, '内部归属判断，不是新回复', {
+    type: 'attribution', speaker: 'system', messageId: initial[1]!.messageId,
+    topicId: 'weather', topicTitle: '杭州天气', topicColor: '#059669', topicAssignmentVersion: 1,
+  });
+  let first = true;
+  const fixture = await installFixture(page, { items: initial, hasOlder: false,
+    stream: async (_after, route) => {
+      if (!first) return false;
+      first = false;
+      await gate;
+      fixture.setTimeline([...initial, assignment]);
+      await route.fulfill({ contentType: 'text/event-stream', body: streamBody([assignment, assignment]) });
+      return true;
+    },
+  });
+  await page.goto('/modules/assistant/main');
+  await ready(page);
+  const reply = page.locator('[data-ca-item="publication-2"]');
+  await expect(reply).toContainText('这是分类前已经显示的完整原回复');
+  await expect(page.locator('.ca-topic-heading')).toHaveCount(0);
+  await reply.evaluate(element => { element.setAttribute('data-preserved-row', 'yes'); });
+  const scroller = page.locator('.ca-scroller');
+  await scroller.press('Home');
+  await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
+  release();
+  await expect(reply.locator('.ca-topic-heading')).toHaveText('杭州天气');
+  await expect(reply.locator('.ca-topic-heading')).toHaveCSS('border-inline-start-color', 'rgb(5, 150, 105)');
+  await expect(reply).toHaveAttribute('data-preserved-row', 'yes');
+  await expect(reply).toContainText('这是分类前已经显示的完整原回复');
+  await expect(page.locator('[data-ca-item]')).toHaveCount(3);
+  await expect(page.locator('[data-ca-item="publication-1"] .ca-topic-heading')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: '对话记录', exact: true })).not.toContainText('内部归属判断');
+  expect(await scroller.evaluate(element => element.scrollTop)).toBeLessThan(100);
+  await page.reload();
+  await ready(page);
+  await expect(page.locator('[data-ca-item]')).toHaveCount(3);
+  await expect(reply.locator('.ca-topic-heading')).toHaveText('杭州天气');
+  clean(fixture);
+});
+
+test('hidden SSE advances the raw cursor and corrects text without unread; only new dialogue marks new content', async ({ page }) => {
   let releaseHidden!: () => void;
   let releaseDialogue!: () => void;
   const hiddenGate = new Promise<void>(resolve => { releaseHidden = resolve; });
@@ -278,7 +380,7 @@ test('hidden SSE advances the raw cursor and corrects text without unread; only 
     publication(4, '当前最后一条自然回答'),
   ];
   const status = system(5, '内部唤醒状态');
-  const risk = system(6, '内部风险报告', 'risk');
+  const risk = system(6, '内部风险报告', 'attribution');
   const corrected = publication(7, '内部修正通知', {
     type: 'correction', speaker: 'system', messageId: target, sources: [source(target, 2)],
     revision: { version: 2, text: '修正后的自然正文', attachments: [] },
@@ -304,7 +406,7 @@ test('hidden SSE advances the raw cursor and corrects text without unread; only 
   await page.goto('/modules/assistant/main');
   await ready(page);
   const scroller = page.locator('.ca-scroller');
-  await scroller.evaluate(element => { element.scrollTop = 0; element.dispatchEvent(new Event('scroll')); });
+  await scroller.press('Home');
   await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
   releaseHidden();
   await expect(page.locator('[data-ca-item="publication-2"]')).toContainText('修正后的自然正文');
@@ -313,17 +415,61 @@ test('hidden SSE advances the raw cursor and corrects text without unread; only 
   await expect.poll(() => fixture.requests.some(request =>
     request.path === '/timeline/stream' && request.query.includes('after=7'))).toBe(true);
   await expect(page.locator('[data-ca-item]')).toHaveCount(4);
-  await expect(page.getByRole('button', { name: /条新消息，查看最新/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
   expect(await scroller.evaluate(element => element.scrollTop)).toBeLessThan(100);
   releaseDialogue();
   await expect(page.locator('[data-ca-item]')).toHaveCount(5);
-  await expect(page.getByRole('button', { name: '1 条新消息，查看最新', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新', exact: true })).toBeVisible();
   await expect.poll(() => fixture.requests.some(request =>
     request.path === '/timeline/stream' && request.query.includes('after=8'))).toBe(true);
   await expect(page.getByRole('region', { name: '对话记录', exact: true })).not.toContainText(/内部|修正前/);
-  await page.getByRole('button', { name: '1 条新消息，查看最新', exact: true }).click();
+  await page.getByRole('button', { name: '有新内容 · 回到最新', exact: true }).click();
   await expect(page.getByText('新增的唯一自然回答', { exact: true })).toBeInViewport();
-  await expect(page.getByRole('button', { name: /条新消息，查看最新/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
+  clean(fixture);
+});
+
+test('prepending an earlier publication of the same original retains its shared message DOM and reading anchor', async ({ page }) => {
+  const messageId = 'stable-original-across-history';
+  const text = '同一原回复不能因为读到更早发布记录而重建消息节点。';
+  const fixture = await installFixture(page, {
+    items: [publication(50, text, { messageId }), publication(51, longMarkdown)], hasOlder: true,
+    read: async (url, route) => {
+      if (!url.pathname.endsWith('/timeline') || url.searchParams.get('before') !== '50') return false;
+      await json(route, { items: [publication(1, '更早的用户原话', { speaker: 'user' }),
+        publication(2, text, { messageId })], before: 1, hasMore: false, watermark: 51 });
+      return true;
+    },
+  });
+  await page.goto('/modules/assistant/main');
+  await ready(page);
+  const scroller = page.locator('.ca-scroller');
+  await scroller.press('Home');
+  await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
+  const earlier = page.getByRole('button', { name: '加载更早消息', exact: true });
+  await earlier.focus();
+  const row = page.locator(`[data-ca-message-id="${messageId}"]`);
+  const body = row.locator('[data-message-id]');
+  const node = await row.elementHandle();
+  await row.evaluate(element => { element.setAttribute('data-preserved-row', 'yes'); });
+  const before = await body.evaluate(element => element.getBoundingClientRect().top);
+  await scroller.dispatchEvent('touchstart', { touches: [] });
+  await earlier.click();
+  await expect(row).toHaveAttribute('data-ca-item', 'publication-2');
+  await expect(earlier).toBeVisible();
+  await expect(earlier).toBeDisabled();
+  await expect(page.locator('[data-ca-item]')).toHaveCount(2);
+  await expect.poll(async () => Math.abs(before - await body.evaluate(element =>
+    element.getBoundingClientRect().top))).toBeLessThan(2);
+  await scroller.dispatchEvent('touchend', { touches: [] });
+  await scroller.dispatchEvent('scrollend');
+  await expect(page.locator('[data-ca-item]')).toHaveCount(3);
+  await expect(row).toHaveAttribute('data-preserved-row', 'yes');
+  expect(await node!.evaluate(element => element.isConnected)).toBe(true);
+  await expect.poll(async () => Math.abs(before - await body.evaluate(element =>
+    element.getBoundingClientRect().top))).toBeLessThan(2);
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新', exact: true })).toHaveCount(0);
+  await node!.dispose();
   clean(fixture);
 });
 
@@ -404,7 +550,7 @@ test('late real messageList middleware registration and revocation preserve read
     await expect.poll(() => scroller.evaluate(element =>
       element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
     await expect(page.getByText(`增长结束 ${index + 2}`, { exact: true })).toBeInViewport();
-    await expect(page.getByRole('button', { name: /条新消息，查看最新/ })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
     await expect(page.locator('[data-ca-item]')).toHaveCount(3);
     await oldViewport!.dispose();
   }

@@ -30,7 +30,7 @@ function fixture() {
   for (const [name, value] of Object.entries({
     'package.json': { version: expected.version },
     'cockpit.module.json': { version: expected.version },
-    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.9.0', platform: 'linux', node: '24.20.0' },
+    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.11.1', platform: 'linux', node: '24.20.0' },
     'cockpit-deployment.json': descriptor,
   })) writeFileSync(join(stage, name), `${JSON.stringify(value)}\n`);
   writeFileSync(join(directory, 'cockpit-deployment.json'), readFileSync(join(stage, 'cockpit-deployment.json')));
@@ -119,16 +119,17 @@ test('Descriptor derives real public requirements and all database preservation 
   assert.equal(actual.id, 'assistant');
   assert.ok(actual.requiresCapabilities.includes('page.v1'));
   assert.ok(actual.requiresCapabilities.includes('messagePresentation.v1'));
-  for (const capability of ['frontend-api.v3', 'publicComponents.v1', 'draftOwner.v1', 'draftSubmission.v2']) {
+  for (const capability of ['frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2']) {
     assert.ok(actual.requiresCapabilities.includes(capability));
   }
   assert.ok(actual.requiresCapabilities.includes('chatRead.v1'));
+  assert.ok(actual.requiresCapabilities.includes('promptReceipt.v1'));
   assert.ok(actual.requiredIntents.includes('session/chat'));
   assert.ok(actual.requiredIntents.includes('session/resources-prepare'));
   assert.ok(actual.requiredIntents.includes('respondAsk'));
   assert.deepEqual(actual.migrations, []);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
-  assert.equal(actual.databases[0].schema, 1);
+  assert.equal(actual.databases[0].schema, 2);
   assert.deepEqual(actual.databases[0].preserve.find((table: any) => table.table === 'messages').columns,
     ['ordinal', 'id', 'document']);
   assert.ok(actual.databases[0].preserve.some((table: any) => table.table === 'meta'));

@@ -7,10 +7,8 @@ import { receiptInputSchema, withAttachments } from './attachments.ts';
 export function timelineItem(service: AssistantService, publication: Publication): TimelineItem {
   const { db } = service;
   const message = publication.messageId ? db.get('messages', publication.messageId) : undefined;
-  const anchor = publication.anchorId ? db.get('anchors', publication.anchorId) : undefined;
   const question = message ? db.forMessage('questions', message.id, 1).items[0] : undefined;
-  const topicId = publication.topicId;
-  const sessionId = message?.sessionId ?? anchor?.sessionId ?? null;
+  const sessionId = message?.sessionId ?? null;
   const internalSource = sessionId !== null && (db.get('bindings', 'coordinator')?.sessionId === sessionId
     || db.get('bindings', 'memory')?.sessionId === sessionId);
   const speaker = internalSource || message?.kind === 'system' ? 'system'
@@ -18,16 +16,17 @@ export function timelineItem(service: AssistantService, publication: Publication
     : publication.type !== 'message' && publication.type !== 'question' ? 'system'
     : message?.kind === 'user' ? 'user'
     : message?.kind === 'reply' || message?.kind === 'ask' ? 'assistant' : 'system';
-  const revision = message && ['message', 'question', 'correction', 'status'].includes(publication.type)
+  const topicSnapshot = message && ['message', 'question', 'attribution'].includes(publication.type);
+  const topicId = message?.kind === 'user' ? null : topicSnapshot ? message.topicId : publication.topicId;
+  const topic = topicId ? db.get('topics', topicId) : undefined;
+  const revision = message && ['message', 'question', 'correction', 'status', 'attribution'].includes(publication.type)
     ? { version: message.version, text: message.kind === 'ask' ? question?.request.question ?? message.raw : message.raw,
       attachments: message.attachments } : undefined;
-  const sourceVersion = publication.sources.find(source => source.messageId === message?.id)?.version;
-  const corrected = publication.type === 'message' && revision && sourceVersion !== undefined
-    && revision.version > sourceVersion;
-  return { ...publication, topicTitle: topicId ? db.get('topics', topicId)?.title ?? null : null,
-    text: publication.type === 'question' && question ? question.request.question
-      : corrected ? revision.text : publication.text,
-    attachments: corrected ? revision.attachments : publication.attachments,
+  const original = (publication.type === 'message' || publication.type === 'question') && revision;
+  return { ...publication, topicId, topicTitle: topic?.title ?? null, topicColor: topic?.color ?? null,
+    ...(topicSnapshot ? { topicAssignmentVersion: message.assignmentVersion } : {}),
+    text: original ? original.text : publication.text,
+    attachments: original ? original.attachments : publication.attachments,
     speaker, sessionId, ...(revision ? { revision } : {}),
     question: question ? { state: question.state, stateVersion: question.stateVersion ?? 0,
       ...(question.request.choices === undefined ? {} : { choices: question.request.choices }),
@@ -49,9 +48,7 @@ export function inputReceipt(service: AssistantService, requestId: string): Inpu
   const deliveries = service.db.forMessage('deliveries', message.id);
   // Older receipts saved only their original message snapshot, never the mutable current row.
   const input = receiptInputSchema.parse('input' in original ? original.input : {
-    requestId, text: message.raw, attachments: message.attachments,
-    ...(message.replyTo === null ? {} : { replyTo: message.replyTo }),
-    ...(message.topicId === null ? {} : { topicId: message.topicId }) });
+    requestId, text: message.raw, attachments: message.attachments });
   requireFact(input.requestId === requestId, 'INPUT_RECEIPT_INVALID', 'Input receipt identity does not match');
   return { requestId, input, message, work: work.items.filter(item => item.role === 'coordinator'),
     deliveries: deliveries.items, hasMore: { work: work.hasMore, deliveries: deliveries.hasMore } };

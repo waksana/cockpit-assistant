@@ -33,12 +33,16 @@ test('real host global menu opens on an empty homepage; complete conversation an
   await expect(messages).toHaveCount(timeline.length);
   expect(await messages.evaluateAll(elements => elements.map(element => element.getAttribute('data-ca-item'))))
     .toEqual(timeline.map(item => item.id));
-  await expect(page.locator('.ca-topic-heading')).toHaveCount(0);
+  await expect(page.locator('.ca-topic-heading')).toHaveCount(4);
+  await expect(messages.first().locator('.ca-topic-heading')).toHaveCount(0);
+  await expect(messages.nth(1).locator('.ca-topic-heading')).toHaveCount(0);
+  await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveText('旅行计划 A');
+  await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveCSS('border-inline-start-color', 'rgb(37, 99, 235)');
   await expect(messages.first()).toContainText('A：先讨论旅行计划');
   await expect(messages.nth(1)).toContainText('B：现在讨论代码审查');
   await expect(messages.nth(2)).toContainText('A：继续刚才的旅行计划');
   await expect(page.getByRole('region', { name: '对话记录', exact: true }))
-    .not.toContainText(/来源：|synthetic-reception|旅行计划 A|代码审查 B/);
+    .not.toContainText(/来源：|synthetic-reception|代码审查 B/);
   const long = page.locator('[data-ca-item="publication-9"]');
   await expect(long.getByRole('heading', { name: '完整 Markdown 回答' })).toBeVisible();
   await expect(long.getByRole('table')).toContainText('已确认');
@@ -170,13 +174,15 @@ test('compact status detail remains visible while delayed history arrives', asyn
   assertClean(fixture);
 });
 
-test('question choices fill ordinary text without reply controls, captured anchors or hidden posting', async ({ page }) => {
+test('question options are ordinary text answered only through Composer without hidden posting', async ({ page }) => {
   const fixture = await installFixture(page);
   await page.goto('/');
   await openAssistant(page);
   await expect(page.getByRole('button', { name: '回复', exact: true })).toHaveCount(0);
   await expect(page.getByRole('region', { name: '当前回复引用', exact: true })).toHaveCount(0);
-  await page.getByRole('button', { name: '火车', exact: true }).click();
+  await expect(page.locator('[data-ca-item="publication-7"]').getByRole('listitem')).toHaveText(['火车', '飞机']);
+  await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(0);
+  await page.getByRole('textbox', { name: '消息输入', exact: true }).fill('火车');
   await expect(page.getByRole('textbox', { name: '消息输入', exact: true })).toHaveValue('火车');
   expect(fixture.posts).toEqual([]);
   await page.getByRole('button', { name: '发送', exact: true }).click();
@@ -191,9 +197,9 @@ test('question choices fill ordinary text without reply controls, captured ancho
   assertClean(fixture);
 });
 
-test('a quick-filled choice survives reopening as text without retaining a question target', async ({ page }) => {
+test('a typed answer survives reopening as text without retaining a question target', async ({ page }) => {
   const question = publication(1, '需要保留选项的早期问题', {
-    type: 'question', anchorId: 'retained-question-anchor',
+    type: 'question',
     question: { state: 'pending', stateVersion: 1, choices: ['火车', '飞机'], allowFreeform: false },
   });
   const later = publication(2, '最新窗口内的另一个问题', {
@@ -202,8 +208,9 @@ test('a quick-filled choice survives reopening as text without retaining a quest
   const fixture = await installFixture(page, { items: [question], hasOlder: false });
   await page.goto('/');
   await openAssistant(page);
-  await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(1);
-  await page.getByRole('button', { name: '火车', exact: true }).click();
+  await expect(page.locator('[data-ca-item="publication-1"]').getByRole('listitem')).toHaveText(['火车', '飞机']);
+  await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(0);
+  await page.getByRole('textbox').fill('火车');
   await expect(page.getByRole('textbox')).toHaveValue('火车');
   await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   fixture.setTimeline([later]);
@@ -211,7 +218,8 @@ test('a quick-filled choice survives reopening as text without retaining a quest
   await expect(page.locator('[data-ca-item="publication-1"]')).toHaveCount(0);
   await expect(page.getByRole('region', { name: '当前回复引用', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '火车', exact: true })).toHaveCount(0);
-  await expect(page.locator('[data-ca-item="publication-2"]').getByRole('button', { name: '另一个选项', exact: true })).toBeEnabled();
+  await expect(page.locator('[data-ca-item="publication-2"]').getByRole('listitem')).toHaveText(['另一个选项']);
+  await expect(page.locator('[data-ca-item="publication-2"]').getByRole('button')).toHaveCount(0);
   await expect(page.getByRole('textbox')).toHaveValue('火车');
   await page.getByRole('textbox').fill('普通补充，不受旧问题限制');
   expect(fixture.posts).toEqual([]);
@@ -229,11 +237,9 @@ test('six long question choices stay in the scroller and never replace the publi
   const gate = new Promise<void>(resolve => { release = resolve; });
   const question = publication(1, '请从六个完整的长选项中选择', {
     type: 'question', question: { state: 'pending', stateVersion: 1, choices, allowFreeform: false },
-    anchorId: 'immutable-question-anchor',
   });
   const later = publication(2, '另一个独立的待回答问题', {
     type: 'question', question: { state: 'pending', stateVersion: 1, choices: ['新的选择'], allowFreeform: false },
-    anchorId: 'different-question-anchor',
   });
   const fixture = await installFixture(page, { items: [question, later], hasOlder: false,
     post: async (post, route) => {
@@ -249,27 +255,31 @@ test('six long question choices stay in the scroller and never replace the publi
   const send = page.getByRole('button', { name: /^(发送|发送选项|正在提交)$/ });
   const scroller = page.locator('.ca-scroller');
   const assertComposerVisible = async () => {
-    await expect(page.locator('.ca-composer')).toBeInViewport();
+    await expect(page.locator('.ca-page .chat-input-area')).toBeInViewport({ ratio: 1 });
+    await expect(draft).toBeInViewport();
     await expect(send).toBeInViewport();
     expect(await scroller.evaluate(element => element.clientHeight)).toBeGreaterThan(100);
   };
   await assertComposerVisible();
-  await page.locator('[data-ca-item="publication-1"]').getByRole('button', { name: selected, exact: true }).click();
+  await expect(page.locator('[data-ca-item="publication-1"]').getByRole('listitem')).toHaveText(choices);
+  await expect(page.locator('[data-ca-item="publication-1"]').getByRole('button')).toHaveCount(0);
+  await draft.fill(selected);
   await expect(draft).toHaveValue(selected);
   await assertComposerVisible();
   await expect(page.getByRole('region', { name: '当前回复引用', exact: true })).toHaveCount(0);
-  await expect(page.locator('.ca-composer').getByRole('button', { name: selected, exact: true })).toHaveCount(0);
+  await expect(page.locator('.ca-page .chat-input-area').getByRole('button', { name: selected, exact: true })).toHaveCount(0);
   expect(fixture.posts).toEqual([]);
   await send.click();
   await expect.poll(() => fixture.posts.length).toBe(1);
   expect(fixture.posts[0]?.body.text).toBe(selected);
   expect(fixture.posts[0]?.body).not.toHaveProperty('replyTo');
-  await page.locator('[data-ca-item="publication-2"]').getByRole('button', { name: '新的选择', exact: true }).click();
+  await expect(page.locator('[data-ca-item="publication-2"]').getByRole('listitem')).toHaveText(['新的选择']);
+  await draft.fill('新的选择');
   await expect(draft).toHaveValue('新的选择');
   await assertComposerVisible();
   release?.();
-  await detail(page, '发送回执');
-  await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('已接受');
+  await expect(page.getByRole('button', { name: '正在提交', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '发送回执', exact: true })).toHaveCount(0);
   await expect(draft).toHaveValue('新的选择');
   expect(fixture.posts[0]?.body).not.toHaveProperty('replyTo');
   expect(fixture.posts).toHaveLength(1);
@@ -310,18 +320,15 @@ test('unknown input never resends; receipt lookup uses the original ID and prese
   const draft = page.getByRole('textbox', { name: '消息输入', exact: true });
   await draft.fill('仅发送一次');
   await page.getByRole('button', { name: '发送', exact: true }).click();
-  await detail(page, '发送回执');
-  await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('状态未知');
+  await expect(page.getByText(/暂时无法确认发送状态/)).toBeVisible();
   const requestId = String(fixture.posts[0]?.body.requestId);
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
   await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
-  await detail(page, '发送回执');
   await draft.fill('不应被旧请求清空的新草稿');
   await draft.press('Enter');
   const newerText = await draft.inputValue();
-  await page.getByRole('button', { name: '检查发送回执' }).click();
-  await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('输入已持久保存');
+  await expect(page.getByText(/暂时无法确认发送状态/)).toHaveCount(0);
   await expect(draft).toHaveValue(newerText);
   expect(newerText.trim()).toBe('不应被旧请求清空的新草稿');
   expect(fixture.posts).toHaveLength(1);
@@ -355,20 +362,20 @@ test('opening loads only bound unloaded carriers, preserves pending receipts and
     { role: 'memory', sessionId: 'synthetic-memory', epoch: 1 },
   ] } });
   expect(fixture.posts[0]!.body.requestId).toMatch(uuid);
-  const receipt = page.getByRole('article', { name: '加载内部角色会话', exact: true });
+  const receipt = page.getByText('正在准备角色会话…', { exact: true });
   await detail(page, /^coordinator：/);
-  await expect(receipt).toContainText('处理中');
+  await expect(receipt).toBeVisible();
   await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   await openAssistant(page);
   await detail(page, /^coordinator：/);
-  await expect(receipt).toContainText('处理中');
+  await expect(receipt).toBeVisible();
   const draft = page.getByRole('textbox', { name: '消息输入', exact: true });
   await draft.fill('加载完成不得改变此草稿');
   await expect(page.getByRole('button', { name: 'memory：不可用' })).toBeVisible();
   unloaded.roles[0]!.status = 'ready';
   fixture.setReadiness(unloaded);
   release();
-  await expect(receipt).toContainText('已接受');
+  await expect(receipt).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'coordinator：已就绪' })).toBeVisible();
   await expect(draft).toHaveValue('加载完成不得改变此草稿');
   await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
@@ -397,8 +404,7 @@ test('late POST completion after close/reopen cannot erase new typing or duplica
   await draft.fill('关闭后重新输入的内容');
   await expect(page.getByRole('button', { name: '正在提交', exact: true })).toBeDisabled();
   release?.();
-  await detail(page, '发送回执');
-  await expect(page.getByRole('article', { name: '发送回执', exact: true })).toContainText('已接受');
+  await expect(page.getByRole('button', { name: '正在提交', exact: true })).toHaveCount(0);
   await expect(draft).toHaveValue('关闭后重新输入的内容');
   expect(fixture.posts).toHaveLength(1);
   assertClean(fixture);
@@ -423,13 +429,16 @@ test('paging and duplicate/out-of-order SSE recover from the applied cursor with
   await page.goto('/');
   await openAssistant(page);
   const scroller = page.locator('.ca-scroller');
-  await page.getByRole('button', { name: '加载更早消息' }).scrollIntoViewIfNeeded();
-  const before = await page.locator('[data-ca-item="publication-4"]').evaluate(element => element.getBoundingClientRect().top);
-  await page.getByRole('button', { name: '加载更早消息' }).click();
+  const earlier = page.getByRole('button', { name: '加载更早消息' });
+  await earlier.scrollIntoViewIfNeeded();
+  await earlier.focus();
+  const anchor = page.locator('[data-ca-item="publication-4"] [data-message-id]');
+  const before = await anchor.evaluate(element => element.getBoundingClientRect().top);
+  await earlier.click();
   await expect(page.locator('[data-ca-item]')).toHaveCount(9);
-  const after = await page.locator('[data-ca-item="publication-4"]').evaluate(element => element.getBoundingClientRect().top);
-  expect(Math.abs(before - after)).toBeLessThan(5);
-  await scroller.evaluate(element => { element.scrollTop = 0; });
+  await expect.poll(async () => Math.abs(before - await anchor.evaluate(element =>
+    element.getBoundingClientRect().top))).toBeLessThan(5);
+  await scroller.press('Home');
   await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
   release?.();
   await expect(page.locator('[data-ca-item]')).toHaveCount(12);
@@ -437,11 +446,11 @@ test('paging and duplicate/out-of-order SSE recover from the applied cursor with
     .toEqual(Array.from({ length: 12 }, (_, index) => `publication-${index + 1}`));
   await expect.poll(() => fixture.requests.some(request => request.path === '/timeline' && request.query.includes('after=10'))).toBe(true);
   await expect.poll(() => fixture.requests.some(request => request.path === '/timeline/stream' && request.query.includes('after=12'))).toBe(true);
-  await expect(page.getByRole('button', { name: '3 条新消息，查看最新' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toBeVisible();
   expect(await scroller.evaluate(element => element.scrollTop)).toBeLessThan(100);
-  await page.getByRole('button', { name: '3 条新消息，查看最新' }).click();
+  await page.getByRole('button', { name: '有新内容 · 回到最新' }).click();
   await expect(page.getByText('补读的完整消息十二', { exact: true })).toBeInViewport();
-  await expect(page.getByRole('button', { name: /条新消息，查看最新/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
   expect(fixture.posts).toEqual([]);
   assertClean(fixture);
 });
@@ -469,19 +478,20 @@ test('unknown internal activation stays inspectable across reopen with no new-ID
   fixture.setReadiness(unloaded);
   await page.goto('/');
   await openAssistant(page);
-  const receipt = page.getByRole('article', { name: '加载内部角色会话', exact: true });
+  const receipt = page.getByText('角色会话尚未就绪，请刷新就绪状态。', { exact: true });
   await detail(page, /^coordinator：/);
-  await expect(receipt).toContainText('状态未知');
+  await expect(receipt).toBeVisible();
   await page.getByRole('link', { name: '返回 Cockpit', exact: true }).click();
   unloaded.roles[0]!.status = 'unknown';
   fixture.setReadiness(unloaded);
   await openAssistant(page);
   await detail(page, /^coordinator：/);
   await expect(page.getByRole('button', { name: 'coordinator：状态未知' })).toBeVisible();
-  await page.getByRole('button', { name: '检查操作状态' }).click();
-  await expect(receipt).toContainText('回执状态：unknown');
-  await receipt.getByRole('button', { name: '展开完整结果' }).click();
-  await expect(receipt).toContainText('Still not confirmed');
+  await page.getByRole('button', { name: '刷新就绪状态' }).click();
+  await expect(receipt).toBeVisible();
+  await expect(page.getByRole('button', { name: '检查操作状态' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '展开完整结果' })).toHaveCount(0);
+  await expect(page.getByText('Still not confirmed')).toHaveCount(0);
   expect(fixture.posts).toHaveLength(1);
   expect(fixture.requests.some(request => decodeURIComponent(request.path) === `/operations/activate:${activationId}`)).toBe(true);
   expect(fixture.requests.filter(request => request.path === '/readiness').length).toBeGreaterThanOrEqual(3);

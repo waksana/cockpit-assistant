@@ -6,8 +6,8 @@ import type { Table, Tables } from './types.ts';
 import { requireFact } from './errors.ts';
 import { withAttachments } from './attachments.ts';
 
-const tables: Table[] = ['topics', 'receptions', 'messages', 'anchors', 'questions', 'work',
-  'bindings', 'deliveries', 'publications', 'memories', 'risks', 'routes', 'native', 'operations', 'exposures'];
+const tables: Table[] = ['topics', 'messageTopics', 'batches', 'receptions', 'messages', 'questions', 'work',
+  'bindings', 'deliveries', 'publications', 'memories', 'native', 'operations'];
 
 function record<T extends Table>(table: T, document: unknown): Tables[T] {
   const value = JSON.parse(String(document)) as Tables[T];
@@ -35,8 +35,11 @@ export class Database {
     if (path !== ':memory:') chmodSync(path, 0o600);
     this.sql.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
     const schema = this.sql.prepare('PRAGMA user_version').get();
-    requireFact(schema?.user_version === 0 || schema?.user_version === 1,
-      'SCHEMA_VERSION', 'Database schema is newer than this module');
+    if (schema?.user_version !== 0 && schema?.user_version !== 2) {
+      this.sql.close();
+      requireFact(false, 'SCHEMA_VERSION',
+        'Assistant requires schema 2. Legacy generated data is not migrated. Use a separately authorized fresh data directory.');
+    }
     this.sql.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
     for (const table of tables) {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS ${table} (
@@ -49,6 +52,9 @@ export class Database {
       ON receptions(json_extract(document, '$.enabled'), json_extract(document, '$.kind'), ordinal)`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS native_session_type
       ON native(json_extract(document, '$.sessionId'), json_extract(document, '$.event.type'), ordinal)`);
+    for (const field of ['messageId', 'interactionId']) this.sql.exec(`CREATE INDEX IF NOT EXISTS native_${field}
+      ON native(json_extract(document, '$.sessionId'), json_extract(document, '$.event.type'),
+        json_extract(document, '$.event.data.${field}'))`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS messages_native_message
       ON messages(json_extract(document, '$.sessionId'), json_extract(document, '$.nativeMessageId'))`);
     this.sql.exec(`CREATE INDEX IF NOT EXISTS messages_native_event
@@ -57,7 +63,7 @@ export class Database {
       this.sql.exec(`CREATE INDEX IF NOT EXISTS ${table}_message
         ON ${table}(json_extract(document, '$.messageId'), ordinal)`);
     }
-    this.sql.exec('PRAGMA user_version=1');
+    this.sql.exec('PRAGMA user_version=2');
   }
   transaction<T>(fn: () => T): T {
     requireFact(!this.inTransaction, 'NESTED_TRANSACTION', 'Nested transactions are not supported');
@@ -140,6 +146,15 @@ export class Database {
     const row = this.sql.prepare(`SELECT document FROM messages WHERE json_extract(document, '$.sessionId')=?
       AND json_extract(document, '$.${field}')=? ORDER BY ordinal LIMIT 1`).get(sessionId, messageId ?? eventId);
     return row ? record('messages', row.document) : undefined;
+  }
+  consumerEvidence(sessionId: string, field: 'messageId' | 'interactionId' | 'toolCallId', value: string) {
+    const tool = field === 'toolCallId';
+    const rows = this.sql.prepare(`SELECT document FROM native
+      WHERE json_extract(document, '$.sessionId')=? AND json_extract(document, '$.event.type')=?
+      AND ${tool ? `EXISTS (SELECT 1 FROM json_each(json_extract(document, '$.event.data.toolRequests'))
+        WHERE json_extract(value, '$.toolCallId')=?)` : `json_extract(document, '$.event.data.${field}')=?`}
+      ORDER BY ordinal LIMIT 2`).all(sessionId, tool ? 'assistant.message' : 'user.message', value);
+    return rows.map(row => record('native', row.document).event);
   }
   publicationPage(direction: 'before' | 'after', cursor: number | undefined, limit: number) {
     requireFact((cursor === undefined || Number.isSafeInteger(cursor) && cursor >= 0)

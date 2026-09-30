@@ -10,11 +10,12 @@ import { conversationItems, isConversationItem } from './timeline.ts';
 const sequence = z.number().int().nonnegative().safe();
 const itemSchema = z.object({
   id: z.string(), sequence: sequence.positive(),
-  type: z.enum(['message', 'question', 'status', 'correction', 'risk', 'clarification']),
+  type: z.enum(['message', 'question', 'status', 'correction', 'attribution', 'clarification']),
   messageId: z.string().nullable(), topicId: z.string().nullable(), text: z.string(),
-  anchorId: z.string().nullable(), createdAt: z.number().finite(),
+  createdAt: z.number().finite(),
   sources: z.array(z.object({ messageId: z.string(), version: sequence, assignmentVersion: sequence })),
-  topicTitle: z.string().nullable(), speaker: z.enum(['user', 'assistant', 'system']),
+  topicTitle: z.string().nullable(), topicColor: z.string().nullable(), speaker: z.enum(['user', 'assistant', 'system']),
+  topicAssignmentVersion: sequence.optional(),
   sessionId: z.string().nullable(),
   question: z.object({ state: z.enum(['pending', 'stale', 'answered', 'unknown']),
     stateVersion: sequence.default(0), choices: z.array(z.string()).optional(),
@@ -34,7 +35,8 @@ const activationLabel = '加载内部角色会话';
 class RequestFailure extends Error {
   constructor(message: string, readonly known: boolean) { super(message); }
 }
-const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+const errorText = (error: unknown): string => error instanceof z.ZodError ? '返回的消息格式无法识别，请重新连接。'
+  : error instanceof Error ? error.message : String(error);
 const id = (): string => crypto.randomUUID();
 
 /** A stream cursor advances only after the entire validated publication is applied. */
@@ -302,11 +304,11 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       catch (error) { update({ error: errorText(error) }); context.report(error); }
     },
     edit(text) {
-      try { input.edit(text); }
+      try { input.edit(text); if (state.error) update({ error: null }); }
       catch (error) { update({ error: errorText(error) }); }
     },
     async send() {
-      try { await input.send(); }
+      try { update({ error: null }); await input.send(); }
       catch (error) { update({ error: errorText(error) }); if (disposed) context.report(error); }
     },
     async inspectInput(requestId) {
@@ -331,7 +333,12 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
         void initialize(generation, lifetime!.signal);
       } else void connect(generation, true);
     },
-    refresh: () => refresh(),
+    async refresh() {
+      for (const operation of state.setup.filter(entry => entry.state === 'unknown' || entry.state === 'pending')) {
+        await store.inspectOperation(operation.requestId);
+      }
+      await refresh();
+    },
     async inspectOperation(requestId) {
       const operation = state.setup.find(entry => entry.requestId === requestId);
       if (!operation) return null;

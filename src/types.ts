@@ -7,11 +7,10 @@ export type SourceRef = { messageId: string; version: number; assignmentVersion:
 export interface Topic {
   id: string;
   title: string;
-  domain: string | null;
-  relatedTo: string[];
-  pinned: boolean;
+  content: string;
+  color: string;
+  sessionId: string | null;
   archived: boolean;
-  independent: boolean;
   version: number;
   dirtyThrough: number;
   memoryThrough: number;
@@ -44,19 +43,16 @@ export interface Message {
   nativeEventId: string | null;
   nativeMessageId: string | null;
   nativeParentId: string | null;
-  correlation: 'unknown';
-  /** Historical input provenance only; new input always stores null. */
-  replyTo: string | null;
+  deliveryId?: string;
+  correlation: 'unknown' | 'native';
   historical: boolean;
   sequence: number;
   createdAt: number;
 }
-export interface Anchor {
+export interface MessageTopic {
   id: string;
   messageId: string;
-  sessionId: string;
-  requestId: string | null;
-  kind: 'comment' | 'ask';
+  topicId: string;
 }
 export interface Question {
   id: string;
@@ -66,6 +62,7 @@ export interface Question {
   state: 'pending' | 'stale' | 'answered' | 'unknown';
   stateVersion?: number;
 }
+/** Internal progress only: no coordinator tool accepts a work proof. */
 export interface Work {
   id: string;
   role: Role;
@@ -77,11 +74,23 @@ export interface Work {
   stateVersion: number;
   sources: SourceRef[];
   through: number;
-  state: 'pending' | 'leased' | 'done' | 'invalidated';
+  state: 'pending' | 'leased' | 'done' | 'invalidated' | 'failed';
   epoch: number | null;
   token: string | null;
   leaseUntil: number;
   result: unknown;
+  attempts?: number;
+  retryAfter?: number;
+}
+export interface Batch {
+  id: string;
+  role: Role;
+  sessionId: string;
+  epoch: number;
+  workIds: string[];
+  state: 'pending' | 'running' | 'done' | 'failed' | 'unknown';
+  dispatchHash: string | null;
+  createdAt: number;
 }
 export interface Binding {
   id: Role;
@@ -97,6 +106,9 @@ export interface Delivery {
   id: string;
   kind: 'prompt' | 'ask' | 'wake';
   messageId: string | null;
+  messageIds?: string[];
+  topicId?: string;
+  batchId?: string;
   sessionId: string;
   requestId: string | null;
   text: string;
@@ -109,8 +121,9 @@ export interface Delivery {
   createdAt: number;
   roleEpoch: number | null;
   inputVersion?: number;
-  wake?: { claimedAt: number | null; leaseUntil: number; drainedAt: number | null };
-  /** Preparation never implies that prompt/respondAsk was invoked. */
+  nativeMessageId?: string;
+  interactionId?: string;
+  interactionState?: 'pending' | 'active' | 'completed' | 'interrupted' | 'unknown';
   preparation?: {
     attempts: number;
     nextAttemptAt: number;
@@ -121,13 +134,11 @@ export interface Delivery {
 export interface Publication {
   id: string;
   sequence: number;
-  type: 'message' | 'question' | 'status' | 'correction' | 'risk' | 'clarification';
+  type: 'message' | 'question' | 'status' | 'correction' | 'clarification' | 'attribution';
   messageId: string | null;
   topicId: string | null;
   text: string;
   attachments: NativeAttachment[];
-  /** Historical publication provenance only; new publications do not create anchors. */
-  anchorId: string | null;
   sources: SourceRef[];
   createdAt: number;
 }
@@ -141,18 +152,6 @@ export interface Memory {
   workId: string;
   valid: boolean;
   correction: string | null;
-}
-export interface Risk {
-  id: string;
-  signature: string;
-  lastAt: number;
-  suppressed: boolean;
-}
-export interface Route {
-  id: string;
-  sessionIds: string[];
-  version: number;
-  evidence: string;
 }
 export interface NativeRecord {
   id: string;
@@ -168,19 +167,17 @@ export interface Operation {
   result: unknown;
 }
 export interface Tables {
-  exposures: { id: string; sessionId: string; topicId: string; firstDeliveryId: string };
   topics: Topic;
+  messageTopics: MessageTopic;
+  batches: Batch;
   receptions: Reception;
   messages: Message;
-  anchors: Anchor;
   questions: Question;
   work: Work;
   bindings: Binding;
   deliveries: Delivery;
   publications: Publication;
   memories: Memory;
-  risks: Risk;
-  routes: Route;
   native: NativeRecord;
   operations: Operation;
 }

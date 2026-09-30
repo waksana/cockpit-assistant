@@ -7,13 +7,17 @@ session-independent SPA page, including on an empty Cockpit home. Direct URLs,
 refresh and browser forward/back navigation retain the page; its return arrow
 always goes to Cockpit home.
 
-The coordinator classifies inputs and session outputs; the program validates,
-persists, sends, and publishes them. A separate memory role extracts versioned,
-source-bound memory on topic changes. Neither internal role is a receptionist.
+The coordinator maintains flat topics, maps each to one current session, splits
+inputs into topic-specific prompts and attributes business session replies. The
+service persists originals, creates or loads targets, queues prompts and receives
+all new ordinary primary replies and native questions. A separate memory role extracts versioned, source-bound
+memory per topic. Neither internal role is a receptionist.
 Select `coordinator` and `memory` on two separate sessions using Cockpit's
 normal role controls; successful role saves register their carriers with the
-module. Registration does not claim readiness. Ordinary sessions are observed
-automatically, without a separate receptionist setup step.
+module. Registration does not claim readiness. Assistant is the user input
+entry: native session user messages, forwarded prompts and internal role output
+do not become new Assistant inputs. Native history remains available through
+the public session history API when explicitly needed.
 
 Inputs need no reply selection or `replyTo`. The coordinator uses conversation
 context to choose the recipient and forwards the user's wording to a real native
@@ -23,8 +27,9 @@ native choice/freeform and attachment restrictions still apply.
 The page presents ordinary conversation using the same public message and
 Composer surfaces as Chat. Internal wake/status/risk records and correction
 notices stay out of the reading flow; corrections update the actual message
-instead. Topic/session metadata remains backstage, and all underlying records
-and sequence cursors are preserved.
+instead. User originals appear once without topic labels. Related replies are
+visible immediately, then gain a stable topic color and title in place after
+attribution. Generated prompts are not additional user bubbles.
 
 ## Development
 

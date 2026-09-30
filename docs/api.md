@@ -151,6 +151,13 @@ copy. Only a later matching persistent natural reply in that interaction
 consumes those IDs. An unrelated ledger answer, a partial presentation, a tool
 prelude or an old/duplicate reply does not clear the other read results.
 
+The declaration result is
+`{declared,ids,sessionId,interactionId,textHash,afterSequence,normalization}`.
+`normalization: "crlf-to-lf-outer-trim-v1"` changes CRLF to LF and trims only
+outer whitespace before hashing. It does not paraphrase, extract sentences or
+normalize away omitted content. Native answers likewise allow only outer
+whitespace normalization when comparing the full human original.
+
 Reads and declarations survive cancellation or interruption without deleting
 unpresented bodies. This is internal consumption bookkeeping, not a user ACK or
 a per-input classification step. Consumed native identities remain so duplicate

@@ -31,6 +31,8 @@ test('shared topic Skill is physically embedded in each role without requiring a
     assert.match(front, /user's complete original answer unchanged/);
     assert.match(shared, /designing a topic system|How should the topic system be designed/);
     assert.match(shared, /not completed presentation/);
+    assert.match(shared, /omit `topicId`/);
+    assert.match(shared, /Never invent an ID for dispatch/);
     const manifest = JSON.parse(await readFile('cockpit.module.json', 'utf8'));
     const role = (id: string) => manifest.roles.find((entry: { id: string }) => entry.id === id);
     assert.equal(role('coordinator').instructions, 'dist/roles/coordinator.md');

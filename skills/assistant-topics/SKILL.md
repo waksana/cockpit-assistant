@@ -39,8 +39,11 @@ to background sessions. It must not provide business reasoning itself.
 ## Faithful routing
 
 Use the service's topic tools to query and maintain definitions and explicit
-session links. New unbound business topics are created by service on first
-dispatch; unloaded sessions retain their original IDs and busy sessions enqueue.
+session links. To register a new topic, call `assistant_topic` with its title and
+content and omit `topicId`; keep the actual ID returned by the service. Use
+`topicId` only for an existing topic. Never invent an ID for dispatch.
+The first dispatch to an unbound topic creates its worker; unloaded sessions
+retain their original IDs and busy sessions enqueue.
 The model does not manage lifecycle proofs, retries or per-message completion
 ACKs.
 

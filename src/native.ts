@@ -14,11 +14,17 @@ export function nativeAccess(host: ModuleHostApi): NativeAccess {
   requireFact(host.chatReadVersion === 1 && host.askResponseVersion === 1
     && host.resourcePreparationVersion === 1 && host.roleAssignmentVersion === 1
     && host.sessionDirectoryVersion === 1 && host.sessionLoadVersion === 1
-    && 'promptReceiptVersion' in host && host.promptReceiptVersion === 1,
+    && host.promptReceiptVersion === 1 && host.toolScopeVersion === 1,
   'HOST_CAPABILITY', 'Assistant requires chatReadVersion, askResponseVersion, resourcePreparationVersion, '
-    + 'roleAssignmentVersion, sessionDirectoryVersion, sessionLoadVersion and promptReceiptVersion 1');
+    + 'roleAssignmentVersion, sessionDirectoryVersion, sessionLoadVersion, promptReceiptVersion and toolScopeVersion 1');
   return {
     host,
+    async scope(sessionId) {
+      const body = { sessionId };
+      const result = await host.call('session/tool-scope', body);
+      requireFact(result.sessionId === sessionId, 'SESSION_MISMATCH', 'Host returned another tool-scope session');
+      return result;
+    },
     async read(sessionId, cursor, bootstrap, backward = false, all = false) {
       return host.call('session/chat', {
         sessionId, source: 'live', direction: bootstrap || backward ? 'backward' : 'forward',

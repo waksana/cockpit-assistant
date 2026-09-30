@@ -35,7 +35,7 @@ test('unsupported Host fails before creating any module data', async () => {
     await assert.rejects(access(dataRoot));
   } finally { f.close(); await rm(root, { recursive: true }); }
 });
-test('synthetic activation filters coordinator-only role setup, consumes direct events, and releases writer ownership', async () => {
+test('synthetic activation separates roles, excludes unmanaged events, and releases writer ownership', async () => {
   const f = fixture(), dataRoot = await directory(), controller = new AbortController();
   const errors: unknown[] = [];
   try {
@@ -56,14 +56,13 @@ test('synthetic activation filters coordinator-only role setup, consumes direct 
     f.metas.get('coordinator')!.status = 'running';
     backend.events!.handle({ sessionId: 's1', cwd: '/synthetic',
       event: { id: 'live-original', type: 'assistant.message', data: { content: 'Actual live raw body' } } });
-    let seen = false;
-    for (let n = 0; n < 100; n++) {
-      const response = await state.handler(req);
-      seen = (response.body as { items: { text: string }[] }).items.some(item => item.text === 'Actual live raw body');
-      if (seen) break;
-      await setTimeout(5);
-    }
-    assert.equal(seen, true);
+    await setTimeout(20);
+    const response = await state.handler(req);
+    assert.equal((response.body as { items: { text: string }[] }).items.some(item => item.text === 'Actual live raw body'), false);
+    const combined = await backend.roleAssignments!.permit!({ operation: 'create', sessionId: 'candidate',
+      roles: [{ moduleId: 'assistant', roleId: 'coordinator' }, { moduleId: 'assistant', roleId: 'worker' }],
+      previousRoles: [] }, controller.signal);
+    assert.equal(combined.allowed, false);
     backend.dispose!();
     await setTimeout(20);
     const reopened = await activate({ ...context, signal: new AbortController().signal });
@@ -82,9 +81,10 @@ test('setup receipts are native-backed temporary facts and duplicate IDs never r
     assert.equal(f.calls.filter(call => call.name === 'session/new').length, 1);
     await assert.rejects(f.runtime.create({ ...create, cwd: '/different' }), /request changed/);
     assert.deepEqual(f.db.sql.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-      .all().map(row => row.name), ['messages','topic_messages','topics']);
+      .all().map(row => row.name), ['foreground_inputs','inbox','messages','tool_actions','topic_messages','topics','workers']);
     const readiness = await f.runtime.readiness();
-    assert.equal(readiness.roles[0]!.status, 'ambiguous');
+    assert.equal(readiness.roles[0]!.status, 'ready');
+    assert.equal(readiness.roles[0]!.sessionId, 'coordinator');
   } finally { f.close(); }
 });
 test('unknown setup creation preserves actual partial native identity and duplicate request does not repeat it', async () => {

@@ -6,7 +6,7 @@ import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts'
 import { createInput } from './input.ts';
 import { attachmentsSchema } from '../src/attachments.ts';
 import { conversationItems, isConversationItem, mergeSnapshots } from './timeline.ts';
-import { clarificationSchema, createClarification, type ClarificationActions } from './clarification.ts';
+import { conversationProtocolSchema, legacyClarificationSchema } from './protocol.ts';
 
 const sequence = z.number().int().nonnegative().safe();
 const itemSchema = z.object({
@@ -20,7 +20,7 @@ const itemSchema = z.object({
     stateVersion: sequence, requestId: z.string().min(1), choices: z.array(z.string()).optional(),
     allowFreeform: z.boolean().optional() }).nullable(),
   attachments: attachmentsSchema.default([]),
-  clarifications: z.array(clarificationSchema).default([]),
+  clarifications: z.array(legacyClarificationSchema).default([]),
   diagnostic: z.string().nullable(),
   deliveryIssues: z.array(z.object({
     topicMessageId: z.string().min(1), state: z.enum(['rejected', 'unknown', 'cancelled']), detail: z.string().min(1),
@@ -94,14 +94,12 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
   let notify = () => {};
   const input = createInput(context, () => notify());
   let state: Snapshot = {
-    open: false, items: [], hasOlder: false, loading: false, loadingOlder: false,
+    open: false, protocolReady: false, view: 'conversation', items: [], hasOlder: false, loading: false, loadingOlder: false,
     stream: 'disconnected', error: null, readiness: null, checking: false, readinessError: null,
     draft: input.reference.getSnapshot(),
     submissions: input.business().submissions, setup: [],
   };
   const listeners = new Set<() => void>();
-  const clarifications = new Map<string, ClarificationActions>();
-  const clarificationKey = (messageId: string, clarificationId: string) => JSON.stringify([messageId, clarificationId]);
   let disposed = false;
   notify = () => {
     if (disposed) return;
@@ -121,18 +119,8 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
   const update = (patch: Partial<Snapshot>) => {
     if (disposed) return;
     state = { ...state, ...patch };
-    if (patch.items) {
-      for (const item of patch.items) for (const value of item.clarifications ?? []) {
-        const key = clarificationKey(item.id, value.id);
-        let client = clarifications.get(key);
-        if (!client) {
-          client = createClarification(context, item.id, value, () => notify());
-          clarifications.set(key, client);
-        } else client.update(value);
-        void client.inspect();
-      }
-    }
-    input.update(state.open, !!state.readiness?.canSend && !state.checking && !state.readinessError
+    input.update(state.open, state.protocolReady && state.view === 'conversation'
+      && !!state.readiness?.canSend && !state.checking && !state.readinessError
       && !!state.readiness?.roles.some(entry => entry.role === 'coordinator' && entry.status === 'ready'),
     conversationItems(state.items));
     for (const listener of listeners) listener();
@@ -156,7 +144,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     body: JSON.stringify(body), signal: context.signal,
   });
   const page = async (query: string, signal?: AbortSignal) =>
-    pageSchema.parse(await read(`/timeline${query}`, signal));
+    pageSchema.parse(await read(`${state.view === 'legacy' ? '/legacy/timeline' : '/timeline'}${query}`, signal));
   const merge = (items: TimelineItem[]) => mergeSnapshots([...state.items, ...items]);
   const stopStream = () => {
     if (retryTimer) clearTimeout(retryTimer);
@@ -209,6 +197,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     }
   };
   const refresh = async (activate = false) => {
+    if (!state.protocolReady || state.view !== 'conversation') return;
     const epoch = generation;
     const check = ++readinessGeneration;
     update({ checking: true, readinessError: null });
@@ -239,7 +228,17 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     }
   };
   const initialize = async (epoch: number, signal: AbortSignal) => {
+    if (!current(epoch) || signal.aborted) return;
+    ++readinessGeneration;
+    update({ protocolReady: false, readiness: null, readinessError: null,
+      checking: state.view === 'conversation' });
     try {
+      const protocol = await read<unknown>('/state', signal);
+      if (!current(epoch) || signal.aborted) return;
+      const supported = conversationProtocolSchema.safeParse(protocol);
+      if (!supported.success) throw new Error('Assistant 会话协议不兼容；未发送消息，也未把旧版后台汇聚记录当成前台对话。');
+      update({ protocolReady: true });
+      if (state.view === 'conversation') void refresh(true);
       const result = await page('?limit=50', signal);
       if (!current(epoch)) return;
       if (result.items.some(item => item.snapshotRevision > result.watermark))
@@ -250,9 +249,9 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       if (!result.items.some(isConversationItem) && result.hasMore) await older(epoch, signal);
       if (!current(epoch)) return;
       update({ loading: false });
-      void connect(epoch, false);
+      if (state.view === 'conversation') void connect(epoch, false);
     } catch (error) {
-      if (current(epoch)) update({ loading: false, error: errorText(error) });
+      if (current(epoch)) update({ loading: false, ...(!state.protocolReady ? { checking: false } : {}), error: errorText(error) });
     }
   };
   const older = async (epoch: number, signal: AbortSignal) => {
@@ -311,10 +310,9 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       const epoch = ++generation;
       applied = 0;
       lifetime = new AbortController();
-      update({ open: true, items: [], loading: true, hasOlder: false, error: null,
-        loadingOlder: false, readiness: null, checking: true });
+      update({ open: true, protocolReady: false, items: [], loading: true, hasOlder: false, error: null,
+        loadingOlder: false, readiness: null, checking: state.view === 'conversation' });
       void initialize(epoch, lifetime.signal);
-      void refresh(true);
     },
     close() {
       ++generation;
@@ -330,15 +328,13 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       catch (error) { update({ error: errorText(error) }); }
     },
     async send() {
+      if (state.view === 'legacy') { update({ error: '旧版记录是只读归档，请返回当前对话后发送。' }); return; }
       try { update({ error: null }); await input.send(); }
       catch (error) { update({ error: errorText(error) }); if (disposed) context.report(error); }
     },
     async inspectInput(requestId) {
       try { await input.inspectInput(requestId); }
       catch (error) { update({ error: errorText(error) }); if (disposed) context.report(error); }
-    },
-    getClarification(messageId, clarificationId) {
-      return clarifications.get(clarificationKey(messageId, clarificationId));
     },
     async loadOlder() {
       if (state.loading || !state.hasOlder || state.loadingOlder || !state.items.length) return;
@@ -352,7 +348,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       }
     },
     reconnect() {
-      if (!state.open || state.loading) return;
+      if (!state.open || state.loading || state.view === 'legacy') return;
       if (!state.items.length && applied === 0) {
         update({ loading: true, error: null });
         void initialize(generation, lifetime!.signal);
@@ -363,6 +359,22 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
         await store.inspectOperation(operation.requestId);
       }
       await refresh();
+    },
+    showLegacy(show) {
+      if (!state.open || disposed || (state.view === 'legacy') === show) return;
+      const epoch = ++generation;
+      ++readinessGeneration;
+      lifetime?.abort();
+      stopStream();
+      try { input.close(); }
+      catch (error) { update({ error: errorText(error) }); context.report(error); return; }
+      lifetime = new AbortController();
+      applied = 0;
+      historyBefore = null;
+      update({ view: show ? 'legacy' : 'conversation', protocolReady: false, items: [],
+        loading: true, hasOlder: false, loadingOlder: false, error: null,
+        checking: !show, readiness: null, readinessError: null, stream: 'disconnected' });
+      void initialize(epoch, lifetime.signal);
     },
     async inspectOperation(requestId) {
       const operation = state.setup.find(entry => entry.requestId === requestId);
@@ -380,7 +392,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
         return null;
       }
     },
-    dispose() { input.dispose(); store.close(); disposed = true; listeners.clear(); clarifications.clear(); },
+    dispose() { input.dispose(); store.close(); disposed = true; listeners.clear(); },
   };
   return store;
 }

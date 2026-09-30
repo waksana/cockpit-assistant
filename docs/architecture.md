@@ -1,260 +1,212 @@
-# Architecture and reliability
+# Architecture and responsibility
 
-## Ownership
+## One real foreground conversation
 
-One activation manages one Assistant space in its module-private `dataRoot`.
-Cockpit authenticates digest-bound HTTP routes and supplies the main caller's
-identity to MCP. Assistant is trusted same-user code, not a sandbox or a new
-authorization system. It never uses private SDK handles, native-home scans or
-Task state to implement conversations.
+Assistant uses one persistent native foreground session, not an additional agent
+in front of the old classifier. Its autonomous domain is the current topic
+register: topic names, scope, current worker mapping, actual progress, overviews
+and useful reminders.
 
-The native session directory supplies bounded metadata for choosing destinations.
-It is not a chat archive. Assistant stores its own input, topic-specific results,
-new ordinary primary replies and native questions, and necessary progress. Native
-session user messages, including forwarded prompts, are not imported as user
-speech or coordinator work. The coordinator can inspect native history on demand through the
-public `session/chat` API without loading the session or importing that history.
+Designing the topic system or implementing Assistant is business work, not
+register maintenance. All business requests, including discussion and research,
+go through service dispatch to a background session. There is no exception for
+questions that the foreground thinks are easy.
 
-Select `coordinator` through Cockpit's normal role controls. Role selection does
-not establish readiness. Actual applied roles, resources and native availability
-remain host-owned; an unloaded carrier is not missing. Internal carriers are
-never ordinary destinations or sources of business replies. This version does
-not run a memory role or require one before accepting conversation.
+The foreground may read worker results and make them easier to understand. It
+must preserve attribution, disagreement and uncertainty. It does not review
+quality or completeness, adjudicate professional conflicts, supply missing
+conclusions, or request additional business work. Only a new user instruction
+can authorize another business dispatch.
 
-## Three-table persistence
+The `coordinator` role identifier is retained as the dedicated foreground role;
+it no longer denotes a per-message classification worker. The `organizer` role
+shares register guidance for manually selected history work but is not the
+foreground. A `worker` handles its supplied business in its own session.
+Role and source identity are checked separately from shared Skill availability.
 
-The product model is topics and conversation. SQLite has exactly three application
-tables; SQLite's internal tables and indexes are not application records:
+## Registry and execution
 
-| Table | Durable responsibility |
+A topic has a stable ID, title, short definition and zero or one current native
+session. Topics are flat, without parent relationships, implicit inheritance,
+colors or success inferred from names. Multiple topics can share a session.
+
+The foreground submits faithful topic-specific prompts to the service.
+Service creates an unbound topic's worker, loads an existing worker by its
+original ID, or uses normal enqueue when it is busy. It records actual target
+and native acceptance separately from business completion. An unknown creation
+or send is not permission to create a replacement or repeat the operation.
+
+Register edits are useful operations in their own right. They are not bundled
+into a mandatory `assistant_complete` transaction for every user utterance.
+The old processed/classification loop is retired; retained old data does not
+continue executing that loop.
+
+Explicit adoption or handoff changes future routing. A reply from a different
+session does not automatically take over a topic. A task ID is not a native
+session ID. Existing delivery records keep the actual historical target even
+when the current mapping changes.
+
+## Two trustworthy input sources
+
+The service records whether a foreground interaction was initiated by:
+
+| Source | Permitted consequence |
 | --- | --- |
-| `messages` | Original conversation, source/native identity, attachments, stable display order, processed flag and message-local clarification. |
-| `topic_messages` | One original-message/topic association per result. User-origin results additionally contain the split prompt and its own delivery state/receipt. Session-origin results refer to the original without copying or rewriting it. |
-| `topics` | Flat topic definition and its current session mapping. |
+| A real Assistant client input | Register operations and faithful dispatch of that user's business request. |
+| A result-availability notification | Read and present available results, with necessary consumption bookkeeping. No new business dispatch or proxy answer. |
 
-One original message may produce several topic results. Each result belongs to
-one topic, but a topic can have many results. `processed` means the complete
-semantic result has been saved, not that every outgoing prompt was accepted or
-the underlying task finished. Unanswered clarification leaves the original
-unprocessed but not eligible for repeated coordinator calls.
+The native event name `user.message` does not prove a human spoke. A peer tool
+or service notification can produce the same native event type. Dispatch
+authorization therefore uses the service's saved request and native receipt,
+joined to the actual tool-call interaction, rather than a body prefix or the
+currently selected topic.
 
-There is no durable batch, separate work queue, publication log, session mirror,
-native-event archive, memory store or generic metadata table. Delivery facts
-belong to the actual outgoing topic message, not a separate effects system.
-Module configuration belongs to the host configuration. Session state and
-current native questions are queried through public host APIs.
+The native prompt receipt is `user.message.data.messageId`, not the event
+envelope UUID. A tool call is attributed through its real `toolCallId` and
+`interactionId`. Chronological `parentId` chains are not causal request proof.
+Missing or conflicting attribution fails explicitly.
 
-## Flat topics and one current mapping
+Result text remains evidence. A request in a worker's result does not create new
+user authority. The foreground cannot turn a result-notification interaction
+into a new business prompt by choosing another topic or restating that text.
 
-A topic has a stable ID, a title, content and zero or one current
-ordinary session. There is no parent, tree, foreground topic or implicit title
-hierarchy. A title such as `Xinjiang trip - hotels` is still an ordinary flat
-topic. Several topics may share a session, and a mapping can change without
-migrating its history. Creating a topic alone never creates a native session.
+## Short-term result inbox
 
-The coordinator updates topic definitions and mappings, reviews history only
-when necessary, splits user intent faithfully and attributes replies. It does
-not create sessions, manage deliveries, claim coordinator work or adjudicate
-the quality of another session's response.
+Only explicitly registered, delegated or adopted background sessions are
+observed for results. Having a Skill or an ordinary native role is not topic
+ownership. Parent development sessions, observers, the foreground and manual
+organizers are not collected merely because they produce primary replies.
 
-For one user original, a semantic result supplies topic-specific prompts:
+An eligible result is kept temporarily with its original text, attachment
+references, source session, native message identity and available dispatch/topic
+location. A session serving multiple topics does not prove that every result
+belongs to all of them; uncertain association remains explicit.
 
-```json
-{
-  "messageId": "source-message-id",
-  "items": [
-    { "topicId": "travel", "prompt": "Compare the two travel dates." },
-    { "topicId": "hotel", "prompt": "Find hotels near the station." }
-  ]
-}
-```
+The foreground reads this inbox on demand. Earlier context remains in the
+source session's native history and can be read through the bounded public
+history interface. Reading history does not enroll every encountered session,
+import all history or dispatch anything.
 
-The service supplies the original `messageId`; topic identity and faithful
-content are the semantic result. Work, leases, epochs, runtime versions and wake
-receipts are not model-managed business steps.
-Generated prompts may split or clarify the user's request but cannot add
-authorization, contradict the request or replace its saved original.
-
-## Original conversation before classification
+Inbox lifecycle:
 
 ```text
-Assistant input -> durable original + visible user message
-                          |
-                   one-message classification
-                          |
-             topic/mapping + two-field dispatch
-                          |
-                 user-origin topic_messages
-                          |
-                  ordinary session replies
-                          |
-             original reply + visible reply message
-                          |
-                  one-message attribution
-                          |
-             patch existing message's topic header
+managed worker produces a result
+             |
+   save temporary body + native identity
+             |
+   foreground reads relevant results
+             |
+   declare represented inbox IDs + expected full reply
+             |
+   observe and record that matching persistent native reply
+             |
+   clear temporary body, retain identity and consumption location
 ```
 
-Each user original appears once and never has a topic header, even when it
-produces multiple prompts. Business replies appear before classification.
-Attribution adds a plain title listing the related topics in place, without changing
-the body, timestamp, message identity or unread count. It neither publishes a
-second reply nor asks the responding session to rewrite one. Background
-generated prompts are topic-message delivery records, not user chat bubbles.
+Read success alone never clears a result. Cancellation, lost acknowledgement or
+a crash after reading must leave unpresented content recoverable. There is no
+arbitrary expiry that silently discards pending bodies.
 
-The coordinator processes one eligible original at a time. There is no
-multi-message batch. Service saves the complete set of topic results and the
-original's processed flag in one SQLite transaction, then sends individual
-user-origin results. Original attachments accompany each of that user's split
-prompts. Classification does not require public claim, lease or ACK tokens.
-User input and earlier native observations share the same short validation and
-persistence boundary, so a delayed metadata read cannot save an answer ahead
-of its already-observed question. Coordinator execution and native delivery
-waits stay outside this boundary.
+Consumption records concern presentation, not business-quality acceptance.
+They retain enough source and foreground identity to distinguish a confirmed
+presentation from a tool read or model idle event. A declaration is bound to
+previously read IDs, its actual interaction, the expected full-text hash and
+a later display-sequence boundary. An unrelated reply cannot consume everything
+read in the same interaction; a reply representing only some IDs leaves the
+others intact. Duplicate native observations do not restore a body already
+consumed.
 
-Native acceptance is not business completion. A failed recipient does not cause
-the already-classified original to be split again or another accepted prompt to
-be resent. Exact invocation identity prevents late coordinator tools from
-applying to a different message. Idle, turn-end and elapsed time do not establish
-the outcome of an uncertain native call. Rare unresolved calls can require
-manual handling in the original session; this module does not implement an
-automatic retry, skip, reassignment or general recovery framework.
+Clearing the inbox deletes only the service's temporary copy. It does not erase
+native session history, a foreground reply already shown, native tool records,
+model context or shared attachment files. A native history reference cannot
+reconstruct content that its owner later deletes, and opaque history cursors
+are not promised to remain valid forever.
 
-Only the current original and necessary context are supplied. The coordinator
-can consult stored messages or related native chat when a topic is unclear;
-those reads do not become new inputs. Empty queues wait for events, not model
-polling. The model's long-term context is not the durable source of topic facts.
+## Notifications without a second workflow
 
-## Message-local clarification
+New result metadata waits while the foreground is busy. When appropriate, one
+lightweight prompt can identify several pending results. It contains locations
+and facts such as "new result available" or "waiting for the user", not all
+worker bodies or a claim of successful business completion.
 
-A clarification belongs to the original message. Service saves the question and
-waiting state on that row, leaves it unprocessed and displays a question box
-under its original body. Waiting rows are not repeatedly classified. Other
-eligible originals can continue through the one-message loop.
+The supported native prompt transport can still record this as a native
+`user.message`. Assistant hides its own notification input from the user-facing
+conversation by saved receipt provenance, not by changing or deleting native
+history. This is not a claim that the public API supports a hidden system-message
+transport.
 
-The box submits to its exact message and clarification identity. Service keeps
-the question and answer history without replacing the original text or creating
-an independent user message. Answering makes that original eligible again; it
-does not mark it processed. The coordinator receives the original plus its
-clarifications, and the processed flag advances only with a complete saved
-result. Old or conflicting answers cannot target a newer clarification.
+Results actively read and presented before a pending notice is sent do not
+produce another notification. Empty or stale notices are not invitations for
+recursive acknowledgements. Native/control events drive work; no global
+periodic session scan, new batch service or reminder agent is introduced.
 
-## Delivery facts and correlation
+## Questions and real answers
 
-SQLite uses WAL and `synchronous=FULL`. A Linux abstract-socket lease prevents
-two cooperating activations from operating the same store. Original input and
-its stable request receipt commit before acceptance. Changed request bodies
-conflict; a retry of the same request returns its original receipt.
+A background native question retains its source session, exact request ID,
+question, choices and freeform constraints. The foreground presents the question
+to the user without supplying an answer itself. A new user's answer is routed
+by the service using the real current request. A normal prompt is not used to
+pretend that a native ask was answered.
 
-| Delivery state | Meaning |
-| --- | --- |
-| `pending` | No native message call has started. |
-| `calling` | Durable call intent exists; the native call may be in progress. |
-| `accepted` | Native acceptance was observed, not reading or completion. |
-| `rejected` | A precondition or explicit native rejection prevented delivery. |
-| `unknown` | The effect may have happened; automatic resend is forbidden. |
-| `cancelled` | This local operation has been explicitly abandoned. |
+The native answer comes from the immutable complete human original in a
+single-topic dispatch, not a generated split prompt. Freeform answers cannot be
+rewritten by the foreground. A constrained choice requires the whole answer to
+match, not merely contain the option. Ambiguous or mixed input leaves the
+question waiting for a separate human answer.
 
-Each outgoing topic message has its own delivery facts. One destination's failure
-does not repeat another destination's accepted prompt. Recovery turns a
-crashed `calling` state into `unknown`, not `pending`. This is deliberately not
-a cross-system exactly-once promise.
+Optional native fields are compared semantically. Missing or `undefined` choices
+mean no offered choices; an unspecified freeform flag uses the native default.
+This avoids false identity conflicts after SQL serialization while retaining
+checks for changed question text, option order, request identity and real
+constraint changes.
 
-An unmapped topic's first delivery creates a session using configured
-`defaultCwd` (the home directory by default) and the host's native default model.
-The actual new ID is saved before further observation or delivery. Uncertain
-creation blocks replacement creation. An unloaded mapped session is loaded by
-its existing ID; a loaded busy session receives normal enqueue delivery.
-Neither path changes models, reloads loaded sessions or interrupts native work.
-Shared sessions receive a short focus/splitting suggestion, not a fabricated
-authorization or automatic migration.
+Native ask APIs do not accept attachments. Unsupported attachments are not
+silently dropped or redirected. Rare stuck questions after a handoff can be
+handled in the source session rather than building historical-question
+arbitration or an automatic repair loop.
 
-Preparing a session is separate from calling `prompt`. A lost load response
-does not establish an unknown prompt. Bounded preparation can read the same
-native identity and continue the still-unsent message. Missing or newly
-internal targets fail explicitly instead of silently creating replacements.
+## Actual tool boundaries
 
-Business reply ingestion is live-only, not gated by delivery correlation.
-Ordinary primary response segments and native questions received while service
-runs are eligible, including background continuations. Native user messages,
-internal role carriers, subagent transcripts, reasoning and tool payloads are
-not the feed. Stable native identity deduplicates repeated notifications.
-Messages from service downtime are not backfilled, and no per-session history
-cursor is stored.
+The foreground has only the Assistant service toolkit. Shell, filesystem,
+browser, generic Cockpit/GitHub MCP, unrelated servers and subagent-execution
+tools are not alternative business paths. Native tool scope must be applied
+and observable after creation and cold loading; prompt instructions or UI
+hiding are not sufficient.
 
-Internal coordinator calls have a different boundary. The host's
-native `toolCallId` joins the exact originating `assistant.message.toolRequests`
-and `interactionId`, then the `user.message.data.messageId` matching the saved
-wake receipt. Missing, conflicting or stale invocation provenance is rejected;
-an in-memory current-source pointer alone never authorizes a tool. This control evidence does not
-ingest native user text into Assistant. `parentId` is chronological, not causal.
-Receipt availability and native scheduling readiness do not imply interaction
-completion, and idle/turn-end events do not end business reply observation.
+The shared topic Skill is a source document. Packaging incorporates its body
+into the foreground and organizer role instructions, so a restricted foreground
+does not need filesystem or Skill-reading tools to obtain its required guidance.
 
-## Questions and attachments
+Worker templates have their own selected tools and resources. They do not
+inherit foreground identity and do not expose arbitrary peer prompt or
+human-answer channels by default. Existing unscoped sessions are not falsely
+reported as restricted just because a new template was saved.
 
-A business session's native question retains its exact request identity, choices and
-freeform restrictions. For a topic's current session, service checks the
-host's current pending question and its topic association. A user prompt for
-that topic answers that current question when present; otherwise it is sent as
-an ordinary prompt. The backend rechecks the same question
-before sending. Exact choices remain choices; allowed freeform answers retain
-the user's wording. Attachments are rejected for native answers without being
-silently discarded or bypassed through a normal prompt. All ordinary business
-questions are eligible; they need not prove ownership by a particular Assistant
-prompt. Historical questions in retired sessions are not candidate answers for
-the current mapping. A rare stuck handoff can be handled directly in its
-original session instead of adding historical-question arbitration.
+Tool scope controls native model-visible and callable tools, not the operating
+system. The runtime permission policy remains `allow-all`; this feature does
+not add approval dialogs or claim to sandbox same-user code.
 
-Native attachment descriptors are preserved in the immutable original,
-versioned source and independent deliveries. Preview URLs are not native
-paths. Acceptance never proves that a path still exists or that a model read
-or supports the attachment. The public host draft remains the owner of editable
-text, attachments, keyboard behavior and compatible Speech/File enhancements.
+## Configuration, preservation and clients
 
-## Schema and role transition
+Host module configuration owns persistent defaults. A worker template applies
+to new workers and is separate from the foreground session selection.
+Changing defaults does not silently reload, reassign, cancel or create Tasks
+for existing workers. Applying a template to an existing session requires an
+explicit safe operation with its native identity and history preserved.
 
-Schema 3 uses the three-table model. Schema 1, schema 2 and a mismatched
-schema 3 layout are rejected before modifying the database. There is no automatic
-deletion, migration or reset. Replacing old state is a separately authorized
-operator action, not part of package installation or startup.
-Never point development or acceptance runs at a production data root.
+Existing schema 3 topics, original messages, mappings and delivery evidence
+remain available through a forward, data-preserving transition. Old
+classification history is an archive, not a source of new foreground prompts.
+The package cannot delete an existing database or call a destructive reset a
+nondestructive migration.
 
-The old release descriptor incorrectly treated target-schema tables as
-preservation projections over the source database. In particular, querying
-`batches` before upgrading schema 1 fails because that table does not exist.
-Declaring no preservation projections avoids that particular query but does
-not itself authorize a schema transition. Destructive reset must not be
-declared as a nondestructive migration. See [releases](releases.md) for the
-deployment contract and its availability boundary.
+The main transcript contains real user inputs and natural foreground responses.
+Generated worker prompts, raw worker results and internal notifications are not
+duplicate conversation bubbles. The published client contract identifies the
+foreground protocol separately from the old aggregation feed; see
+[API and setup](api.md).
 
-The current coordinator role has no claim/lease/wake-ACK protocol and no memory
-dependency. Merely publishing a package does not apply new instructions to an
-already-loaded carrier. Use normal host role application/loading controls and
-then inspect actual readiness; do not silently replace registered carriers.
-
-The database and WAL require SQLite-aware backups. There is no automatic
-retention, arbitrary corruption recovery, or claim that deleting Assistant
-state makes a native model forget its conversation.
-
-## Retirement of the previous protocol
-
-| Product requirement | Disposition |
-| --- | --- |
-| D01: one topic per input | One original may dispatch to several flat topics. |
-| D02: one decision per claimed work | One original produces one complete set of topic results. |
-| D03: full-text multi-target forwarding | Topic-specific prompts preserve the original separately. |
-| D04: classification before visibility | Originals appear first; replies gain headers later. |
-| D05: coordinator proof/lease/version | Removed from coordinator business tools. |
-| D06: model-managed session creation | Service creates only when a mapped destination is needed. |
-| D07: wake ACK | No coordinator ACK protocol. |
-| D08: old rejection blocks new work | Failures remain explicit; no general retry/recovery framework. Rare stuck work is handled in its original session. |
-| D09: per-event reminders and empty polling | One eligible original at a time; unanswered clarification waits on that message and empty queues do not call the model. |
-| D10: metadata-only routing | Coordinator submits faithful topic-specific prompts. |
-| D11: publish/rewrite gate | Attribution only; original replies are already visible. |
-| D12: route context and handoff procedure | Replaced by topic content and current session mapping. |
-| D13: `replyTo` | Rejected at the input boundary; native asks retain real identity. |
-| D14: foreground-centered memory | No foreground pointer or memory dependency in this version. |
-| D15: normal technical receipt UI | Receipts remain diagnostic, not normal conversation controls. |
-| D16: topic tree | Flat records only. |
-| D17: old and new protocols together | Three-table schema and one coordinator protocol; no compatibility execution path. |
+The shared public Chat composition, owner drafts, File/Speech enhancements, IME
+and reading-position controller remain the presentation boundary. No private
+native Chat imports, duplicate React root or competing scroll implementation
+is needed.

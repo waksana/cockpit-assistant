@@ -2,12 +2,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import type { Message, Table, Tables, Topic, TopicMessage } from './types.ts';
+import type { ForegroundInput, InboxItem, Message, Table, Tables, Topic, TopicMessage, Worker } from './types.ts';
 import { requireFact } from './errors.ts';
 import { attachmentsSchema } from './attachments.ts';
+import { questionIdentity } from './question.ts';
 
-export const SCHEMA_VERSION = 3;
-const definitions = {
+export const SCHEMA_VERSION = 4;
+export const legacyDefinitions = {
   messages: `CREATE TABLE messages (
     id TEXT PRIMARY KEY NOT NULL, sequence INTEGER NOT NULL UNIQUE, revision INTEGER NOT NULL,
     kind TEXT NOT NULL CHECK(kind IN ('user','reply','ask')), raw TEXT NOT NULL,
@@ -50,16 +51,53 @@ const definitions = {
     CHECK(mode!='ask' OR (request_id IS NOT NULL AND was_freeform IS NOT NULL)))`,
 } as const;
 const normalize = (sql: string) => sql.replace(/\s+/g, ' ').trim();
-function inspectSchema(sql: DatabaseSync): number {
+const definitions = legacyDefinitions;
+export function inspectSchema(sql: DatabaseSync): number {
   const version = Number(sql.prepare('PRAGMA user_version').get()?.user_version ?? 0);
   const existing = sql.prepare("SELECT name,type,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','view','trigger')").all();
-  requireFact(version === SCHEMA_VERSION || version === 0 && existing.length === 0,
-    'SCHEMA_VERSION', 'Assistant requires its three-table schema 3; existing data must not be migrated or reset automatically');
-  if (version === SCHEMA_VERSION) requireFact(existing.length === 3 && existing.every(row =>
+  requireFact([3, 4].includes(version) || version === 0 && existing.length === 0,
+    'SCHEMA_VERSION', 'Assistant supports empty storage, exact schema 3, or additive schema 4; no reset is permitted');
+  if (version === 3) requireFact(existing.length === 3 && existing.every(row =>
     row.type === 'table' && Object.hasOwn(definitions, String(row.name))
     && normalize(String(row.sql)) === normalize(definitions[String(row.name) as Table])),
   'SCHEMA_TABLES', 'Assistant schema 3 must exactly match messages, topic_messages and topics');
+  if (version === 4) {
+    const expected = ['messages', 'topic_messages', 'topics', 'foreground_inputs', 'inbox', 'workers', 'tool_actions'];
+    requireFact(existing.length === expected.length && existing.every(row => row.type === 'table' && expected.includes(String(row.name))),
+      'SCHEMA_TABLES', 'Assistant schema 4 contains unexpected or missing tables');
+    for (const table of ['topics', 'topic_messages'] as const) {
+      requireFact(normalize(String(existing.find(row => row.name === table)?.sql)) === normalize(definitions[table]),
+        'SCHEMA_TABLES', `Retained ${table} schema changed`);
+    }
+    const actual = normalize(String(existing.find(row => row.name === 'messages')?.sql));
+    requireFact(actual.replace(", conversation TEXT NOT NULL DEFAULT '{\"channel\":\"legacy\",\"targetSessionId\":null,\"rootId\":null}' CHECK(json_valid(conversation))", '')
+      === normalize(definitions.messages),
+      'SCHEMA_TABLES', 'Retained messages schema changed');
+    for (const [table, definition] of Object.entries(additions))
+      requireFact(normalize(String(existing.find(row => row.name === table)?.sql)) === normalize(definition),
+        'SCHEMA_TABLES', `Assistant ${table} schema changed`);
+  }
   return version;
+}
+const additions = {
+  foreground_inputs: 'CREATE TABLE foreground_inputs (id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL CHECK(json_valid(payload)))',
+  inbox: 'CREATE TABLE inbox (id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL CHECK(json_valid(payload)))',
+  workers: 'CREATE TABLE workers (id TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL CHECK(json_valid(payload)))',
+  tool_actions: 'CREATE TABLE tool_actions (id TEXT PRIMARY KEY NOT NULL, fingerprint TEXT NOT NULL, result TEXT NOT NULL CHECK(json_valid(result)))',
+};
+/** Explicit, transactional forward migration. Existing rows and schema-3 receipts are never rewritten. */
+export function migrateSchema4(sql: DatabaseSync): { from: number; to: 4; changed: boolean } {
+  const from = inspectSchema(sql);
+  requireFact(from !== 0, 'MIGRATION_TARGET', 'Create empty storage through Database; migration requires an existing schema-3 or schema-4 target');
+  if (from === 4) return { from, to: 4, changed: false };
+  sql.exec('BEGIN IMMEDIATE');
+  try {
+    sql.exec("ALTER TABLE messages ADD COLUMN conversation TEXT NOT NULL DEFAULT '{\"channel\":\"legacy\",\"targetSessionId\":null,\"rootId\":null}' CHECK(json_valid(conversation))");
+    for (const definition of Object.values(additions)) sql.exec(definition);
+    sql.exec('PRAGMA user_version=4');
+    sql.exec('COMMIT');
+    return { from, to: 4, changed: true };
+  } catch (error) { sql.exec('ROLLBACK'); throw error; }
 }
 export function fingerprint(value: unknown): string {
   const canonical = (v: unknown): string => {
@@ -87,7 +125,8 @@ function decode<T extends Table>(table: T, row: Row): Tables[T] {
           ...(row.question_allow_freeform === null ? {} : { allowFreeform: !!row.question_allow_freeform }) },
         state: row.question_state as NonNullable<Message['question']>['state'], stateVersion: Number(row.question_version) },
       clarificationHistory: history,
-      clarification: history.find(item => item.answer === null) ?? null };
+      clarification: history.find(item => item.answer === null) ?? null,
+      conversation: row.conversation ? parse(row.conversation) as Message['conversation'] : undefined };
     if (row.input_request_id) message.input = { requestId: String(row.input_request_id),
       text: message.raw, attachments, fingerprint: String(row.input_fingerprint) };
     return message as Tables[T];
@@ -130,6 +169,7 @@ export class Database {
           CREATE INDEX topic_messages_pending ON topic_messages(origin,state);
           PRAGMA user_version=3`);
       });
+      migrateSchema4(this.sql);
     } catch (error) { this.sql.close(); throw error; }
   }
   transaction<T>(fn: () => T): T {
@@ -156,9 +196,9 @@ export class Database {
     if (table === 'messages') {
       const m = value as Message, old = this.get('messages', m.id);
       if (old) requireFact(fingerprint([old.kind, old.raw, old.attachments, old.sessionId,
-        old.nativeMessageId, old.nativeEventId, old.sequence, old.createdAt, old.input, old.question?.request])
+        old.nativeMessageId, old.nativeEventId, old.sequence, old.createdAt, old.input, questionIdentity(old.question?.request)])
         === fingerprint([m.kind, m.raw, m.attachments, m.sessionId,
-          m.nativeMessageId, m.nativeEventId, m.sequence, m.createdAt, m.input, m.question?.request]),
+          m.nativeMessageId, m.nativeEventId, m.sequence, m.createdAt, m.input, questionIdentity(m.question?.request)]),
       'IMMUTABLE_ORIGINAL', 'Original input, native body, source identity and display order cannot change');
       for (const entry of old?.clarificationHistory ?? []) {
         const current = m.clarificationHistory.find(item => item.id === entry.id);
@@ -172,7 +212,7 @@ export class Database {
       requireFact(!old?.processed || m.processed, 'PROCESSED_IMMUTABLE', 'Completed semantic results cannot be reopened');
       requireFact(!old?.excluded || m.excluded, 'INTERNAL_SOURCE', 'An old internalized source cannot be resumed as business input');
       m.revision = this.watermark + 1;
-      this.sql.prepare(`INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      this.sql.prepare(`INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,processed=excluded.processed,
           excluded=excluded.excluded,diagnostic=excluded.diagnostic,question_state=excluded.question_state,
           question_version=excluded.question_version,
@@ -183,7 +223,7 @@ export class Database {
         m.question?.request.choices ? JSON.stringify(m.question.request.choices) : null,
         m.question?.request.allowFreeform === undefined ? null : Number(m.question.request.allowFreeform),
         m.question?.state ?? null, m.question?.stateVersion ?? 0,
-        JSON.stringify(m.clarificationHistory));
+        JSON.stringify(m.clarificationHistory), JSON.stringify(m.conversation ?? { channel: 'legacy', targetSessionId: null, rootId: null }));
       return;
     }
     if (table === 'topics') {
@@ -266,17 +306,12 @@ export class Database {
     return this.sql.prepare('SELECT m.* FROM messages m JOIN topic_messages tm ON tm.message_id=m.id WHERE tm.topic_id=?')
       .all(topicId).map(row => decode('messages', row));
   }
-  eligible(): Message | undefined {
-    const row = this.sql.prepare(`SELECT * FROM messages WHERE processed=0 AND excluded=0 AND diagnostic IS NULL
-      AND NOT EXISTS(SELECT 1 FROM json_each(clarification_history) WHERE json_extract(value,'$.answer') IS NULL)
-      ORDER BY sequence LIMIT 1`).get();
-    return row ? decode('messages', row) : undefined;
-  }
-  messagePage(direction: 'before' | 'after', cursor: number | undefined, limit: number) {
+  messagePage(direction: 'before' | 'after', cursor: number | undefined, limit: number, legacy = false) {
     requireFact(Number.isSafeInteger(limit) && limit >= 1 && limit <= 100
       && (cursor === undefined || Number.isSafeInteger(cursor) && cursor >= 0), 'PAGINATION', 'Invalid message cursor', 400);
     const field = direction === 'before' ? 'sequence' : 'revision';
-    const rows = this.sql.prepare(`SELECT * FROM messages WHERE ${field}${direction === 'before' ? '<' : '>'}?
+    const rows = this.sql.prepare(`SELECT * FROM messages WHERE json_extract(conversation,'$.channel') ${legacy ? '=' : '!='} 'legacy'
+      AND ${field}${direction === 'before' ? '<' : '>'}?
       ORDER BY ${field} ${direction === 'before' ? 'DESC' : 'ASC'} LIMIT ?`)
       .all(cursor ?? (direction === 'before' ? Number.MAX_SAFE_INTEGER : 0), limit + 1);
     const selected = rows.slice(0, limit), items = selected.map(row => decode('messages', row));
@@ -284,6 +319,29 @@ export class Database {
     return { items, before: items.length ? Math.min(...items.map(m => m.sequence)) : null,
       cursor: direction === 'after' ? items.at(-1)?.revision ?? cursor ?? 0 : undefined,
       hasMore: rows.length > limit, watermark: this.watermark };
+  }
+  record<T extends 'foreground_inputs' | 'inbox' | 'workers'>(table: T, id: string):
+    ({ foreground_inputs: ForegroundInput; inbox: InboxItem; workers: Worker })[T] | undefined {
+    const row = this.sql.prepare(`SELECT payload FROM ${table} WHERE id=?`).get(id);
+    return row ? JSON.parse(String(row.payload)) : undefined;
+  }
+  records<T extends 'foreground_inputs' | 'inbox' | 'workers'>(table: T):
+    ({ foreground_inputs: ForegroundInput; inbox: InboxItem; workers: Worker })[T][] {
+    return this.sql.prepare(`SELECT payload FROM ${table} ORDER BY rowid`).all().map(row => JSON.parse(String(row.payload)));
+  }
+  save<T extends 'foreground_inputs' | 'inbox' | 'workers'>(table: T,
+    value: ({ foreground_inputs: ForegroundInput; inbox: InboxItem; workers: Worker })[T]): void {
+    this.sql.prepare(`INSERT INTO ${table}(id,payload) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload`)
+      .run(value.id, JSON.stringify(value));
+  }
+  toolAction(id: string, value: unknown): unknown | undefined {
+    const row = this.sql.prepare('SELECT * FROM tool_actions WHERE id=?').get(id);
+    if (!row) return;
+    requireFact(row.fingerprint === fingerprint(value), 'IDEMPOTENCY_CONFLICT', 'Native tool action changed its arguments');
+    return JSON.parse(String(row.result));
+  }
+  saveToolAction(id: string, value: unknown, result: unknown): void {
+    this.sql.prepare('INSERT INTO tool_actions VALUES(?,?,?)').run(id, fingerprint(value), JSON.stringify(result));
   }
   close(): void { this.sql.close(); }
 }

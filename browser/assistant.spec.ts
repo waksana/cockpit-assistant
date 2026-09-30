@@ -33,11 +33,10 @@ test('real host global menu opens on an empty homepage; complete conversation an
   await expect(messages).toHaveCount(timeline.length);
   expect(await messages.evaluateAll(elements => elements.map(element => element.getAttribute('data-ca-item'))))
     .toEqual(timeline.map(item => item.id));
-  await expect(page.locator('.ca-topic-heading')).toHaveCount(4);
+  await expect(page.locator('.ca-topic-heading')).toHaveCount(0);
   await expect(messages.first().locator('.ca-topic-heading')).toHaveCount(0);
   await expect(messages.nth(1).locator('.ca-topic-heading')).toHaveCount(0);
-  await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveText('旅行计划 A');
-  await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveCSS('border-inline-start-width', '0px');
+  await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveCount(0);
   await expect(messages.first()).toContainText('A：先讨论旅行计划');
   await expect(messages.nth(1)).toContainText('B：现在讨论代码审查');
   await expect(messages.nth(2)).toContainText('A：继续刚才的旅行计划');
@@ -285,13 +284,16 @@ test('six long question choices stay in the scroller and never replace the publi
   assertClean(fixture);
 });
 
-test('role registration belongs to Cockpit; no manual UUID, create, bind or reception enrollment forms', async ({ page }) => {
+test('foreground setup requires an explicit scoped binding without manual UUID or enrollment forms', async ({ page }) => {
   const fixture = await installFixture(page, { ready: false, items: [], hasOlder: false });
   await page.goto('/');
   await openAssistant(page);
   await detail(page, /^coordinator：/);
   const setup = page.getByRole('region', { name: '状态详情', exact: true });
-  await expect(setup).toContainText('在 Cockpit 创建会话或添加角色时选择 coordinator');
+  await expect(setup).toContainText('创建并绑定受限的 coordinator');
+  await expect(setup).toContainText('保存 foregroundSessionId');
+  await expect(setup).toContainText('仅添加角色不会选择前台');
+  await expect(setup).not.toContainText('自动登记');
   await expect(setup.locator('input,select,form')).toHaveCount(0);
   await expect(page.getByRole('button', { name: /^(创建会话|绑定|接入接待者|检查会话)/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'coordinator：未绑定' })).toHaveText('coordinator');

@@ -1,46 +1,45 @@
 # Cockpit Assistant
 
-Assistant is a trusted Cockpit module for durable topic-based
-conversation across ordinary native sessions. It does not require
-Task or replace native history. The global menu's **助手** action opens its
+Assistant is a trusted Cockpit module with one continuous foreground native
+conversation and a register of background topics. It does not require Task or
+replace native history. The global menu's **助手** action opens its
 session-independent SPA page, including on an empty Cockpit home. Direct URLs,
 refresh and browser forward/back navigation retain the page; its return arrow
 always goes to Cockpit home.
 
-The coordinator processes one original message at a time, identifies flat topics
-and produces topic-specific results. The service saves those results, creates or
-loads target sessions, queues user prompts and displays original conversation.
-Select `coordinator` through Cockpit's normal role controls; role selection does
-not itself prove readiness. This version does not run or require a memory role.
+The foreground independently manages only the current topic register: names,
+scope, session mappings, actual progress and overviews. Every business request,
+including discussion or the design of Assistant itself, is faithfully routed
+through the service to a background session. The foreground reads and presents
+worker results; it does not review business quality, resolve disagreements, add
+conclusions or ask workers for more work without a new user instruction.
 
-Assistant is the user input entry. New ordinary primary replies and native
-questions are collected while the service runs. Native session user messages,
-forwarded prompt copies and internal role output do not become new Assistant
-inputs. Events from service downtime are not backfilled. The coordinator can
-read stored messages or related native history on demand to clarify a topic;
-those reads do not import or reprocess history.
+Only the Assistant service toolkit is available to the foreground. The required
+guidance is physically included in its role instructions, rather than depending
+on access to a Skill-reading or filesystem tool. A persistent worker template
+controls newly created background sessions separately. Existing workers and their
+worktrees are not silently reconfigured. The shared topic-management Skill is
+also available to manually selected `organizer` sessions without making them the
+foreground or automatically enrolling their messages.
 
-Inputs need no reply selection or `replyTo`. The service uses a topic's current
-session and its current matching native question, answering through the real
-request ID when one is pending and otherwise sending a prompt. Native
-choice/freeform and attachment restrictions still apply. Rare unresolved
-handoffs or questions can be handled in the original session.
+Only explicitly managed background sessions feed a short-term result inbox.
+The service records pending results and sends lightweight location notifications
+when appropriate; it does not inject every worker response into the foreground.
+Reading alone does not delete an inbox body. A recorded presentation/consumption
+boundary clears only the temporary copy, keeping native identity and consumed
+metadata. Native histories and shared files remain untouched.
 
-The page uses the same public conversation layout, message and Composer surfaces
-as Chat. Originals appear once immediately. User originals have no topic label;
-session replies acquire a plain heading listing their topics in place, without
-topic colors or rewritten answers. Generated prompts are not additional bubbles.
-When meaning is unclear, a clarification box belongs to the original message.
-Its answer is saved with that message before the coordinator resumes processing;
-it is not another ordinary input to classify.
+The page retains Chat's shared layout, messages, owner Composer, File/Speech
+enhancements and reading behavior. It shows real user inputs and natural
+foreground replies once. Internal notifications, generated dispatch prompts and
+raw background results are not extra chat bubbles. Native question constraints
+and the real user's answer remain authoritative.
 
-The persistence model has three application tables: `messages` for originals and
-local clarification, `topic_messages` for topic associations and user-prompt
-delivery, and `topics` for definitions and current mappings. There is no separate
-batch, work, session mirror, delivery ledger or publication log.
-See [architecture](docs/architecture.md#three-table-persistence) for ownership and
-the schema compatibility boundary. Installing a new package does not authorize
-replacing an incompatible old database.
+Schema 3 data is retained through the documented forward transition; old
+classification history and receipts are not replayed as new business work.
+See [architecture](docs/architecture.md) for ownership, provenance and inbox
+lifecycle, and [API and setup](docs/api.md) for the versioned client contract.
+Publication is not permission to reset existing data.
 
 ## Development
 
@@ -80,7 +79,8 @@ and browser lifecycle boundaries.
 See [API and role setup](docs/api.md) for host compatibility, initialization,
 HTTP/MCP payloads, and recovery; [architecture and reliability](docs/architecture.md)
 for the trust model; and the role protocols in
-[coordinator](roles/coordinator.md) and [memory](roles/memory.md).
+[coordinator](roles/coordinator.md), [organizer](roles/organizer.md) and
+[worker](roles/worker.md).
 
 Merged main pull requests produce immutable Rolling Releases as described in
 [releases](docs/releases.md). Publication does not install, deploy, or restart
@@ -90,5 +90,5 @@ The initial backend implementation is tracked in
 [issue #1](https://github.com/waksana/cockpit-assistant/issues/1).
 The interface follow-up is tracked in
 [issue #3](https://github.com/waksana/cockpit-assistant/issues/3).
-Role registration and automatic session observation are tracked in
-[issue #5](https://github.com/waksana/cockpit-assistant/issues/5).
+The continuous foreground and managed-worker model is tracked in
+[issue #17](https://github.com/waksana/cockpit-assistant/issues/17).

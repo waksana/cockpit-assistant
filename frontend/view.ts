@@ -5,7 +5,6 @@ import type { Role } from '../src/types.ts';
 import type { TimelineItem } from '../src/ui-types.ts';
 import { createIcon } from './icons.ts';
 import { conversationItems } from './timeline.ts';
-import type { Clarification } from './clarification.ts';
 
 const statusNames = {
   ready: '已就绪', unbound: '未绑定', unloaded: '未加载', invalid: '不可用', unknown: '状态未知',
@@ -26,41 +25,9 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
   const Transcript = context.components.get('conversationTranscript');
   const ChatMessage = context.components.get('chatMessage');
   const Button = context.components.get('button');
-  const ComposerEditor = context.components.get('composerEditor');
   const button = (text: string, onClick: () => void, disabled = false, extra: Record<string, unknown> = {}) =>
     h(Button, { type: 'button', onClick, disabled, ...extra }, text);
-  function ClarificationCard({ messageId, value }: { messageId: string; value: Clarification }) {
-    const client = store.getClarification(messageId, value.id);
-    if (!client) throw new Error('澄清答复输入尚未准备');
-    const draft = useSyncExternalStore(client.draft.subscribe, client.draft.getSnapshot, client.draft.getSnapshot);
-    const question = client.question;
-    const answered = question.answer !== null;
-    const disabled = answered || draft.pending || draft.unconfirmed || !draft.editable;
-    const pendingLabel = draft.pending ? '正在保存答复…' : draft.unconfirmed ? '答复状态未确认，已保留原提交'
-      : !draft.editable && !answered ? '待核对已保存的答复' : '等待补充';
-    return h('section', { className: 'ca-clarification', role: 'group',
-      'aria-label': answered ? '已完成的澄清' : '需要澄清', 'aria-busy': draft.pending,
-      'data-ca-clarification': value.id, 'data-state': answered ? 'answered' : 'pending' },
-    h('div', { className: 'ca-clarification-heading' },
-      h('strong', null, '需要澄清'),
-      h('span', { role: 'status' }, answered ? '已补充' : pendingLabel)),
-    h(ChatMessage, { identity: { owner: 'assistant', id: `clarification:${messageId}:${value.id}`, kind: 'ask' },
-      complete: true, role: 'assistant', timestamp: value.createdAt, showTimestamp: false,
-      previous: { role: 'assistant', timestamp: value.createdAt }, body: question.question }),
-    answered ? h(ChatMessage, {
-      identity: { owner: 'assistant', id: `clarification-answer:${messageId}:${value.id}`, kind: 'message', role: 'user' },
-      complete: true, role: 'user', timestamp: question.answeredAt ?? value.createdAt, showTimestamp: false,
-      previous: { role: 'user', timestamp: question.answeredAt ?? value.createdAt }, body: question.answer ?? '',
-    }) : h(Fragment, null,
-      question.choices.length ? h('div', { className: 'ca-clarification-choices' },
-        ...question.choices.map(choice => button(choice, () => { void client.choose(choice); }, disabled, { key: choice }))) : null,
-      question.allowFreeform ? h(ComposerEditor, { draft: client.draft, operation: 'ask',
-        disabled, busy: draft.pending, placeholder: '补充这条消息…', submitLabel: '提交补充',
-        sendBlocked: !draft.hasContent || !draft.submittable || draft.blocks.length > 0 || disabled,
-        onTextChange: client.edit, onSubmit: () => { void client.submit(); } }) : null),
-    client.error ? h('p', { role: 'alert', className: 'ck-danger ca-wrap' }, client.error) : null);
-  }
-  function Message({ item, previous }: { item: TimelineItem; previous?: TimelineItem }) {
+  function Message({ item, previous, legacy }: { item: TimelineItem; previous?: TimelineItem; legacy: boolean }) {
     const role = item.speaker === 'user' ? 'user' : 'assistant';
     const body = item.question?.choices?.length
       ? `${item.text}\n\n${item.question.choices.map(choice => `- ${choice.replace(/\n/g, '\n  ')}`).join('\n')}`
@@ -69,22 +36,26 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
       'data-ca-message-id': item.id,
       identity: { owner: 'assistant', id: itemKey(item),
       kind: 'message', role }, complete: true, role, timestamp: item.createdAt,
-      header: role === 'assistant' && item.topicTitle
+      header: legacy && role === 'assistant' && item.topicTitle
         ? h('h3', { className: 'ca-topic-heading' }, item.topicTitle) : undefined,
       body, attachments: item.attachments,
       previous: previous ? { role: previous.speaker === 'user' ? 'user' : 'assistant',
         timestamp: previous.createdAt } : undefined,
     }, ...(item.diagnostic ? [h('p', { key: 'diagnostic', role: 'alert', className: 'ck-danger ca-wrap' }, item.diagnostic)] : []),
-    ...(item.clarifications ?? []).map(value =>
-      h(ClarificationCard, { key: value.id, messageId: item.id, value })),
+    ...(legacy ? item.clarifications ?? [] : []).map(value =>
+      h('section', { key: value.id, className: 'ca-clarification', 'aria-label': '旧版澄清记录' },
+        h('strong', null, '旧版澄清记录（只读）'),
+        h('p', { className: 'ca-wrap' }, value.question),
+        h('p', { className: 'ca-wrap' }, value.answer ?? '当时尚未回答；此旧流程不再执行。'))),
     ...(item.deliveryIssues ?? []).map(issue => h('p', {
       key: issue.topicMessageId, role: 'alert', className: 'ck-danger ca-wrap',
     }, issue.detail)));
   }
 
   function Conversation({ snapshot }: { snapshot: Snapshot }) {
+    const legacy = snapshot.view === 'legacy';
     const items = useMemo(() => conversationItems(snapshot.items), [snapshot.items]);
-    const scroll = context.conversation.useScroll({ key: 'assistant', items, itemKey });
+    const scroll = context.conversation.useScroll({ key: `assistant:${legacy ? 'legacy' : 'conversation'}`, items, itemKey });
     const { viewport, content, changed, follow } = scroll;
     const previous = useRef<readonly TimelineItem[] | null>(null);
     const lastSubmission = useRef(snapshot.draft.submissionId);
@@ -110,7 +81,7 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
     const rolesReady = snapshot.readiness?.roles.some(entry =>
       entry.role === 'coordinator' && entry.status === 'ready');
     const unresolvedSend = snapshot.draft.pending || snapshot.draft.unconfirmed;
-    const canSend = !!snapshot.readiness?.canSend && rolesReady && !snapshot.checking
+    const canSend = !legacy && !!snapshot.protocolReady && !!snapshot.readiness?.canSend && rolesReady && !snapshot.checking
       && !snapshot.readinessError && !unresolvedSend && snapshot.draft.hasContent
       && snapshot.draft.submittable && !snapshot.draft.blocks.length;
     const send = () => { if (canSend) void store.send(); };
@@ -141,7 +112,8 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
         selectedReadiness?.sessionId ? h('p', { className: 'ca-wrap' }, '会话：', selectedReadiness.sessionId) : null,
         selectedReadiness?.detail ? h('p', { className: 'ca-wrap' }, selectedReadiness.detail) : null,
         roleState(selectedRole) === 'unbound' ? h('p', null,
-          '在 Cockpit 创建会话或添加角色时选择 ', selectedRole, '；保存后会自动登记，登记不代表就绪。') : null,
+          '请通过 Assistant 设置接口创建并绑定受限的 ', selectedRole, '，再保存 foregroundSessionId。仅添加角色不会选择前台。') : null,
+        button('查看旧版记录', () => store.showLegacy(true), snapshot.loading),
         snapshot.readinessError ? h('p', { role: 'alert', className: 'ck-danger ca-wrap' }, snapshot.readinessError) : null,
         button(snapshot.checking ? '正在检查…' : '刷新就绪状态', () => { void store.refresh(); }, snapshot.checking),
         ...snapshot.setup.filter(operation => operation.state !== 'accepted').map(operation =>
@@ -163,8 +135,9 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
               event.preventDefault(); goHome();
             }
           } }, icon('arrow-left')),
-        title: h('h1', { id: `${id}-title`, className: 'ck-heading' }, '助手'),
+        title: h('h1', { id: `${id}-title`, className: 'ck-heading' }, legacy ? '助手 · 旧版记录' : '助手'),
         actions: h('div', { className: 'ca-status-controls' },
+        ...(legacy ? [button('返回当前对话', () => store.showLegacy(false))] : []),
         statusButton('coordinator', `coordinator：${stateName(roleState('coordinator'))}`, roleState('coordinator')),
         statusButton('connection', connectionLabel, snapshot.stream)) }),
       statusOpen ? h('section', { id: `${id}-status`, className: 'ca-status-detail', 'aria-label': '状态详情',
@@ -173,13 +146,14 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
         } },
         localStatus()) : null),
         notices: h(Fragment, null,
+          legacy ? h('p', { role: 'status', className: 'ck-status-text' }, '旧版记录只读保留，不会重新分类、派发或回答旧问题。') : null,
           snapshot.draft.unconfirmed ? h('p', { role: 'status', className: 'ck-status-text' },
             '暂时无法确认发送状态，草稿已保留。连接恢复后会自动确认，不会重复发送。') : null,
           snapshot.error && statusOpen !== 'connection'
             ? h('p', { role: 'alert', className: 'ck-danger ca-wrap' }, snapshot.error) : null),
-        composer: h(Composer, { draft: store.draft, operation: 'prompt', disabled: !snapshot.draft.editable,
+        composer: h(Composer, { draft: store.draft, operation: 'prompt', disabled: legacy || !snapshot.draft.editable,
           busy: snapshot.draft.pending, placeholder: '输入消息…', submitLabel: '发送',
-          sendBlocked: !snapshot.draft.submittable, onTextChange: store.edit, onSubmit: send }),
+          sendBlocked: legacy || !snapshot.protocolReady || !snapshot.draft.submittable, onTextChange: store.edit, onSubmit: send }),
       }, h(Transcript, { className: 'ca-scroller', viewportRef: scroll.viewportRef, contentRef: scroll.contentRef,
         awayFromBottom: scroll.awayFromBottom, hasNewContent: scroll.hasNewContent, onFollow: follow,
         role: 'region', 'aria-label': '对话记录', 'aria-busy': snapshot.loading || snapshot.loadingOlder,
@@ -188,12 +162,13 @@ export function createPage(context: ModuleFrontendContext, store: AssistantActio
           snapshot.hasOlder || scroll.prependHeld ? button(snapshot.loadingOlder ? '正在加载…' : '加载更早消息',
             () => { void store.loadOlder(); }, !snapshot.hasOlder || snapshot.loading || snapshot.loadingOlder) : null,
           snapshot.loading ? h('span', { role: 'status', 'aria-label': '正在加载对话' }, icon('loader')) : null),
-      }, ...scroll.items.map((item, index) => h(Message, { key: itemKey(item), item, previous: scroll.items[index - 1] })))));
+      }, ...scroll.items.map((item, index) => h(Message, { key: itemKey(item), item,
+        previous: scroll.items[index - 1], legacy })))));
   }
 
   return function AssistantPage() {
     const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
     useLayoutEffect(() => { store.open(); return () => store.close(); }, []);
-    return h(Conversation, { snapshot });
+    return h(Conversation, { key: snapshot.view, snapshot });
   };
 }

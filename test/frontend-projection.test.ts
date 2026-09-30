@@ -1,33 +1,28 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { timelineItem } from '../src/ui.ts';
+import { timeline, timelineItem } from '../src/ui.ts';
 import { AssistantService } from '../src/service.ts';
 import { Database } from '../src/database.ts';
 import { conversationItems } from '../frontend/timeline.ts';
-import type { Message, Topic } from '../src/types.ts';
+import type { Message } from '../src/types.ts';
 
 function fixture(kind: Message['kind']) {
   const db = new Database(':memory:');
   const service = new AssistantService(db, () => 1000);
   const message: Message = kind === 'user' ? service.accept({ requestId: 'original',
-    text: 'Complete original wording', attachments: [{ type: 'file', path: '/synthetic/file.txt' }] }).message : {
+    text: 'Complete original wording', attachments: [{ type: 'file', path: '/synthetic/file.txt' }] }, 'foreground').message : {
     id: 'original', kind, raw: 'Complete original wording', attachments: [{ type: 'file', path: '/synthetic/file.txt' }],
     sessionId: 'reception', nativeEventId: 'native-event', nativeMessageId: 'native-message',
     sequence: 1, revision: 1, createdAt: 1, processed: false, excluded: false, diagnostic: null,
     question: null, clarification: null, clarificationHistory: [],
   };
-  const topic: Topic = { id: 'topic', title: 'Weather', content: 'Forecast',
-    sessionId: 'reception', archived: false, version: 1, mappingState: 'bound',
-    mappingError: null, creationReceipt: null };
   if (kind !== 'user') db.put('messages', message);
-  db.put('topics', topic);
-  return { message, topic, service, db };
+  return { message, service, db };
 }
 
-test('UI projects a processed user original with its stable identity and no topic label', t => {
+test('UI projects a genuine foreground user original without requiring a classification result', t => {
   const { message, service, db } = fixture('user');
   t.after(() => db.close());
-  service.complete({ messageId: message.id, items: [{ topicId: 'topic', prompt: 'Faithful weather request' }] });
   const saved = db.must('messages', message.id);
   const [item] = conversationItems([timelineItem(service, saved)]);
   assert.ok(item);
@@ -44,20 +39,14 @@ test('UI projects a processed user original with its stable identity and no topi
   assert.equal(Object.hasOwn(saved, 'topicIds'), false);
 });
 
-test('multiple topic associations preserve the native original and only change its plain heading', t => {
-  const { message, topic, service, db } = fixture('reply');
+test('retained original worker messages are read only through legacy history, not foreground conversation', t => {
+  const { message, service, db } = fixture('reply');
   t.after(() => db.close());
-  db.put('topics', { ...topic, id: 'code', title: 'Code' });
-  const initial = timelineItem(service, message);
-  assert.equal(initial.topicTitle, null);
-  service.complete({ messageId: message.id, items: [{ topicId: topic.id }, { topicId: 'code' }] });
-  const assigned = timelineItem(service, db.must('messages', message.id));
-  assert.equal(assigned.id, initial.id);
-  assert.equal(assigned.sequence, initial.sequence);
-  assert.equal(assigned.text, initial.text);
-  assert.equal(assigned.topicTitle, '关于Weather和Code');
-  assert.equal(Object.hasOwn(assigned, 'topicColor'), false);
-  assert.ok(assigned.snapshotRevision > initial.snapshotRevision);
+  assert.deepEqual(timeline(service, undefined, undefined, 50).items, []);
+  const [archived] = timeline(service, undefined, undefined, 50, undefined, true).items;
+  assert.equal(archived!.id, message.id);
+  assert.equal(archived!.text, message.raw);
+  assert.deepEqual(archived!.attachments, message.attachments);
   assert.equal(db.list('messages').items.length, 1);
-  assert.ok(db.topicMessages(message.id).every(row => row.prompt === null && row.state === null));
+  assert.equal(db.topicMessages(message.id).length, 0);
 });

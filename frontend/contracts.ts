@@ -1,7 +1,6 @@
 import type { Readiness, TimelineItem } from '../src/ui-types.ts';
 import type { Operation } from '../src/types.ts';
 import type { DraftReference, ModuleDraftSnapshot } from '@waksana/cockpit-module-sdk/frontend';
-import type { ClarificationActions } from './clarification.ts';
 
 export interface Submission {
   requestId: string;
@@ -20,6 +19,8 @@ export interface SetupOperation {
 }
 export interface Snapshot {
   open: boolean;
+  protocolReady: boolean;
+  view: 'conversation' | 'legacy';
   items: TimelineItem[];
   hasOlder: boolean;
   loading: boolean;
@@ -42,10 +43,10 @@ export interface AssistantActions {
   edit(text: string): void;
   send(): Promise<void>;
   inspectInput(requestId: string): Promise<void>;
-  getClarification(messageId: string, clarificationId: string): ClarificationActions | undefined;
   loadOlder(): Promise<void>;
   reconnect(): void;
   refresh(): Promise<void>;
+  showLegacy(show: boolean): void;
   inspectOperation(requestId: string): Promise<Operation | null>;
   dispose(): void;
 }

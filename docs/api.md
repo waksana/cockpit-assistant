@@ -1,173 +1,235 @@
-# API and role setup
+# API and setup
 
-Assistant uses the public Cockpit module API. All paths below are relative to
-its authenticated, digest-bound module HTTP base. No route accepts a host
-credential, private runtime handle or caller-selected MCP identity.
+Assistant routes are relative to the authenticated, digest-bound module API
+base discovered from the Host's module listing. Never hardcode an installation
+digest, reach into SQLite or use a private native handle. Module HTTP and native
+MCP caller identity are different boundaries.
 
-See [architecture](architecture.md) for topic, batching, native correlation and
-durability semantics, and [interface](interface.md) for conversation projection.
-The strict schemas in `src/schema.ts` and `src/attachments.ts` are authoritative.
-Retired coordinator tools and routes are not compatibility aliases.
+## Discover the foreground protocol
 
-## Setup and transition
+The module's public configuration advertises `protocolVersion: 4`. Before
+reading the main transcript or sending an input, clients read `GET /state` and
+require:
 
-Select `coordinator` using native role controls. Readiness separately checks
-the actual role and resources; selection does not establish readiness. This
-version does not run or require memory. A package publication does not reload
-loaded carriers or rewrite their native context.
+```json
+{
+  "protocolVersion": 4,
+  "timelineProtocol": "foreground-message-snapshots-v1",
+  "legacyTimelinePath": "/legacy/timeline"
+}
+```
 
-`GET /readiness` is passive. `POST /roles/activate` explicitly loads only
-registered, unloaded carriers selected by a captured binding vector. It does
-not create replacements, reload loaded sessions or repair disabled resources.
-The frontend uses this operation on opening when appropriate. The operator
-must handle pending role changes through normal host controls.
+Other state fields include host-supplied configuration, observed role/readiness
+facts, the message revision watermark and database schema version. The protocol
+version is not the module SDK version or a proof that a particular native
+session has applied its role and tool scope.
 
-Schema 3 requires exactly `messages`, `topic_messages` and `topics`.
-Schema 1 and schema 2 are rejected without deleting or migrating their data;
-replacing old generated state is a separately authorized operator action, not an
-operation provided by this module.
-Use isolated data roots for development. Never modify installed package bytes.
+Protocol 4 changes conversation ownership: the default transcript is the real
+user and foreground Assistant, not a stream of all background replies.
+Protocol 3 history remains an explicit read-only archive. A client must not
+silently interpret that old aggregation feed as the new foreground conversation.
+This includes non-Web clients such as Dashboard.
 
-## HTTP conventions
+## Client conversation
 
-Mutations use JSON and strict bodies. Except for the stream, successful reads
-return JSON. Known errors are `{error:{code,message,status,...}}` with their
-HTTP status. Stable request IDs make retries inspectable and idempotent;
-changed content under the same request ID conflicts. An unknown effect is not
-permission to resend.
-
-| Method and path | Body or query | Result |
+| Method and path | Body or query | Meaning |
 | --- | --- | --- |
-| `POST /messages` | `{requestId,text,attachments?}` | Saved original message, awaiting coordinator processing. |
-| `GET /inputs/:requestId` | No query | Original input plus its topic-message results and delivery state. |
-| `GET /state` | No query | Host-supplied config, observed coordinator role, `schemaVersion:3`, message revision watermark in `publicationCursor`, and `timelineProtocol:"message-snapshots-v1"`. |
-| `GET /readiness` | No query | Fresh passive role/readiness observations. |
-| `POST /roles/activate` | `{requestId,bindings:[{role:"coordinator",sessionId}]}` | Temporary exact-session activation receipt; one coordinator only. |
-| `POST /roles/bind` | `{requestId,role:"coordinator",sessionId}` | Validate the actual Host role carrier; not a persistent binding override. |
-| `POST /sessions` | `{requestId,cwd,role?}` | Explicit operator creation, not a coordinator tool. |
-| `GET /sessions/:id/inspect` | No query | Passive exact-session native metadata. |
-| `GET /operations/:id` | No query | Current-process setup receipt, or 404; not a durable effects ledger. |
-| `PATCH /config` | `{requestId,config:{defaultCwd?}}` | Rejected with `HOST_CONFIG_REQUIRED`; configuration belongs to the host. |
-| `GET /topics` | `after`, `limit` | Flat topic records. |
-| `GET /messages` | `after`, `limit` | Assistant input and business reply/question originals, not native user history. |
-| `GET /topic-messages` | `after`, `limit` | Source/topic results; user rows additionally include per-prompt delivery facts. |
-| `GET /receptions` | `after`, `limit` | Ordinary destination metadata queried from Host, not stored reader progress. |
+| `POST /messages` | `{requestId,text,attachments?}` | Save one genuine client input and send it to the continuous foreground session. |
+| `GET /inputs/:requestId` | None | Inspect the original saved input and any derived topic-message delivery facts. |
+| `GET /timeline?limit=50` | Bounded tail | Current user/foreground message snapshots in stable display order. |
+| `GET /timeline?before=N&limit=50` | Display sequence | Earlier main-conversation rows, exclusive. |
+| `GET /timeline?after=N&limit=100` | Snapshot revision | Newer current snapshots, exclusive and revision ordered. |
+| `GET /timeline/items/:sequence` | None | Current projection at one stable display position. |
+| `GET /timeline/stream?after=N` | SSE | Main-conversation snapshots; `Last-Event-ID` takes precedence. |
+| `GET /legacy/timeline` | Same bounded history parameters | Retained old conversation, never reclassified or dispatched. |
 
-Table reads default to `after=0,limit=50`, with limits from 1 to 100.
-`defaultCwd` must be absolute and defaults to the home directory; newly created
-topic sessions use the host's native model default. New topic definitions do
-not create sessions until dispatch needs one.
+Bodies are strict JSON. Known errors have `{error:{code,message,status,...}}`
+and the corresponding HTTP status. Request IDs refer to immutable content;
+changed content under the same ID conflicts. Acceptance means saved/native
+acceptance as stated by the receipt, not recipient completion.
 
-Set `defaultCwd` in the Assistant entry's `config` object in the host-owned
-`modules/config.json`, preserving its selected version, digest and enabled
-fields. The host passes configuration on the next cold start, as documented in
-the [host storage/config contract](https://github.com/waksana/cockpit/blob/main/docs/module-contract.md#storage-config).
-The module does not write that file, maintain a second configuration in SQLite,
-or promise hot application. Its public SDK supplies read-only configuration,
-not a configuration mutation capability.
+The input body remains `{requestId,text,attachments}`. Native file, directory,
+selection and blob descriptors are preserved and bounded. Empty text requires
+an attachment; a preview URL is not a native file path. The service supplies
+the original attachments to each relevant split prompt, not another copied
+user bubble.
 
-Inputs strictly reject `topicId`, `replyTo` and unrecognized fields. Empty text
-requires at least one attachment. Native file, directory, selection and blob
-descriptors are validated, bounded and preserved; preview URLs are not file
-paths. Attachment-bearing originals are isolated from other input batches.
+`InputReceipt` retains `requestId`, `input`, `message`, `topicMessages` and
+`hasMore.topicMessages`. Original protocol-3 receipts can still be inspected
+without restarting the old classifier. On timeout, inspect the exact original
+request; do not resubmit merely because a response was lost.
 
-### Conversation projection
+### Snapshot identity and display
 
-| Method and path | Meaning |
-| --- | --- |
-| `GET /timeline?limit=50` | Latest message window in stable ascending display `sequence`. |
-| `GET /timeline?before=N&limit=50` | Exclusive older window by display `sequence`. |
-| `GET /timeline?after=N&limit=100` | Current message snapshots changed after revision N, in revision order. |
-| `GET /timeline/items/:sequence` | Current projection of the message at that stable display position. |
-| `GET /timeline/stream?after=N` | SSE message snapshots with revision event IDs; `Last-Event-ID` takes precedence. |
+Each timeline item retains `id === messageId`, stable `sequence` and changing
+`snapshotRevision`, plus `text`, `attachments`, `speaker`, `createdAt`,
+`sessionId`, nullable question/diagnostic fields and delivery diagnostics.
+Only actual foreground responses and genuine client originals enter the main
+feed. Worker originals and service notifications do not become extra bubbles.
 
-`before` and `after` are mutually exclusive. Pages expose bounded continuation
-and a global watermark, not proof of reading or gap-free native history.
-Each item has a stable message `id` and display `sequence`, plus a changing
-`snapshotRevision`. SSE retains the event name `publication`, but its event ID
-is `snapshotRevision`, not the display sequence. Revisions may skip when a newer
-snapshot supersedes an unread update; they need not be contiguous.
+The SSE event name remains `publication` for transport compatibility. Its ID
+is `snapshotRevision`, not the display sequence. Revisions may skip; there is
+no gap-free publication log. Merge a newer snapshot by message identity,
+preserving display order, DOM identity and reading position. Start with the
+tail page's watermark and use separate revision and history cursors.
 
-Initialize the update cursor from the page's `watermark`. For forward pages,
-advance using `cursor`, merging newer snapshots by message identity while
-retaining display order. Attribution, clarification and question
-state patch the original message in place without creating another bubble or
-unread message. There is no persistent publication log or diagnostic message
-stream. Native/session failures remain visible through the host error reporting
-and readiness surfaces.
+Legacy rows can retain `topicTitle` and `clarifications`. Those are historical
+display facts, not new classification instructions. The Web archive has no
+working clarification buttons. The old clarification GET can inspect retained
+answers; its retired POST flow is not used for foreground input.
 
-## Coordinator MCP
+### Human answers
 
-`POST /mcp` supports JSON-RPC initialization, ping, tool listing and calls.
-Supported protocol versions are `2025-11-25`, `2025-06-18` and `2025-03-26`.
-Tool errors use `isError:true`; missing/invalid host invocation identity cannot
-be replaced by a tool argument. Only the currently registered, ready primary
-role carrier can perform its role's operations.
+Business worker questions are read with their real native session/request
+identity and presented by the foreground. The next relevant genuine user input
+may be faithfully routed as the answer. The service, not the model or another
+worker, calls the exact native response API and validates literal choices,
+freeform permission and attachment restrictions.
 
-The service supplies one eligible original message and its clarification record,
-with relevant source names/IDs, not the entire conversation again. Source
-quotations remain evidence, not new user authorization. Coordinator operations
-apply to that source, not a multi-message batch. Runtime/native invocation
-identity must prevent stale tools from modifying a different message.
+Native answers use a single-topic dispatch whose prompt matches the complete
+genuine user message. The service reads the actual answer from that immutable
+original and binds it to the exact native question; model-generated split text
+cannot replace it. A constrained choice must match the whole answer, not a
+substring found in a negation, quotation or request to explain the options.
+Freeform answers also preserve the user's words. A mixed or ambiguous input
+must be answered separately; rejection leaves the question pending.
 
-| Tool | Arguments |
-| --- | --- |
-| `assistant_topics` | `{after?,limit?}` |
-| `assistant_sessions` | `{after?,limit?}` |
-| `assistant_history` | `{sessionId,cursor?}` |
-| `assistant_source` | `{messageId}` |
-| `assistant_complete` | `{messageId,topics?,items}`; complete definitions, mappings and results for one original. |
-| `assistant_clarify` | `{messageId,question,choices?,allowFreeform?}` |
+There is no unrestricted model-facing answer tool. A result notification,
+worker statement or peer input cannot supply a human answer. Normal prompt
+delivery is not evidence that an outstanding native ask was answered.
 
-`assistant_complete.topics` contains affected definitions:
-`{topicId,title,content,archived?,sessionId?}`. A new definition uses an explicit,
-stable `topicId`. Existing definitions are read with `assistant_topics`; unchanged
-definitions need not be resubmitted. A new reply topic defaults to its original
-source session, while existing topics do not adopt a new speaker automatically.
-An explicit handoff must identify an actual ordinary target session.
+## Foreground and worker setup
 
-`items` contains 1 to 100 topic results. For a user original each item is
-`{topicId,prompt}`; for a session reply or question it is `{topicId}` with no
-copied or rewritten body. Service saves all results, definition/mapping changes
-and the processed flag transactionally before any outgoing native call. Native
-acceptance is not coordinator quality approval or receiver completion.
-
-History reads one persisted native page, backward, with at most 16 events,
-plus that session's actual current ask and known topic associations. They
-neither load sessions nor import their messages into Assistant.
-Attribution only applies to the current original reply. It adds a topic
-header to text already shown, never rewrites or republishes the response.
-
-Native answers retain exact wording, including whitespace. Exact choices must
-match literally; otherwise freeform must be allowed. Native ask routes reject
-attachments and stale request identities without silently changing delivery mode.
-
-## Message-local clarification
-
-Clarification questions and answers belong to their original message. They do
-not create independent conversation rows or a new topic input.
-
-| Method and path | Body | Result |
+| Method and path | Body | Meaning |
 | --- | --- | --- |
-| `GET /messages/:messageId/clarifications/:clarificationId` | None | Current `{messageId,clarification}` record for exact answer inspection. |
-| `POST /messages/:messageId/clarifications/:clarificationId` | `{requestId,answer}` | Saved answer on that exact clarification; does not mark the original processed. |
+| `GET /readiness` | None | Current foreground role and actual tool-scope observations. |
+| `POST /roles/activate` | `{requestId,bindings:[{role:"coordinator",sessionId}]}` | Load the exact saved foreground carrier if appropriate; no replacement creation. |
+| `POST /roles/bind` | `{requestId,role,sessionId}` | Explicitly select/prepare `coordinator` or prepare a separate `organizer` carrier. |
+| `POST /sessions` | `{requestId,cwd,role}` | Explicit operator setup; `role` is `coordinator`, `organizer` or `worker`. |
+| `GET /sessions/:id/inspect` | None | Actual metadata for that exact session. |
+| `GET /operations/:id` | None | Current-process setup receipt, or an explicit unavailable result. |
 
-The frontend retains the exact request on an unknown result and reads this
-record instead of resending. A successful answer must match its original
-message, clarification, request ID and text. Stale questions and conflicting
-answers fail explicitly. The waiting state ends after the answer is saved, but
-the original remains unprocessed until the coordinator saves its topic results.
-The original body is never overwritten.
+Role selection is not proof of application or readiness. Unloaded is different
+from missing; a busy carrier is not replaced. Setup receipts are not a generic
+durable effects system and may be unavailable after restart. Read actual Host
+state before any explicit recovery.
 
-## Diagnosis and limits
+The foreground uses an actual persisted native tool scope: no built-in tools
+and only the Assistant service MCP subset. The required shared topic guidance
+is embedded into its role instructions at build time, not loaded by a forbidden
+shell, filesystem or Skill tool. Configuration and actual offered tools must
+agree; a role label or a successful resource enable operation is not evidence
+of tool restriction.
 
-No offline native-history resynchronization or memory extraction API is provided.
-The coordinator's passive native-chat reads are context only, not import or replay.
-Each user-origin topic result retains its own delivery outcome. An uncertain
-native call is not automatically returned to pending or repeated. Rare stuck
-questions and handoffs can be handled directly in their source sessions.
-See [architecture](architecture.md#delivery-facts-and-correlation).
+## Foreground MCP toolkit
 
-Normal conversation does not require technical receipt management. Developer
-inspection does not establish model success, and no module API operation grants
-deployment, production cleanup or runtime restart authority.
+The HTTP MCP endpoint supports initialize, ping, tool listing and tool calls.
+The Host supplies the trusted primary-session and tool-call identity. Caller
+arguments cannot substitute for that identity. A manually selected organizer
+has a smaller tool set and does not acquire foreground dispatch authority.
+
+| Tool | Main arguments | Boundary |
+| --- | --- | --- |
+| `assistant_topics` | `{after?,limit?}` | Bounded current topic register. |
+| `assistant_topic` | `{topicId?,title?,content?,archived?,sessionId?}` | Necessary register edits under a genuine human or explicitly scoped organizer request. |
+| `assistant_dispatch` | `{items:[{topicId,prompt}]}` | One saved, faithful split from a genuine foreground user input; service sends it. |
+| `assistant_status` | `{topicId?}` | Actual state of registered workers, not inferred business completion. |
+| `assistant_inbox` | `{ids?,after?,limit?}` or `{presentation:{ids,text}}` | Read pending results or associate selected IDs with the complete planned natural reply. Neither operation alone consumes a body. |
+| `assistant_history` | `{sessionId,cursor?}` | Bounded related native history within the permitted session scope. |
+| `assistant_source` | `{messageId}` | A relevant saved genuine user original, not an additional authority grant. |
+| `assistant_sessions` | `{after?,limit?}` | Manual organizer candidate metadata, not automatic enrollment. |
+
+There is no per-message `assistant_complete`, lease, token, epoch or
+classification ACK protocol. Result notifications permit reads and presentation,
+not new business dispatch. Differing or incomplete worker results do not grant
+permission to send another business prompt.
+
+For presentation, the foreground identifies only the inbox IDs it read in this
+interaction and actually represents in its planned reply. The service records
+their expected full-text hash and the declaration boundary, not another body
+copy. Only a later matching persistent natural reply in that interaction
+consumes those IDs. An unrelated ledger answer, a partial presentation, a tool
+prelude or an old/duplicate reply does not clear the other read results.
+
+Reads and declarations survive cancellation or interruption without deleting
+unpresented bodies. This is internal consumption bookkeeping, not a user ACK or
+a per-input classification step. Consumed native identities remain so duplicate
+observation cannot restore an already-cleared body. Source histories and shared
+files are never deleted by this process.
+
+## Persistent defaults and manual organization
+
+Persistent module defaults belong to the Assistant entry in the Host's
+`modules/config.json`; preserve its selected version, digest and enabled fields.
+The Host supplies these values on cold start. `PATCH /config` does not claim a
+persistent configuration write when the public Host API provides none.
+See the [Host configuration contract](https://github.com/waksana/cockpit/blob/main/docs/module-contract.md#storage-config).
+
+For example, the module's **config value**, not the entire Host configuration
+file, can select a discussion-only worker template:
+
+```json
+{
+  "defaultCwd": "/absolute/project",
+  "foregroundSessionId": null,
+  "worker": {
+    "cwd": "/absolute/project",
+    "roles": [{ "moduleId": "assistant", "roleId": "worker" }],
+    "toolScope": { "builtins": ["ask_user"], "mcpServers": [] }
+  }
+}
+```
+
+Use a real existing absolute directory. This explicit example permits native
+questions but no worker shell or MCP tools; choose the actual tools needed for
+an execution template instead. A new worker always receives the `worker` role;
+it must not carry Assistant foreground or organizer roles. Additional persistent
+Skill/MCP contributions come from the selected roles and remain intersected
+with the explicit tool scope. Nonempty top-level `worker.skills` and
+`worker.mcpServers` reject: one-time resource preparation is not a persistent
+template. There is no per-template model override in this API; new sessions
+inherit the Host's persistent default model.
+
+`foregroundSessionId: null` starts unbound; role labels do not select a
+foreground. An explicit bind/activate selects an ID for the current service
+instance only. Persist that exact native ID in `foregroundSessionId` to retain
+the selection across restarts; a setup receipt is not a saved config write.
+Creating or selecting a role does not retrofit a tool scope
+onto an old unscoped session: the current Host scope is immutable after creation.
+Use explicit setup to create an appropriately scoped foreground, retain any
+old session/history, and select the new ID rather than relabelling an unsafe
+carrier as ready.
+
+New-worker defaults and foreground selection are separate. A template is not
+retroactively applied to existing workers. Cwd and selected roles must actually
+take effect; resource and model settings must follow the exact supported
+creation/cold-load behavior, with unsupported fields rejected rather than
+ignored. A selected Skill is not itself an OS sandbox or proof its body was read.
+
+A manual organizer is a separate native session using the `organizer` role and
+shared `assistant-topics` Skill. It does not receive foreground conversation or
+automatic result notifications. Create it with `POST /sessions` using
+`role:"organizer"`, then explicitly prepare that exact ID with `POST /roles/bind`
+and `role:"organizer"`. Its source scope is explicit:
+
+```text
+POST /organizers/:id/messages
+{ requestId, text, historySessionIds: [selected native session IDs] }
+```
+
+This service-recorded request authorizes the bounded selected-history workflow;
+the native channel name `user.message` alone does not establish who sent it.
+An organizer can propose topics and, when explicitly requested, register/link
+existing sessions. It cannot dispatch business or answer another session's ask.
+No production-wide history scan is started by selecting the role or Skill.
+
+## Compatibility and operational limits
+
+The forward schema transition preserves existing topics, mappings, original
+messages and delivery evidence. It does not restart old unprocessed classifier
+work or clear the current database. Package publication and deployment are
+separate; see [releases](releases.md).
+
+Unknown native outcomes require inspection. No API promises global exactly-once
+delivery, permanent opaque history cursors, restoration of deleted native
+history, or complete observation while the service is stopped.

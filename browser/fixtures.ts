@@ -62,6 +62,7 @@ export interface FixtureOptions {
   ready?: boolean;
   items?: TimelineItem[];
   hasOlder?: boolean;
+  legacyItems?: TimelineItem[];
   post?: (post: Post, route: Route) => Promise<boolean>;
   read?: (url: URL, route: Route) => Promise<boolean>;
   stream?: (after: number, route: Route) => Promise<boolean>;
@@ -152,7 +153,18 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
       }
     } else {
       if (await options.read?.(url, route)) return;
+      if (path === '/state') {
+        await json(route, { protocolVersion: 4, timelineProtocol: 'foreground-message-snapshots-v1',
+          legacyTimelinePath: '/legacy/timeline' });
+        return;
+      }
       if (path === '/readiness') { await json(route, currentReadiness); return; }
+      if (path === '/legacy/timeline') {
+        const items = options.legacyItems ?? [];
+        await json(route, { items, before: items[0]?.sequence ?? null, hasMore: false,
+          watermark: Math.max(0, ...items.map(item => item.snapshotRevision)) });
+        return;
+      }
       if (path === '/timeline') {
         const before = url.searchParams.get('before');
         const after = url.searchParams.get('after');

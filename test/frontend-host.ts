@@ -21,7 +21,7 @@ export async function hostState() {
   const runtime = new ModuleRuntime({
     pageUrl: 'http://fixture.invalid/',
     fetch: async () => Response.json({ modules: [{
-      id: 'assistant', name: 'Assistant', version: '0.1.0', digest, config: {}, styles: [],
+      id: 'assistant', name: 'Assistant', version: '0.1.0', digest, config: { protocolVersion: 4 }, styles: [],
       apiBase: `/_modules/assistant/${digest}/api`, entry: `/_modules/assets/assistant/${digest}/index.js`,
     }], errors: [] }),
     load: async () => ({ frontendApiVersion: 3, activate: (value: ModuleFrontendContext) => activate(value) }),

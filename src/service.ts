@@ -60,6 +60,11 @@ export class AssistantService {
       'Answer dispatch must match the entire genuine human text (outer trim only); answer separately without model rewriting');
     return askAnswer(request, original.raw.trim(), original.attachments);
   }
+  assertTopicScope(root: ForegroundInput, ...sessionIds: (string | null | undefined)[]): void {
+    if (root.kind !== 'organizer') return;
+    for (const sessionId of sessionIds) if (sessionId) requireFact(root.historySessionIds.includes(sessionId),
+      'ORGANIZER_SCOPE', 'Organizer registry changes must remain within this request selected-history scope', 403);
+  }
   topic(input: unknown, root: ForegroundInput, actionId: string): Topic {
     const value = topicSchema.parse(input);
     requireFact(root.kind !== 'notification', 'HUMAN_REQUIRED', 'Notifications cannot mutate topic registry', 403);
@@ -69,6 +74,7 @@ export class AssistantService {
       const old = value.topicId ? this.db.get('topics', value.topicId) : undefined;
       requireFact(old || value.title, 'TOPIC_TITLE', 'A new topic needs a title', 400);
       const sessionId = Object.hasOwn(value, 'sessionId') ? value.sessionId! : old?.sessionId ?? null;
+      this.assertTopicScope(root, old?.sessionId, sessionId);
       requireFact(!(sessionId === null && old && ['calling', 'unknown'].includes(old.mappingState)),
         'UNCERTAIN_MAPPING', 'Inspect uncertain worker creation before replacing a mapping');
       const topic: Topic = { id: old?.id ?? value.topicId ?? randomUUID(), title: value.title ?? old!.title,

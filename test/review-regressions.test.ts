@@ -238,7 +238,7 @@ test('claim normalization changes only line endings and outer whitespace, never 
     await f.runtime.presentation(toolIdentity(f, '', 'normalized-claim', receipt), { ids, text: ' \r\nWorker one\r\n  Worker two\r\n ' });
     await final(f, root.interactionId!, 'Worker one\n Worker two', 'wrong-internal-space');
     assert.ok(f.db.record('inbox', ids[0]!)!.body);
-    await final(f, root.interactionId!, '\nWorker one\n  Worker two\n', 'normalized-matching');
+    await final(f, root.interactionId!, '\rWorker one\r  Worker two\r', 'normalized-matching');
     for (const id of ids) assert.equal(f.db.record('inbox', id)!.body, null);
   } finally { f.close(); }
 });
@@ -367,4 +367,164 @@ test('concurrent conflicting organizer content cannot replace the first original
     assert.equal(f.db.records('foreground_inputs')[0]!.text, original.text);
     assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
   } finally { validation.resolve(); f.close(); }
+});
+
+for (const answering of [false, true]) test(`late read authorization preserves a frozen ${answering ? 'ask' : 'business'} dispatch`, async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    if (answering) await ask(f, { requestId: 'frozen-ask', question: 'Which account?' });
+    else topic(f);
+    topic(f, 'other', 's2');
+    const input = await f.runtime.acceptReady({ requestId: 'one-input', text: 'Use staging' });
+    let reads = 0;
+    f.onGet(async sessionId => {
+      if (sessionId === 'coordinator' && ++reads === 2) { entered.resolve(); await release.promise; }
+    });
+    const reading = f.runtime.authorize(toolIdentity(f, input.message.id, 'slow-read'));
+    await entered.promise; f.onGet(null);
+    await f.runtime.dispatch(toolIdentity(f, input.message.id, 'first-dispatch'), {
+      items: [{ topicId: 'topic', prompt: 'Use staging' }],
+    });
+    const frozen = f.db.record('foreground_inputs', input.message.id)!;
+    assert.ok(frozen.dispatchHash);
+    if (answering) assert.equal(frozen.askBinding!.requestId, 'frozen-ask');
+    release.resolve();
+    const current = await reading;
+    assert.equal(current.dispatchHash, frozen.dispatchHash);
+    assert.deepEqual(current.askBinding, frozen.askBinding);
+    assert.equal(f.db.record('foreground_inputs', input.message.id)!.dispatchHash, frozen.dispatchHash);
+    await assert.rejects(f.runtime.dispatch(toolIdentity(f, input.message.id, 'second-dispatch'), {
+      items: [{ topicId: 'other', prompt: 'Unwanted additional business' }],
+    }), { code: 'FROZEN_DISPATCH' });
+    assert.equal(f.db.topicMessages(input.message.id).length, 1);
+    assert.equal(f.db.topicMessages(input.message.id)[0]!.state, 'accepted');
+    assert.equal(f.calls.some(call => call.name === 'prompt'
+      && (call.body as { sessionId: string }).sessionId === 's2'), false);
+    if (answering) assert.equal(f.calls.filter(call => call.name === 'respondAsk').length, 1);
+  } finally { release.resolve(); f.close(); }
+});
+
+test('authorization awaiting readiness cannot erase a primary abort or let its late reply consume results', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    const { root, ids, receipt } = await results(f), text = 'Worker one and Worker two';
+    let reads = 0;
+    f.onGet(async sessionId => {
+      if (sessionId === 'coordinator' && ++reads === 2) { entered.resolve(); await release.promise; }
+    });
+    const claiming = f.runtime.presentation(toolIdentity(f, '', 'slow-claim', receipt), { ids, text });
+    const rejected = assert.rejects(claiming, { code: 'PRESENTATION_ABORTED' });
+    await entered.promise; f.onGet(null);
+    await f.event('coordinator', { id: 'abort-during-authorization', type: 'abort',
+      data: { interactionId: root.interactionId } });
+    assert.equal(f.db.record('foreground_inputs', root.id)!.presentationAborted, true);
+    release.resolve(); await rejected;
+    assert.equal(f.db.record('foreground_inputs', root.id)!.presentationAborted, true);
+    await final(f, root.interactionId!, text, 'late-after-authorization');
+    for (const id of ids) {
+      assert.ok(f.db.record('inbox', id)!.body);
+      assert.equal(f.db.record('inbox', id)!.presented, null);
+    }
+  } finally { release.resolve(); f.close(); }
+});
+
+test('authorization rejects a receipt changed while readiness was being checked', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    const input = await f.runtime.acceptReady({ requestId: 'changed-receipt', text: 'Inspect register' });
+    let reads = 0;
+    f.onGet(async sessionId => {
+      if (sessionId === 'coordinator' && ++reads === 2) { entered.resolve(); await release.promise; }
+    });
+    const reading = f.runtime.authorize(toolIdentity(f, input.message.id, 'receipt-race'));
+    const rejected = assert.rejects(reading, { code: 'TOOL_PROVENANCE' });
+    await entered.promise;
+    const changed = f.db.record('foreground_inputs', input.message.id)!;
+    changed.receipt = 'different-native-receipt';
+    f.db.save('foreground_inputs', changed);
+    release.resolve(); await rejected;
+    assert.equal(f.db.record('foreground_inputs', input.message.id)!.receipt, 'different-native-receipt');
+  } finally { release.resolve(); f.close(); }
+});
+
+test('organizer cannot overwrite a foreground remapping committed during target validation', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    organizer(f); topic(f);
+    const root = (await f.runtime.organizerInput('organizer', {
+      requestId: 'only-s1', text: 'Organize selected s1', historySessionIds: ['s1'],
+    }))!;
+    f.onGet(async sessionId => { if (sessionId === 's1') { entered.resolve(); await release.promise; } });
+    const editing = f.runtime.topic(organizerTool(f, root.receipt!, 'old-mapping-edit'), {
+      topicId: 'topic', title: 'Old organizer title', sessionId: 's1',
+    });
+    const rejected = assert.rejects(editing, { code: 'ORGANIZER_SCOPE' });
+    await entered.promise; f.onGet(null);
+    const human = await f.runtime.acceptReady({ requestId: 'new-mapping', text: 'Assign the topic to s2' });
+    const updated = await f.runtime.topic(toolIdentity(f, human.message.id, 'foreground-remap'), {
+      topicId: 'topic', title: 'New foreground mapping', sessionId: 's2',
+    });
+    release.resolve(); await rejected;
+    assert.deepEqual(f.db.must('topics', 'topic'), updated);
+    assert.equal(updated.sessionId, 's2');
+    assert.equal(f.db.record('workers', 's1'), undefined);
+  } finally { release.resolve(); f.close(); }
+});
+
+for (const presented of [false, true]) test(`notification readiness cannot undo a concurrent ${presented ? 'presentation' : 'read'}`, async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    topic(f);
+    const input = await f.runtime.acceptReady({ requestId: 'active-reader', text: 'Inspect results' });
+    const reader = await f.runtime.authorize(toolIdentity(f, input.message.id, 'before-notice-read'));
+    await f.runtime.observe('coordinator');
+    await f.runtime.observe('s1', { id: 'pending-notice', type: 'assistant.message',
+      data: { messageId: 'pending-notice', content: 'Actual worker result' } });
+    const item = f.db.records('inbox')[0]!;
+    f.onGet(async sessionId => { if (sessionId === 'coordinator') { entered.resolve(); await release.promise; } });
+    const notifying = f.runtime.wake();
+    await entered.promise; f.onGet(null);
+    f.service.readInbox([item.id], reader);
+    if (presented) {
+      f.service.declarePresentation({ ids: [item.id], text: 'The worker reported a result.' }, reader, 'notice-race-claim');
+      await f.runtime.observe('coordinator', { id: 'notice-race-response', type: 'assistant.message',
+        data: { messageId: 'notice-race-response', interactionId: reader.interactionId,
+          content: 'The worker reported a result.' } });
+    }
+    const observed = f.db.record('inbox', item.id)!;
+    release.resolve(); await notifying;
+    assert.deepEqual(f.db.record('inbox', item.id), observed);
+    assert.equal(f.db.records('foreground_inputs').filter(root => root.kind === 'notification').length, 0);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  } finally { release.resolve(); f.close(); }
+});
+
+test('an in-flight native answer never restores a question body concurrently presented', async t => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    const question = await ask(f, { requestId: 'answer-in-flight', question: 'Choose an account', choices: ['Alpha'], allowFreeform: false });
+    const display = await f.runtime.acceptReady({ requestId: 'display-question', text: 'Show the question' });
+    const reader = await f.runtime.authorize(toolIdentity(f, display.message.id, 'read-before-answer'));
+    f.service.readInbox([question.id], reader);
+    f.service.declarePresentation({ ids: [question.id], text: question.body! }, reader, 'present-before-answer-ack');
+    const originalAnswer = f.native.answer.bind(f.native);
+    t.mock.method(f.native, 'answer', async (...args: Parameters<typeof originalAnswer>) => {
+      entered.resolve(); await release.promise; return originalAnswer(...args);
+    });
+    const input = await f.runtime.acceptReady({ requestId: 'answer-question', text: 'Alpha' });
+    const answering = f.runtime.dispatch(toolIdentity(f, input.message.id, 'delayed-native-answer'), {
+      items: [{ topicId: 'topic', prompt: 'Alpha' }],
+    });
+    await entered.promise;
+    await f.runtime.observe('coordinator', { id: 'question-visible', type: 'assistant.message',
+      data: { messageId: 'question-visible', interactionId: reader.interactionId, content: question.body! } });
+    const presented = f.db.record('inbox', question.id)!;
+    assert.equal(presented.body, null);
+    release.resolve(); await answering;
+    const current = f.db.record('inbox', question.id)!;
+    assert.equal(current.askState, 'answered');
+    assert.equal(current.body, null); assert.equal(current.question, null);
+    assert.deepEqual(current.presented, presented.presented);
+    assert.deepEqual(current.presentations, presented.presentations);
+  } finally { release.resolve(); f.close(); }
 });

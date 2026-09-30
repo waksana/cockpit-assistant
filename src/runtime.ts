@@ -311,22 +311,27 @@ export class Runtime {
   }
   private async notification(): Promise<void> {
     if (this.stopped) return;
-    const pending = this.service.db.records('inbox').filter(item => !item.presented && !item.reads.length && !item.notificationId
+    const pending = () => this.service.db.records('inbox').filter(item => !item.presented && !item.reads.length && !item.notificationId
       && (item.kind === 'result' || item.askState === 'pending'));
-    if (!pending.length || this.service.db.records('foreground_inputs').some(r => r.state === 'pending' && r.kind !== 'notification')) return;
+    const humanWaiting = () => this.service.db.records('foreground_inputs').some(r => r.state === 'pending' && r.kind !== 'notification');
+    if (!pending().length || humanWaiting()) return;
     const readiness = await this.readiness(), sessionId = readiness.roles[0]?.sessionId;
     if (!readiness.canSend || !sessionId || this.foregroundTurns.has(sessionId)) return;
     const meta = await this.meta(sessionId);
-    if (!meta || !this.idle(meta)) return;
-    const id = randomUUID(), text = this.noticeText(pending.map(item => item.id));
-    const root: ForegroundInput = { id, kind: 'notification', sessionId, messageId: null, text,
-      fingerprint: fingerprint(text), state: 'pending', receipt: null, interactionId: null,
-      dispatchHash: null, result: null, inboxIds: pending.map(item => item.id), historySessionIds: [] };
-    this.service.db.transaction(() => {
+    if (!meta || !this.idle(meta) || this.stopped || this.foregroundTurns.has(sessionId)
+      || this.foregroundSessionId !== sessionId) return;
+    const root = this.service.db.transaction(() => {
+      const items = pending();
+      if (!items.length || humanWaiting()) return null;
+      const id = randomUUID(), text = this.noticeText(items.map(item => item.id));
+      const root: ForegroundInput = { id, kind: 'notification', sessionId, messageId: null, text,
+        fingerprint: fingerprint(text), state: 'pending', receipt: null, interactionId: null,
+        dispatchHash: null, result: null, inboxIds: items.map(item => item.id), historySessionIds: [] };
       this.service.db.save('foreground_inputs', root);
-      for (const item of pending) { item.notificationId = id; this.service.db.save('inbox', item); }
+      for (const item of items) { item.notificationId = id; this.service.db.save('inbox', item); }
+      return root;
     });
-    await this.sendForeground(root);
+    if (root) await this.sendForeground(root);
   }
   private noticeText(ids: string[]): string {
     return `New managed-worker inbox locations: ${JSON.stringify(ids.map(id => this.service.db.record('inbox', id)!).map(item => ({
@@ -367,9 +372,10 @@ export class Runtime {
     const users = events.filter(e => primary(e) && !e.ephemeral && e.type === 'user.message' && e.data.interactionId === interactionId);
     requireFact(users.length <= 1 && (!users.length || typeof users[0]!.data.messageId === 'string'),
       'TOOL_PROVENANCE', 'Tool call does not identify one exact native user receipt', 403);
-    const roots = this.service.db.records('foreground_inputs').filter(r => r.sessionId === identity.sessionId
+    const matchingRoots = () => this.service.db.records('foreground_inputs').filter(r => r.sessionId === identity.sessionId
       && r.state === 'accepted' && (users.length ? r.receipt === users[0]!.data.messageId
         : r.interactionId === interactionId && !!r.nativeUserEventId));
+    const roots = matchingRoots();
     requireFact(roots.length === 1, 'TOOL_PROVENANCE', 'Unknown native peer input has no human or notification provenance', 403);
     const root = roots[0]!;
     requireFact(root.kind === 'organizer' ? hasRole(meta, 'organizer') && !hasRole(meta, 'coordinator')
@@ -381,12 +387,20 @@ export class Runtime {
       requireFact(this.foregroundSessionId === root.sessionId, 'STALE_ROLE', 'Explicit foreground selection changed', 403);
     }
     else await this.organizerReady(meta);
-    requireFact(!root.interactionId || root.interactionId === interactionId,
-      'NATIVE_ID_CONFLICT', 'Native source receipt changed its interaction identity', 403);
-    root.interactionId = interactionId;
-    if (users.length) root.nativeUserEventId = users[0]!.id;
-    this.service.db.save('foreground_inputs', root);
-    return root;
+    // Readiness awaits can interleave with dispatch or abort; patch only fresh provenance.
+    return this.service.db.transaction(() => {
+      requireFact(!this.stopped, 'STOPPING', 'Assistant stopped during provenance verification', 503);
+      const latest = matchingRoots(), current = latest[0];
+      requireFact(latest.length === 1 && current && current.id === root.id && current.receipt === root.receipt
+        && current.kind === root.kind && current.messageId === root.messageId && current.fingerprint === root.fingerprint,
+      'TOOL_PROVENANCE', 'Trusted native input changed during provenance verification', 403);
+      requireFact(!current.interactionId || current.interactionId === interactionId,
+        'NATIVE_ID_CONFLICT', 'Native source receipt changed its interaction identity', 403);
+      current.interactionId = interactionId;
+      if (users.length) current.nativeUserEventId = users[0]!.id;
+      this.service.db.save('foreground_inputs', current);
+      return current;
+    });
   }
   private async organizerReady(meta: PublicSessionMeta): Promise<void> {
     const evidence = await this.native.host.call('roles/readiness', { sessionId: meta.sessionId,
@@ -403,13 +417,8 @@ export class Runtime {
     const actionId = `${identity.sessionId}:${identity.toolCallId}`;
     const prior = this.service.db.toolAction(actionId, value);
     if (prior) return prior as Topic;
-    if (root.kind === 'organizer') {
-      const existing = value.topicId ? this.service.db.get('topics', value.topicId) : undefined;
-      for (const sessionId of [existing?.sessionId, value.sessionId]) {
-        if (sessionId) requireFact(root.historySessionIds.includes(sessionId), 'ORGANIZER_SCOPE',
-          'Organizer registry changes must remain within this request selected-history scope', 403);
-      }
-    }
+    const existing = value.topicId ? this.service.db.get('topics', value.topicId) : undefined;
+    this.service.assertTopicScope(root, existing?.sessionId, value.sessionId);
     if (value.sessionId) {
       const meta = await this.meta(value.sessionId);
       requireFact(meta && !internal(meta), 'MAPPING_TARGET', 'Mapping needs a real eligible worker, never foreground/organizer/observer');
@@ -553,7 +562,11 @@ export class Runtime {
           }
         }
         if (question && ['accepted', 'unknown'].includes(row.state!)) {
-          question.askState = row.state === 'accepted' ? 'answered' : 'unknown'; db.save('inbox', question);
+          const currentQuestion = db.record('inbox', question.id);
+          requireFact(currentQuestion && currentQuestion.hash === question.hash, 'NATIVE_ID_CONFLICT',
+            'Native question evidence changed while its answer was in flight');
+          currentQuestion.askState = row.state === 'accepted' ? 'answered' : 'unknown';
+          db.save('inbox', currentQuestion);
         }
       });
     } catch (error) {

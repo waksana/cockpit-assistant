@@ -153,7 +153,7 @@ prelude or an old/duplicate reply does not clear the other read results.
 
 The declaration result is
 `{declared,ids,sessionId,interactionId,textHash,afterSequence,normalization}`.
-`normalization: "crlf-to-lf-outer-trim-v1"` changes CRLF to LF and trims only
+`normalization: "crlf-to-lf-outer-trim-v1"` changes CRLF or lone CR to LF and trims only
 outer whitespace before hashing. It does not paraphrase, extract sentences or
 normalize away omitted content. Native answers likewise allow only outer
 whitespace normalization when comparing the full human original.

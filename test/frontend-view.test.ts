@@ -68,7 +68,7 @@ test('only a new local draft submission follows, not passive settlement of its e
   assert.equal(follows, 2);
 });
 
-test('shared Chat rows show originals once and plain multi-topic headings without memory controls', () => {
+test('shared foreground Chat shows natural messages without worker topic headings or memory controls', () => {
   const messages: Record<string, unknown>[] = [];
   const composers: Record<string, unknown>[] = [];
   let buttons = 0;
@@ -114,13 +114,13 @@ test('shared Chat rows show originals once and plain multi-topic headings withou
   assert.equal(composers.length, 1);
   assert.equal(composers[0]?.sendBlocked, true);
   assert.equal(buttons, 2);
-  assert.deepEqual(used, ['composer', 'conversationFrame', 'conversationHeader', 'conversationTranscript', 'chatMessage', 'button', 'composerEditor']);
+  assert.deepEqual(used, ['composer', 'conversationFrame', 'conversationHeader', 'conversationTranscript', 'chatMessage', 'button']);
   assert.equal(messages[0]?.header, undefined, 'user originals never receive a topic header');
-  assert.ok(messages[1]?.header, 'topic heading belongs inside the shared row, not a surrounding wrapper');
+  assert.equal(messages[1]?.header, undefined, 'worker attribution headings do not belong in the foreground conversation');
   assert.deepEqual(messages.map(message => message.body), [user.text, answer.text]);
-  assert.equal((html.match(/ca-topic-heading/g) ?? []).length, 1);
+  assert.equal((html.match(/ca-topic-heading/g) ?? []).length, 0);
   assert.doesNotMatch(html, /border-inline-start-color|memory/);
-  assert.match(html, />关于Weather和Code<\/h3>/);
+  assert.doesNotMatch(html, />关于Weather和Code<\/h3>/);
   assert.match(html, /草稿已保留/);
   assert.match(html, /role="alert"[^>]*>目标会话已不存在/);
   assert.doesNotMatch(html, /发送回执|请求编号|展开完整|检查操作|恢复原提交|private-request-id|internal-json/);

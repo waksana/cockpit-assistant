@@ -7,6 +7,8 @@ import { join, resolve } from 'node:path';
 import { identity, repository, checkEvent, assetNames, hash, verifyAssets, product } from '../scripts/release-contract.mjs';
 // @ts-expect-error Release scripts execute directly in Node; they are not part of the TS runtime.
 import { publish, snapshot } from '../scripts/release.mjs';
+// @ts-expect-error Migration declaration helpers run directly in Node.
+import { preservedSchema3, schema4Migration } from '../scripts/migration-contract.mjs';
 
 const sha = 'a'.repeat(40);
 const expected = identity('17', sha);
@@ -30,7 +32,7 @@ function fixture() {
   for (const [name, value] of Object.entries({
     'package.json': { version: expected.version },
     'cockpit.module.json': { version: expected.version },
-    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.11.1', platform: 'linux', node: '24.20.0' },
+    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.12.0', platform: 'linux', node: '24.20.0' },
     'cockpit-deployment.json': descriptor,
   })) writeFileSync(join(stage, name), `${JSON.stringify(value)}\n`);
   writeFileSync(join(directory, 'cockpit-deployment.json'), readFileSync(join(stage, 'cockpit-deployment.json')));
@@ -114,7 +116,7 @@ test('Only actual accepted main merges in the intended repository qualify', () =
   assert.throws(() => checkEvent({ ...event, repository: { full_name: 'someone/fork' } }, sha));
 });
 
-test('descriptor declares only the three-table schema without source-schema preservation queries', async () => {
+test('descriptor retains schema-3 projections and declares the exact forward migration', async () => {
   const actual = await product(resolve('.'));
   assert.equal(actual.id, 'assistant');
   assert.ok(actual.requiresCapabilities.includes('page.v1'));
@@ -124,13 +126,18 @@ test('descriptor declares only the three-table schema without source-schema pres
   }
   assert.ok(actual.requiresCapabilities.includes('chatRead.v1'));
   assert.ok(actual.requiresCapabilities.includes('promptReceipt.v1'));
+  assert.ok(actual.requiresCapabilities.includes('toolScope.v1'));
   assert.ok(actual.requiredIntents.includes('session/chat'));
   assert.ok(actual.requiredIntents.includes('session/resources-prepare'));
   assert.ok(actual.requiredIntents.includes('respondAsk'));
-  assert.deepEqual(actual.migrations, []);
+  assert.deepEqual(actual.migrations, [schema4Migration]);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
-  assert.equal(actual.databases[0].schema, 3);
-  assert.deepEqual(actual.databases[0].preserve, []);
+  assert.equal(actual.databases[0].schema, 4);
+  assert.deepEqual(actual.databases[0].preserve, preservedSchema3());
+  assert.deepEqual(actual.databases[0].preserve.map((entry: { table: string }) => entry.table),
+    ['messages', 'topic_messages', 'topics']);
+  assert.ok(!actual.databases[0].preserve.find((entry: { table: string }) => entry.table === 'messages')
+    .columns.includes('conversation'), 'New target columns must not be queried on schema 3');
 });
 
 test('Checksums, embedded descriptor and archive identity must all agree', () => {

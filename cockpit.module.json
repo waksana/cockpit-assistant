@@ -13,14 +13,33 @@
     {
       "id": "coordinator",
       "name": "coordinator",
-      "instructions": "roles/coordinator.md",
+      "instructions": "dist/roles/coordinator.md",
+      "skillDirectories": ["skills"],
       "mcpServers": {
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_sessions", "assistant_history", "assistant_source", "assistant_complete", "assistant_clarify"]
+          "tools": ["assistant_topics", "assistant_topic", "assistant_dispatch", "assistant_status", "assistant_inbox", "assistant_history", "assistant_source"]
         }
       }
+    },
+    {
+      "id": "organizer",
+      "name": "Topic organizer",
+      "instructions": "dist/roles/organizer.md",
+      "skillDirectories": ["skills"],
+      "mcpServers": {
+        "assistant": {
+          "type": "http",
+          "path": "/mcp",
+          "tools": ["assistant_topics", "assistant_topic", "assistant_sessions", "assistant_history"]
+        }
+      }
+    },
+    {
+      "id": "worker",
+      "name": "Topic worker",
+      "instructions": "roles/worker.md"
     }
   ]
 }

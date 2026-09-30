@@ -22,7 +22,7 @@ const server = createServer(async (request, response) => {
   if (url.pathname === '/_modules') {
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ modules: [{ id: 'assistant', name: 'Assistant', version: '0.1.0',
-      digest, config: {}, styles: [`${assets}/styles.css`],
+      digest, config: { protocolVersion: 4 }, styles: [`${assets}/styles.css`],
       apiBase: `/_modules/assistant/${digest}/api`, entry: `${assets}/index.js` },
       { id: 'synthetic-probe', name: 'Synthetic File/Speech probe', version: '0.1.0', digest,
         config: {}, styles: [], apiBase: `/_modules/synthetic-probe/${digest}/api`,

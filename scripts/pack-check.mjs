@@ -13,7 +13,8 @@ try {
   const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], { encoding: 'utf8' }));
   const files = new Set(pack.files.map(file => file.path));
   for (const path of [manifest.backend, manifest.frontend.entry, ...manifest.frontend.styles,
-    'cockpit.module.json', 'README.md', 'licenses/lucide.txt', ...manifest.roles.map(role => role.instructions)]) {
+    'cockpit.module.json', 'README.md', 'licenses/lucide.txt', 'dist/migrate.js',
+    'skills/assistant-topics/SKILL.md', ...manifest.roles.map(role => role.instructions)]) {
     assert.ok(files.has(path), `Missing packaged file ${path}`);
   }
   assert.ok(![...files].some(path => path.startsWith('src/') || path.startsWith('node_modules/') || path.includes('.sqlite')));
@@ -22,9 +23,15 @@ try {
   assert.equal(typeof backend.activate, 'function');
   const frontend = await import(pathToFileURL(join(temporary, 'package', manifest.frontend.entry)).href);
   assert.equal(typeof frontend.activate, 'function');
-  await verifySchemaBoundary(backend.activate, temporary);
+  const skill = (await readFile(join(temporary, 'package/skills/assistant-topics/SKILL.md'), 'utf8'))
+    .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
+  for (const role of manifest.roles.filter(role => role.id === 'coordinator' || role.id === 'organizer')) {
+    const instructions = await readFile(join(temporary, 'package', role.instructions), 'utf8');
+    assert.ok(instructions.endsWith(`${skill}\n`), `Packaged ${role.id} must include the actual shared Skill body`);
+  }
+  await verifySchemaBoundary(backend.activate, temporary, join(temporary, 'package/dist/migrate.js'));
   console.log(`Pack closure verified: ${pack.filename}`);
-  console.log('Packaged schema boundary verified: fresh three-table store; incompatible databases unchanged');
+  console.log('Packaged schema boundary verified: schema 3 retained through migration; incompatible databases unchanged');
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

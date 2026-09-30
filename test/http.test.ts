@@ -1,147 +1,112 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ModuleRequest } from '@waksana/cockpit-module-sdk/backend';
+import { fixture, topic, toolIdentity } from './fixtures.ts';
 import { routes } from '../src/http.ts';
-import { fixture, toolIdentity, topic } from './fixtures.ts';
+import { fingerprint } from '../src/database.ts';
 
-function client(f: ReturnType<typeof fixture>) {
-  const table = routes(f.service, f.runtime), signal = new AbortController().signal;
-  return async (method: 'GET' | 'POST' | 'PATCH', path: string, body?: unknown,
-    params: Record<string, string> = {}, query: Record<string, unknown> = {}) => {
-    const route = table.find(item => item.method === method && item.path === path)!;
-    const request: ModuleRequest = { body, params, query, headers: {}, signal };
-    return route.handler(request);
-  };
+function request(body?: unknown, params: Record<string, string> = {}, query: Record<string, unknown> = {}): ModuleRequest {
+  return { params, query, body, headers: {}, signal: new AbortController().signal };
 }
-test('direct clarification GET/POST preserves exact message/card identity, duplicate request receipt and stale failures', async () => {
+test('state explicitly versions new semantics, retains old receipts and offers read-only legacy history', async () => {
   const f = fixture();
   try {
-    f.metas.get('coordinator')!.status = 'running';
-    const request = client(f);
-    const input = f.service.accept({ requestId: 'original', text: 'Raw original' }).message;
-    const q = f.service.clarify({ messageId: input.id, question: 'Where?', choices: ['A','B'], allowFreeform: false }).clarification;
-    const path = '/messages/:messageId/clarifications/:clarificationId', params = { messageId: input.id, clarificationId: q.id };
-    const get = await request('GET', path, undefined, params);
-    assert.deepEqual(get.body, { messageId: input.id, clarification: q });
-    const answer = { requestId: 'stable-answer', answer: 'A' };
-    const post = await request('POST', path, answer, params);
-    assert.equal((post.body as { clarification: { requestId: string } }).clarification.requestId, answer.requestId);
-    assert.deepEqual((await request('POST', path, answer, params)).body, post.body);
-    assert.equal((await request('POST', path, { ...answer, answer: 'B' }, params)).status, 409);
-    assert.equal((await request('POST', path, { requestId: 'later', answer: 'B' }, params)).status, 409);
-    assert.equal((await request('GET', path, undefined, { ...params, clarificationId: 'wrong-card' })).status, 404);
-    assert.equal(f.db.must('messages', input.id).raw, 'Raw original');
-    assert.equal(f.db.must('messages', input.id).processed, false);
-    assert.equal(f.db.find('messages', () => true).length, 1);
+    const api = routes(f.service, f.runtime), call = async (method: string, path: string, req = request()) =>
+      api.find(route => route.method === method && route.path === path)!.handler(req);
+    const state = (await call('GET', '/state')).body as Record<string, unknown>;
+    assert.equal(state.protocolVersion, 4); assert.equal(state.schemaVersion, 4);
+    assert.equal(state.timelineProtocol, 'foreground-message-snapshots-v1');
+    assert.equal(state.legacyTimelinePath, '/legacy/timeline');
+    assert.equal(state.foregroundSessionId, 'coordinator');
+    f.service.addMessage({ kind: 'reply', raw: 'Old historical reply', attachments: [], sessionId: 's1', nativeEventId: 'old' });
+    assert.equal(((await call('GET', '/timeline')).body as { items: unknown[] }).items.length, 0);
+    assert.equal(((await call('GET', '/legacy/timeline')).body as { items: unknown[] }).items.length, 1);
+    assert.equal(api.some(r => r.method === 'POST' && r.path.includes('clarifications')), false);
+    const body = { requestId: 'input', text: 'Exact HTTP human' };
+    const posted = (await call('POST', '/messages', request(body))).body as { message: { id: string } };
+    const inspected = (await call('GET', '/inputs/:requestId', request(undefined, { requestId: 'input' }))).body as { message: { id: string } };
+    assert.equal(posted.message.id, inspected.message.id);
   } finally { await f.runtime.settled(); f.close(); }
 });
-test('messages and inputs keep owner-draft input receipt; no business work/delivery/operation tables or endpoints', async () => {
+test('MCP exports natural ledger/dispatch/inbox tools and no arbitrary peer send, complete or clarify', async () => {
   const f = fixture();
   try {
-    f.metas.get('coordinator')!.status = 'running';
-    const request = client(f);
-    const value = { requestId: 'owner', text: 'Raw', attachments: [] };
-    const response = await request('POST', '/messages', value);
-    assert.deepEqual((response.body as { input: unknown }).input, value);
-    const receipt = await request('GET', '/inputs/:requestId', undefined, { requestId: 'owner' });
-    assert.deepEqual((receipt.body as { input: unknown }).input, value);
-    assert.ok('topicMessages' in (receipt.body as object));
-    assert.equal('work' in (receipt.body as object), false);
-    assert.equal('deliveries' in (receipt.body as object), false);
-    const paths = routes(f.service, f.runtime).map(route => route.path);
-    for (const retired of ['/memories','/deliveries','/sessions/:id/history/recover']) assert.equal(paths.includes(retired), false);
-    assert.equal((await request('GET', '/operations/:id', undefined, { id: 'lost-on-restart' })).status, 404);
-  } finally { await f.runtime.settled(); f.close(); }
+    const route = routes(f.service, f.runtime).find(r => r.path === '/mcp')!;
+    const response = await route.handler(request({ jsonrpc: '2.0', id: 1, method: 'tools/list' }));
+    const names = (response.body as { result: { tools: { name: string }[] } }).result.tools.map(t => t.name);
+    assert.deepEqual(names, ['assistant_topics', 'assistant_topic', 'assistant_dispatch', 'assistant_status', 'assistant_inbox',
+      'assistant_sessions', 'assistant_history', 'assistant_source']);
+    for (const name of ['assistant_complete', 'assistant_clarify', 'cockpit_send_prompt', 'respondAsk']) assert.equal(names.includes(name), false);
+  } finally { f.close(); }
 });
-test('MCP lists only semantic coordinator tools; complete is one atomic original result without work proofs', async () => {
-  const f = fixture();
-  try {
-    const request = client(f);
-    const list = await request('POST', '/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/list' });
-    const names = (list.body as { result: { tools: { name: string }[] } }).result.tools.map(tool => tool.name);
-    assert.deepEqual(names, ['assistant_topics','assistant_sessions','assistant_history','assistant_source','assistant_complete','assistant_clarify']);
-    topic(f);
-    const m = f.service.accept({ requestId: 'semantic', text: 'Raw' }).message;
-    await f.runtime.wake();
-    const identity = toolIdentity(f, m.id);
-    const rpc = { jsonrpc: '2.0', id: 'complete', method: 'tools/call', params: { name: 'assistant_complete',
-      arguments: { messageId: m.id, items: [{ topicId: 'topic', prompt: 'Faithful split' }] },
-      _meta: { 'cockpit/invocation': identity } } };
-    const response = await request('POST', '/mcp', rpc);
-    assert.equal((response.body as { result: { isError: boolean } }).result.isError, false);
-    assert.equal(f.db.must('messages', m.id).processed, true);
-    const old = await request('POST', '/mcp', { ...rpc, params: { ...rpc.params, name: 'assistant_memory_claim' } });
-    assert.equal((old.body as { result: { isError: boolean } }).result.isError, true);
-  } finally { await f.runtime.settled(); f.close(); }
-});
-test('history tool passively reads a bounded ordinary page without ingesting or rewriting it', async () => {
-  const f = fixture();
-  try {
-    const request = client(f);
-    const m = f.service.accept({ requestId: 'history-reader', text: 'Related source' }).message;
-    await f.runtime.wake();
-    f.history.set('s1', [{ id: 'old-reply', type: 'assistant.message', data: { content: 'Old history' } },
-      { id: 'old-subagent', agentId: 'agent', type: 'assistant.message', data: { content: 'Excluded' } }]);
-    const response = await request('POST', '/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/call',
-      params: { name: 'assistant_history', arguments: { sessionId: 's1' },
-        _meta: { 'cockpit/invocation': toolIdentity(f, m.id) } } });
-    const body = response.body as { result: { isError: boolean; content: { text: string }[] } };
-    assert.equal(body.result.isError, false);
-    const history = JSON.parse(body.result.content[0]!.text) as { events: { content: string }[] };
-    assert.deepEqual(history.events.map(event => event.content), ['Old history']);
-    assert.equal(f.db.find('messages', () => true).length, 1);
-    const call = f.calls.find(call => call.name === 'session/chat' && (call.body as { sessionId: string }).sessionId === 's1')!;
-    assert.equal((call.body as { max: number }).max, 16);
-    assert.equal((call.body as { source: string }).source, 'persisted');
-  } finally { await f.runtime.settled(); f.close(); }
-});
-test('MCP protocol validation rejects legacy mutation fields and unsupported revisions', async () => {
-  const f = fixture();
-  try {
-    const request = client(f);
-    const invalid = await request('POST', '/mcp', { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
-    assert.equal((invalid.body as { error: { code: number } }).error.code, -32602);
-    const initialization = await request('POST', '/mcp', { jsonrpc: '2.0', id: 2, method: 'initialize',
-      params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test', version: '1' } } });
-    assert.equal((initialization.body as { result: { serverInfo: { version: string } } }).result.serverInfo.version, '3');
-    assert.equal((await request('POST', '/roles/bind', { requestId: 'bind', role: 'memory', sessionId: 's1' })).status, 400);
-    assert.equal((await request('POST', '/roles/bind', { requestId: 'bind', role: 'coordinator', sessionId: 'coordinator', expectedEpoch: 1 })).status, 400);
-  } finally { await f.runtime.settled(); f.close(); }
-});
-test('semantic source-read can inspect one relevant previous original without granting mutation of it', async () => {
+test('MCP invocation uses actual Host metadata and retired tools cannot reanimate legacy actions', async () => {
   const f = fixture();
   try {
     topic(f);
-    const old = f.service.accept({ requestId: 'old-original', text: 'Old original body' }).message;
-    f.service.complete({ messageId: old.id, items: [{ topicId: 'topic', prompt: 'Old split' }] });
-    const current = f.service.accept({ requestId: 'current-original', text: 'Current original body' }).message;
-    await f.runtime.wake();
-    const request = client(f);
-    const response = await request('POST', '/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/call',
-      params: { name: 'assistant_source', arguments: { messageId: old.id },
-        _meta: { 'cockpit/invocation': toolIdentity(f, current.id) } } });
-    const body = response.body as { result: { isError: boolean; content: { text: string }[] } };
-    assert.equal(body.result.isError, false);
-    assert.equal(JSON.parse(body.result.content[0]!.text).raw, 'Old original body');
-    assert.equal(f.db.must('messages', current.id).processed, false);
-    assert.equal(f.db.topicMessages(old.id).length, 1);
+    const input = await f.runtime.acceptReady({ requestId: 'human', text: 'Business input' });
+    const route = routes(f.service, f.runtime).find(r => r.path === '/mcp')!;
+    const identity = toolIdentity(f, input.message.id);
+    const call = async (name: string, args: unknown, meta = identity) => {
+      const response = await route.handler(request({ jsonrpc: '2.0', id: 'rpc', method: 'tools/call',
+        params: { name, arguments: args, _meta: { 'cockpit/invocation': meta } } }));
+      return (response.body as { result: { isError: boolean; content: { text: string }[] } }).result;
+    };
+    assert.equal((await call('assistant_topics', {})).isError, false);
+    assert.equal((await call('assistant_complete', { messageId: input.message.id, items: [] })).isError, true);
+    assert.equal((await call('assistant_dispatch', { items: [{ topicId: 'topic', prompt: 'Faithful business input' }] })).isError, false);
+    assert.equal(f.calls.filter(c => c.name === 'prompt').length, 2);
+    assert.equal((await call('assistant_sessions', {})).isError, true);
   } finally { await f.runtime.settled(); f.close(); }
 });
-test('one-session history exposes its actual current ask and saved topic associations without backfilling business sources', async () => {
+test('legacy input receipt recovery is passive and old pending sends never enter the current dispatch queue', async () => {
   const f = fixture();
   try {
-    const current = f.service.accept({ requestId: 'current', text: 'Current source' }).message;
-    await f.runtime.wake();
-    const ask = { requestId: 'passive-existing', question: 'Current native choice?', choices: ['Literal'], allowFreeform: false };
-    f.metas.get('s1')!.ask = ask;
-    const request = client(f);
-    const response = await request('POST', '/mcp', { jsonrpc: '2.0', id: 1, method: 'tools/call',
-      params: { name: 'assistant_history', arguments: { sessionId: 's1' },
-        _meta: { 'cockpit/invocation': toolIdentity(f, current.id) } } });
-    const body = response.body as { result: { content: { text: string }[] } };
-    const history = JSON.parse(body.result.content[0]!.text);
-    assert.deepEqual(history.currentAsk, ask);
-    assert.deepEqual(history.currentAskTopicIds, []);
-    assert.equal(f.db.find('messages', () => true).length, 1);
+    topic(f);
+    const input = { requestId: 'old-input', text: '  Legacy original\n', attachments: [] };
+    const message = f.service.addMessage({ kind: 'user', raw: input.text, attachments: [],
+      input: { ...input, fingerprint: fingerprint(input) } });
+    f.db.put('topic_messages', { id: 'legacy-send', messageId: message.id, topicId: 'topic',
+      origin: 'user', prompt: 'Never replay', sessionId: 's1', state: 'pending', mode: null,
+      requestId: null, wasFreeform: null, nativeMessageId: null, result: null, error: null, createdAt: 1 });
+    const route = routes(f.service, f.runtime).find(r => r.path === '/inputs/:requestId')!;
+    const revision = f.db.must('messages', message.id).revision;
+    const response = await route.handler(request(undefined, { requestId: 'old-input' }));
+    assert.deepEqual((response.body as { input: unknown }).input, input);
+    await f.runtime.start();
+    assert.equal(f.db.must('messages', message.id).revision, revision);
+    assert.equal(f.db.must('messages', message.id).processed, false);
+    assert.equal(f.db.must('topic_messages', 'legacy-send').state, 'pending');
+    assert.equal(f.db.records('foreground_inputs').length, 0);
+    assert.equal(f.calls.some(c => ['prompt', 'respondAsk', 'session/new'].includes(c.name)), false);
+  } finally { f.close(); }
+});
+test('assistant_inbox presentation wire declares exact IDs/text without a new tool, bubble, or immediate consumption', async () => {
+  const f = fixture();
+  try {
+    topic(f);
+    await f.event('s1', { id: 'wire-result', type: 'assistant.message', data: { content: 'Wire body' } });
+    const notice = f.db.records('foreground_inputs').find(root => root.kind === 'notification')!;
+    const route = routes(f.service, f.runtime).find(r => r.path === '/mcp')!;
+    const call = async (arguments_: unknown, callId: string) => {
+      const identity = toolIdentity(f, '', callId, notice.receipt!);
+      const response = await route.handler(request({ jsonrpc: '2.0', id: callId, method: 'tools/call',
+        params: { name: 'assistant_inbox', arguments: arguments_, _meta: { 'cockpit/invocation': identity } } }));
+      return (response.body as { result: { isError: boolean; content: { text: string }[] } }).result;
+    };
+    assert.equal((await call({ ids: notice.inboxIds }, 'wire-read')).isError, false);
+    const text = 'The worker reported Wire body.';
+    const declared = await call({ presentation: { ids: notice.inboxIds, text } }, 'wire-declare');
+    assert.equal(declared.isError, false);
+    const receipt = JSON.parse(declared.content[0]!.text);
+    assert.equal(receipt.declared, true); assert.deepEqual(receipt.ids, notice.inboxIds);
+    assert.equal(receipt.normalization, 'crlf-to-lf-outer-trim-v1');
+    assert.equal(receipt.textHash.length, 64); assert.equal(receipt.afterSequence, 0);
+    assert.equal(receipt.text, undefined);
+    assert.equal(f.db.record('inbox', notice.inboxIds[0]!)!.body, 'Wire body');
+    assert.equal(f.db.messagePage('before', undefined, 50).items.length, 0);
+    assert.equal((await call({ ids: notice.inboxIds, presentation: { ids: notice.inboxIds, text } }, 'wire-mixed-read-claim')).isError, true);
+    await f.event('coordinator', { id: 'wire-final', type: 'assistant.message',
+      data: { messageId: 'wire-final', interactionId: receipt.interactionId, content: text } });
+    assert.equal(f.db.record('inbox', notice.inboxIds[0]!)!.body, null);
   } finally { await f.runtime.settled(); f.close(); }
 });

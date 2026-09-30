@@ -23,8 +23,9 @@ credentials are not persisted; package read credentials are limited to install.
 Source package, lock and module manifests remain `0.0.0-dev`. A private packaging
 stage receives `0.0.0-rolling.N`; no generated version is committed. The immutable
 lightweight tag `v0.0.0-rolling.N` points to that exact merged commit.
-The npm SDK dependency is exactly `0.11.1`, independently published to GitHub
-Packages. Its version is not a substitute for the host capability checks below.
+The npm SDK dependency is pinned exactly in `package.json` and the lockfile,
+and independently published to GitHub Packages. Its version is not a substitute
+for the host capability checks below.
 
 Each Release contains exactly four assets:
 
@@ -44,28 +45,39 @@ Independent checksum files avoid a self-referential archive digest.
 The product is module **`assistant`**, backend API 1, requiring public frontend
 API 3, public components/conversation presentation/owner drafts v1, draft submission v2,
 module pages/message presentation/menu/UI/surfaces v1, service readiness, chat reads, ask
-responses, resource preparation, role assignments, session discovery and session
-load v1. Coordinator invocation attribution additionally requires
+responses, resource preparation, role assignments, session discovery, session
+load and persisted native tool scope v1. Foreground invocation attribution additionally requires
 `promptReceipt.v1` and native MCP `toolCallId` metadata. Earlier hosts without
 these capabilities cannot run the coordinator protocol.
 Required intents are extracted from actual backend host calls. Packaging creates
-the real database **in memory** and checks that it has exactly `messages`,
-`topic_messages` and `topics`. The descriptor declares `assistant.sqlite`,
-schema 3, `preserve: []` and `migrations: []`.
+the target database in memory and checks its declared layout. The new foreground
+schema retains the old three tables and adds only the source/notification,
+managed-worker, inbox and tool-result facts needed by the current protocol.
 
-There is no upgrade or reset contract for an incompatible existing database.
-An empty preserve list means no row-projection queries, not permission to
-discard data. In particular, a target-only `topic_messages` query must not run
-against schema 1 or 2 before their incompatibility is detected. Such a transition
-has no declared migration and must not be represented as a supported upgrade.
-Fresh installation and compatible three-table schema 3 are separate from old
-database replacement, which requires a separately authorized operator procedure.
+The descriptor declares schema 4 and one explicit **nondestructive 3-to-4**
+migration. Its preservation projections are derived from an independently
+pinned Rolling 7 schema-3 fixture, not target-only tables or columns. Every
+previous original, topic mapping and delivery receipt must remain byte-for-byte
+equivalent in those projections. New conversation metadata marks retained
+originals as legacy; it does not execute their old classifier work.
+
+The packaged `dist/migrate.js` implements the deployment service's existing
+preflight/apply hook contract. The preflight is read-only; apply uses an explicit
+SQLite transaction. It takes the module data directory and returns only the
+declared JSON confirmation on standard output. It never calls Host/session
+APIs or resets data.
+
+There is no migration or reset claim for schema 1, schema 2 or an incompatible
+schema-3 draft. These are rejected unchanged. Only the reviewed schema-3 source
+and its schema-4 successor are supported; migration success is not permission
+to deploy or restart a running service.
 
 `pack:check` loads the actual packaged backend in isolated data directories.
-It verifies the fresh three-table layout and proves that real synthetic schema 1,
-schema 2 and incompatible four-table schema 3 shapes are rejected without
-changing their bytes or creating target tables. No production database or
-native session is used.
+It exercises the actual packaged migration entry against retained synthetic
+schema-3 originals, a live-question record, mappings and accepted native receipts.
+It compares every old field before/after, checks read-only preflight and repeated
+apply, and proves that incompatible schema 1/2/four-table-3 inputs remain
+unchanged. No production database or native session is used.
 
 Publication creates a draft prerelease, uploads each asset once, downloads every
 asset by ID, checks API digest/size, checksum, archive identity and embedded

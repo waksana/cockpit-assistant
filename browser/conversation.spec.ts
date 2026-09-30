@@ -197,7 +197,7 @@ test('interleaved status, wake, risk and correction retain only natural conversa
   const conversation = page.getByRole('region', { name: '对话记录', exact: true });
   await expect(conversation).not.toContainText(/内部|唤醒通知|风险报告|需要修正的旧正文|synthetic-reception|topic-a/);
   await expect(conversation).not.toContainText(provenance);
-  await expect(conversation.locator('.ca-topic-heading')).toHaveCount(2);
+  await expect(conversation.locator('.ca-topic-heading')).toHaveCount(0);
   await expect(conversation.locator('.message.is-system')).toHaveCount(0);
   await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
   clean(fixture);
@@ -320,7 +320,7 @@ test('a later question snapshot updates Markdown choices in place without select
   clean(fixture);
 });
 
-test('classification SSE adds a plain multi-topic heading without rewriting or duplicating the reply', async ({ page }) => {
+test('foreground snapshots keep the original row without adding background attribution headings', async ({ page }) => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const unclassified = { topicId: null, topicTitle: null };
@@ -353,8 +353,8 @@ test('classification SSE adds a plain multi-topic heading without rewriting or d
   await scroller.press('Home');
   await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
   release();
-  await expect(reply.locator('.ca-topic-heading')).toHaveText('关于杭州天气和代码检查');
-  await expect(reply.locator('.ca-topic-heading')).toHaveCSS('border-inline-start-width', '0px');
+  await expect.poll(() => fixture.requests.filter(request => request.path === '/timeline/stream').length).toBeGreaterThan(0);
+  await expect(reply.locator('.ca-topic-heading')).toHaveCount(0);
   await expect(reply).toHaveAttribute('data-preserved-row', 'yes');
   await expect(reply).toContainText('这是分类前已经显示的完整原回复');
   await expect(page.locator('[data-ca-item]')).toHaveCount(3);
@@ -365,7 +365,7 @@ test('classification SSE adds a plain multi-topic heading without rewriting or d
   await page.reload();
   await ready(page);
   await expect(page.locator('[data-ca-item]')).toHaveCount(3);
-  await expect(reply.locator('.ca-topic-heading')).toHaveText('关于杭州天气和代码检查');
+  await expect(reply.locator('.ca-topic-heading')).toHaveCount(0);
   clean(fixture);
 });
 

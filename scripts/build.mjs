@@ -1,9 +1,21 @@
 import { build } from 'esbuild';
 import { copyFile } from 'node:fs/promises';
+import { buildRoleInstructions } from './role-instructions.mjs';
+
+await buildRoleInstructions();
 
 await build({
   entryPoints: ['src/index.ts'],
   outfile: 'dist/index.js',
+  platform: 'node',
+  format: 'esm',
+  target: 'node24',
+  bundle: true,
+  sourcemap: true,
+});
+await build({
+  entryPoints: ['scripts/migrate-entry.mjs'],
+  outfile: 'dist/migrate.js',
   platform: 'node',
   format: 'esm',
   target: 'node24',

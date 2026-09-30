@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { applicationTables, schemaVersion } from './schema-preflight.mjs';
+import { preservedSchema3, schema4Migration } from './migration-contract.mjs';
 
 export const repository = 'waksana/cockpit-assistant';
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -50,6 +51,7 @@ export async function product(root) {
     ['src/native.ts', 'host.sessionDirectoryVersion === 1'],
     ['src/native.ts', 'host.sessionLoadVersion === 1'],
     ['src/native.ts', 'host.promptReceiptVersion === 1'],
+    ['src/native.ts', 'host.toolScopeVersion === 1'],
     ['frontend/index.ts', 'context.apiVersion !== 3'],
     ['frontend/index.ts', 'context.publicComponentsVersion !== 1'],
     ['frontend/index.ts', 'context.conversationPresentationVersion !== 1'],
@@ -66,21 +68,20 @@ export async function product(root) {
   const db = new Database(':memory:');
   try {
     const schema = db.sql.prepare('PRAGMA user_version').get().user_version;
-    assert.equal(schema, schemaVersion, 'Review schema changes; no automatic migration is declared');
+    assert.equal(schema, schemaVersion, 'Review schema changes and the explicit preservation/migration contract');
     const tables = db.sql.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
       .all().map(({ name }) => name);
-    assert.deepEqual(tables, applicationTables, 'The released database must contain only the agreed three tables');
+    assert.deepEqual(tables, applicationTables, 'The released database must match the declared foreground schema');
     return {
       kind: 'module', id: manifest.id, hostApi: { min: 1, max: 1 },
       requiresCapabilities: ['module-api.v1', 'serviceReady.v1', 'chatRead.v1', 'askResponse.v1',
-        'resourcePreparation.v1', 'roleAssignment.v1', 'sessionDirectory.v1', 'sessionLoad.v1', 'promptReceipt.v1',
+        'resourcePreparation.v1', 'roleAssignment.v1', 'sessionDirectory.v1', 'sessionLoad.v1', 'promptReceipt.v1', 'toolScope.v1',
         'frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2',
         'page.v1', 'messagePresentation.v1', 'menu.v1', 'ui.v1', 'uiSurface.v1'],
       requiredIntents: [...new Set(hostSources.flatMap(source =>
         [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1])))].sort(),
-      // No target-only projection may run against an incompatible source schema.
-      // Empty preserve is not an upgrade: schema mismatch still has no migration.
-      databases: [{ path: 'assistant.sqlite', schema, preserve: [] }], migrations: [],
+      databases: [{ path: 'assistant.sqlite', schema, preserve: preservedSchema3() }],
+      migrations: [schema4Migration],
     };
   } finally { db.close(); }
 }
@@ -111,7 +112,7 @@ export function verifyAssets(directory, expected, expectedProduct) {
     assert.equal(value.version, expected.version);
     if (name === 'module-build.json') {
       assert.equal(value.sourceSha, expected.sourceSha);
-      assert.equal(value.sdk, '0.11.1');
+      assert.equal(value.sdk, '0.12.0');
       assert.equal(value.platform, 'linux');
       assert.match(value.node, /^24\./);
     }

@@ -38,12 +38,11 @@ test('coordinator receives actual native attachments without treating blob bytes
   const f = fixture();
   try {
     const attachments = [{ type: 'blob' as const, mimeType: 'image/png', data: 'c3ludGhldGljLWltYWdl' }];
-    const original = f.service.accept({ requestId: 'image-source', text: 'Classify this image', attachments }).message;
-    await f.runtime.wake();
+    const original = (await f.runtime.acceptReady({ requestId: 'image-source', text: 'Research this image', attachments })).message;
     const prompt = f.calls.find(call => call.name === 'prompt')!.body as { attachments: unknown; text: string };
     assert.deepEqual(prompt.attachments, attachments);
     assert.equal(prompt.text.includes(attachments[0]!.data), false);
-    assert.ok(prompt.text.includes(original.id));
+    assert.equal(prompt.text, 'Research this image');
     assert.deepEqual(f.db.must('messages', original.id).attachments, attachments);
   } finally { f.close(); }
 });

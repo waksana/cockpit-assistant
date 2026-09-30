@@ -40,6 +40,9 @@ async function fixture(handler?: (path: string, init?: RequestInit) => Promise<R
       }
       const custom = handler?.(path, init);
       if (custom) return custom;
+      if (path === '/state') return Response.json({
+        protocolVersion: 4, timelineProtocol: 'foreground-message-snapshots-v1', legacyTimelinePath: '/legacy/timeline',
+      });
       if (path === '/readiness') return Response.json(ready);
       if (path.startsWith('/timeline/stream')) return new Response(new ReadableStream<Uint8Array>({
         start(stream) { streams.push(stream); },
@@ -78,6 +81,105 @@ test('opening reads bounded tail and fresh readiness; closing aborts stream with
     assert.equal(f.requests.filter(request => request.path === '/readiness').length, 2);
     assert.equal(f.store.getSnapshot().draft.text, '保留草稿');
     assert.equal(f.requests.some(request => request.init?.method === 'POST'), false);
+  } finally { f.store.dispose(); }
+});
+
+test('foreground protocol discovery gates reads and sending rather than silently consuming an old aggregation feed', async () => {
+  const gate = deferred<Response>();
+  const f = await fixture(path => path === '/state' ? gate.promise : undefined);
+  try {
+    f.store.open(); await turn();
+    f.store.edit('保留尚未发送的输入');
+    assert.equal(f.requests.some(request => request.path.startsWith('/timeline')), false);
+    assert.equal(f.requests.some(request => request.path === '/readiness'), false);
+    await f.store.send();
+    assert.equal(f.requests.some(request => request.path === '/messages'), false);
+    gate.resolve(Response.json({ protocolVersion: 3, timelineProtocol: 'message-snapshots-v1' }));
+    await turn();
+    assert.equal(f.store.getSnapshot().protocolReady, false);
+    assert.equal(f.store.getSnapshot().checking, false);
+    assert.match(f.store.getSnapshot().error!, /协议不兼容/);
+    assert.equal(f.store.getSnapshot().draft.text, '保留尚未发送的输入');
+    assert.equal(f.requests.some(request => request.path.startsWith('/timeline')), false);
+  } finally { f.store.dispose(); }
+});
+
+test('failed protocol revalidation revokes prior readiness and blocks new input', async () => {
+  let protocolReads = 0;
+  const revalidation = deferred<Response>();
+  const f = await fixture(path => {
+    if (path === '/state' && ++protocolReads > 1) return revalidation.promise;
+    if (path === '/timeline?limit=50') return Response.json(
+      { error: { code: 'UNAVAILABLE', message: 'Synthetic initial history unavailable' } }, { status: 503 });
+  });
+  try {
+    f.store.open(); await turn(); f.store.edit('保留原草稿');
+    assert.equal(f.store.getSnapshot().protocolReady, true);
+    assert.equal(f.store.getSnapshot().draft.submittable, true);
+    f.store.reconnect();
+    assert.equal(f.store.getSnapshot().protocolReady, false);
+    assert.equal(f.store.getSnapshot().readiness, null);
+    assert.equal(f.store.getSnapshot().draft.submittable, false);
+    revalidation.resolve(Response.json({ protocolVersion: 3, timelineProtocol: 'message-snapshots-v1' }));
+    await turn();
+    assert.match(f.store.getSnapshot().error!, /协议不兼容/);
+    assert.equal(f.store.getSnapshot().protocolReady, false);
+    assert.equal(f.store.getSnapshot().checking, false);
+    await f.store.send();
+    assert.equal(f.requests.some(request => request.path === '/messages'), false);
+    assert.equal(f.store.getSnapshot().draft.text, '保留原草稿');
+  } finally { f.store.dispose(); }
+});
+
+test('a late readiness response cannot activate a carrier during new protocol validation', async () => {
+  const oldReadiness = deferred<Response>(), newProtocol = deferred<Response>();
+  let protocolReads = 0;
+  const f = await fixture(path => {
+    if (path === '/state' && ++protocolReads > 1) return newProtocol.promise;
+    if (path === '/readiness') return oldReadiness.promise;
+    if (path === '/timeline?limit=50') return Response.json(
+      { error: { code: 'UNAVAILABLE', message: 'Synthetic initial history unavailable' } }, { status: 503 });
+  });
+  try {
+    f.store.open(); await turn();
+    f.store.reconnect();
+    oldReadiness.resolve(Response.json({ ...ready, canSend: false,
+      roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) }));
+    await turn();
+    assert.equal(f.store.getSnapshot().readiness, null);
+    assert.equal(f.store.getSnapshot().protocolReady, false);
+    assert.equal(f.requests.some(request => request.path === '/roles/activate'), false);
+    newProtocol.resolve(Response.json({ protocolVersion: 3 }));
+    await turn();
+    assert.equal(f.requests.some(request => request.init?.method === 'POST'), false);
+  } finally { f.store.dispose(); }
+});
+
+test('legacy history is explicitly read-only and keeps the current conversation draft', async () => {
+  const legacy = { ...item(1), text: '旧版后台原文', clarifications: [{
+    id: 'legacy-question', question: '之前的分类澄清', choices: [], allowFreeform: true,
+    createdAt: 1, answer: null, answeredAt: null, requestId: null,
+  }] };
+  const f = await fixture(path => path === '/legacy/timeline?limit=50'
+    ? Response.json({ items: [legacy], before: 1, watermark: 1, hasMore: false }) : undefined);
+  try {
+    f.store.open(); await turn();
+    f.store.edit('当前对话草稿');
+    f.store.showLegacy(true); await turn();
+    assert.equal(f.store.getSnapshot().view, 'legacy');
+    assert.equal(f.store.getSnapshot().items[0]!.text, '旧版后台原文');
+    assert.equal(f.store.getSnapshot().draft.submittable, false);
+    const streamCount = f.streams.length;
+    f.store.reconnect();
+    await f.store.send();
+    assert.equal(f.streams.length, streamCount);
+    assert.equal(f.requests.some(request => request.path.includes('/clarifications/')), false);
+    assert.equal(f.requests.some(request => request.init?.method === 'POST'), false);
+    f.store.showLegacy(false); await turn();
+    assert.equal(f.store.getSnapshot().view, 'conversation');
+    assert.equal(f.store.getSnapshot().draft.text, '当前对话草稿');
+    assert.equal(f.store.getSnapshot().items[0]!.id, 'm10');
+    assert.equal(f.store.getSnapshot().draft.submittable, true);
   } finally { f.store.dispose(); }
 });
 

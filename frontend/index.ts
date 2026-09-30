@@ -10,6 +10,7 @@ export const activate: ActivateFrontend = context => {
     || context.uiVersion !== 1 || context.uiSurfaceVersion !== 1) {
     throw new Error('Assistant requires frontend API v3, module pages/navigation v1, message/conversation presentation v1, public components/owner drafts v1, draft submission v2 and public UI/surfaces v1');
   }
+  if (context.config.protocolVersion !== 4) throw new Error('Assistant requires foreground conversation protocol 4');
   const store = context.state.register({
     id: 'conversation-state', create: () => createStore(context), dispose: service => service.dispose(),
   }).get();

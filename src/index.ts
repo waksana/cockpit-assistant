@@ -10,6 +10,8 @@ import { requireFact } from './errors.ts';
 import { nativeTypes } from './ingestion.ts';
 import { configSchema } from './schema.ts';
 import type { Role } from './types.ts';
+export { inspectSchema, migrateSchema4, SCHEMA_VERSION } from './database.ts';
+export { inspect, migrate, SCHEMA3_PRESERVE } from './migration.ts';
 
 export async function activate(context: ModuleBackendContext): Promise<ModuleBackend> {
   requireFact(context.serviceReadyVersion === 1, 'HOST_CAPABILITY', 'Assistant requires serviceReadyVersion 1');
@@ -61,7 +63,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return track(async () => {
           requireFact(!disposed && !signal.aborted, 'STOPPING', 'Assistant is stopping');
           const roles: Role[] = input.roles.flatMap(item => item.moduleId === 'assistant'
-            && item.roleId === 'coordinator' ? [item.roleId] : []);
+            && ['coordinator', 'organizer', 'worker'].includes(item.roleId) ? [item.roleId as Role] : []);
           if (input.roles.some(item => item.moduleId === 'assistant' && item.roleId === 'memory'))
             return { allowed: false, reason: 'Memory role is retired for this iteration' };
           return runtime.allowRoles(input.operation === 'create' ? null : input.sessionId, roles);
@@ -71,7 +73,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return track(async () => {
           requireFact(!disposed && !signal.aborted, 'STOPPING', 'Assistant stopped before role registration');
           const roles: Role[] = input.roles.flatMap(item => item.moduleId === 'assistant'
-            && item.roleId === 'coordinator' ? [item.roleId] : []);
+            && ['coordinator', 'organizer', 'worker'].includes(item.roleId) ? [item.roleId as Role] : []);
           if (roles.length) await runtime.registerRoles(input.sessionId, roles, input.notificationId, signal);
         });
       },
@@ -83,7 +85,8 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return track(async () => route.handler({ ...request, signal: AbortSignal.any([request.signal, local.signal]) }));
       },
     })),
-    publicConfig: { backendOnly: true, protocolVersion: 3 },
+    publicConfig: { backendOnly: true, protocolVersion: 4, timelineProtocol: 'foreground-message-snapshots-v1',
+      legacyTimelinePath: '/legacy/timeline', continuousForeground: true },
     async onReady() {
       if (disposed || context.signal.aborted) return;
       ready = true;

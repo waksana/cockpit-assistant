@@ -17,7 +17,7 @@ npx playwright test
 ```
 
 The host revision is pinned to
-`4c1b9e31911e7a121faff13521552135b712f93f` (merged host PR #271) in
+`e54d3d160852d0ea78b18184de84f160f8aad519` in
 `scripts/browser-build.mjs`. A clean cached checkout is required.
 When its web dependencies are absent, the fixture prepares the pinned host's
 web dependency closure with `pnpm --filter @cockpit/web... install --prod
@@ -69,7 +69,7 @@ stopped. No fixture is part of the module package.
   Native transport entry points throw and are counted.
 - Playwright mocks Assistant timeline, readiness, POST and immutable receipt
   APIs. A loopback server provides idle SSE; tests also exercise controlled
-  failure, cursor catch-up, duplicates and out-of-order events. Unexpected host,
+  failure, revision catch-up, duplicates and stale snapshots. Unexpected host,
   module and external HTTP requests fail.
 
 ## Genuine File and Speech release bundles
@@ -116,7 +116,7 @@ Scenarios run on desktop/mobile Chromium in light/dark themes:
 - Named role buttons with icon-only status, independent connection state, checking and
   error details, compact focus/Escape handling and readiness-gated sending.
 - Long Markdown and six long choices on narrow screens, fixed visible
-  Composer, ordinary text quick-fill without reply targets, paging and
+  Composer, ordinary Markdown options without choice buttons or reply targets, paging and
   reading-position/SSE recovery.
 - Public Composer computed styles/control geometry compared with Chat.
 - Complete public message presentation compared with the native
@@ -129,11 +129,12 @@ Scenarios run on desktop/mobile Chromium in light/dark themes:
   replacements must retain the off-bottom reading anchor and live draft.
   After returning to bottom, subsequent same-message body growth must still
   follow via the rebound resize observer, without new-message unread counts.
-- Natural user/assistant order across hidden status, wake, risk and correction
-  publications; correction replaces the right body without counting as unread.
+- Natural user/assistant order across current snapshots and hidden system
+  messages; source, attribution and question updates retain their message DOM.
   System-only pages stay blank and multi-page system-only history is traversed
-  to reach earlier dialogue. Hidden SSE still advances raw watermarks, catches
-  gaps, reconnects and deduplicates; only new dialogue increments unread.
+  to reach earlier dialogue. SSE IDs and catch-up cursors use sparse global
+  snapshot revisions, not eternal display sequences. Reconnect and reload merge
+  by message identity; only new dialogue increments unread.
 - Genuine File upload, clipboard paste, drag/drop, preview and attachment-only
   send/ACK; genuine Speech microphone/F8, real browser touch/pointer hold,
   foreground target and cancellation.

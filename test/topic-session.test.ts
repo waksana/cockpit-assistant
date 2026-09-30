@@ -1,100 +1,101 @@
 import assert from 'node:assert/strict';
-import { homedir } from 'node:os';
 import { test } from 'node:test';
-import { fixture, stageDelivery, topic } from './fixtures.ts';
-import { ensureTopicSession } from '../src/topic-session.ts';
+import { fixture, topic, stageDelivery } from './fixtures.ts';
 
-test('an unbound topic automatically creates once using default cwd and native default model', async () => {
-  const f = fixture();
-  try {
-    stageDelivery(f, { sessionId: '', topicId: 'unbound' });
-    await f.runtime.wake();
-    assert.deepEqual(f.calls.find(c => c.name === 'session/new')!.body, { cwd: homedir() });
-    assert.equal(f.db.must('topics', 'unbound').sessionId, 'new-synthetic');
-    assert.equal(f.db.must('deliveries', 'delivery').sessionId, 'new-synthetic');
-    assert.equal(f.db.must('deliveries', 'delivery').state, 'accepted');
-    stageDelivery(f, { id: 'second', sessionId: '', topicId: 'unbound' });
-    await f.runtime.wake();
-    assert.equal(f.calls.filter(c => c.name === 'session/new').length, 1);
-    assert.equal(f.db.must('deliveries', 'second').sessionId, 'new-synthetic');
-  } finally { f.close(); }
-});
-
-test('configured cwd is honored without overriding host model selection', async () => {
-  const f = fixture();
-  try {
-    f.db.setMeta('config', { defaultCwd: '/explicit/project', maxReceptions: 32 });
-    stageDelivery(f, { sessionId: '' });
-    await f.runtime.wake();
-    assert.deepEqual(f.calls.find(c => c.name === 'session/new')!.body, { cwd: '/explicit/project' });
-  } finally { f.close(); }
-});
-
-test('unknown creation reserves only its topic and unrelated topics can still create', async () => {
-  const f = fixture();
-  try {
-    stageDelivery(f, { topicId: 'uncertain', sessionId: '' });
-    f.fail(new Error('Lost create receipt'));
-    await f.runtime.wake();
-    f.fail(null);
-    f.advance(1000);
-    stageDelivery(f, { id: 'other', topicId: 'other', sessionId: '' });
-    await f.runtime.wake();
-    assert.equal(f.db.must('deliveries', 'delivery').state, 'unknown');
-    assert.equal(f.db.must('deliveries', 'other').state, 'accepted');
-    assert.equal(f.calls.filter(c => c.name === 'session/new').length, 2);
-    stageDelivery(f, { id: 'same-topic-later', topicId: 'uncertain', sessionId: '' });
-    await f.runtime.wake();
-    assert.equal(f.calls.filter(c => c.name === 'session/new').length, 2);
-    assert.equal(f.db.must('deliveries', 'same-topic-later').state, 'unknown');
-  } finally { f.close(); }
-});
-
-test('known created ID and mapping persist before observation fails and retry reuses exact ID', async () => {
-  const f = fixture();
-  try {
-    stageDelivery(f, { topicId: 'created', sessionId: '' });
-    f.onGet(async id => { if (id === 'new-synthetic') throw new Error('Observation unavailable'); });
-    await f.runtime.wake();
-    assert.equal(f.db.must('topics', 'created').sessionId, 'new-synthetic');
-    assert.equal(f.db.must('deliveries', 'delivery').sessionId, 'new-synthetic');
-    assert.equal(f.db.must('deliveries', 'delivery').state, 'pending');
-    f.onGet(null);
-    f.advance(1000);
-    await f.runtime.wake();
-    assert.equal(f.calls.filter(c => c.name === 'session/new').length, 1);
-    assert.equal(f.db.must('deliveries', 'delivery').state, 'accepted');
-  } finally { f.close(); }
-});
-
-test('partial native create errors carrying a known ID never trigger replacement', async () => {
-  const f = fixture();
-  try {
-    stageDelivery(f, { topicId: 'partial', sessionId: '' });
-    f.metas.set('known-created', { ...f.metas.get('s1')!, sessionId: 'known-created' });
-    f.fail(Object.assign(new Error('Post-create failure'), { sessionId: 'known-created' }));
-    await ensureTopicSession(f.service, f.runtime, 'delivery');
-    assert.equal(f.db.must('topics', 'partial').sessionId, 'known-created');
-    f.fail(null);
-    await f.runtime.wake();
-    assert.equal(f.db.must('deliveries', 'delivery').state, 'accepted');
-    assert.equal(f.calls.filter(c => c.name === 'session/new').length, 1);
-  } finally { f.close(); }
-});
-
-test('an explicit concurrent mapping wins without forgetting a created native ID', async () => {
+test('unbound user topic creates a real default-config session once, records it, and reuses it', async () => {
   const f = fixture();
   try {
     topic(f, 'topic', null);
-    stageDelivery(f, { topicId: 'topic', sessionId: '' });
-    const original = f.runtime.create.bind(f.runtime);
-    f.runtime.create = async input => {
-      const result = await original(input);
-      f.db.put('topics', { ...f.db.must('topics', 'topic'), sessionId: 's2' });
-      return result;
-    };
-    await ensureTopicSession(f.service, f.runtime, 'delivery');
-    assert.equal(f.db.must('deliveries', 'delivery').sessionId, 's2');
-    assert.deepEqual(f.db.must('operations', 'create:topic:topic').result, { sessionId: 'new-synthetic' });
+    const first = stageDelivery(f, 'first');
+    await f.runtime.wake();
+    assert.equal(f.db.must('topics', 'topic').sessionId, 'created-1');
+    assert.equal(f.db.topicMessages(first.message.id)[0]!.sessionId, 'created-1');
+    assert.deepEqual(f.calls.find(call => call.name === 'session/new')!.body, { cwd: '/synthetic' });
+    const next = stageDelivery(f, 'next');
+    await f.runtime.wake();
+    assert.equal(f.calls.filter(call => call.name === 'session/new').length, 1);
+    assert.equal(f.db.topicMessages(next.message.id)[0]!.sessionId, 'created-1');
+  } finally { f.close(); }
+});
+test('unknown creation is retained on the topic with partial real identity, never automatically repeated', async () => {
+  const f = fixture();
+  try {
+    topic(f, 'topic', null);
+    f.fail('session/new', Object.assign(new Error('Lost creation response'), { createdId: 'real-partial' }));
+    const first = stageDelivery(f, 'first');
+    await f.runtime.wake();
+    const t = f.db.must('topics', 'topic');
+    assert.equal(t.mappingState, 'unknown'); assert.equal(t.sessionId, null);
+    assert.equal((t.creationReceipt as { createdId: string }).createdId, 'real-partial');
+    assert.equal(f.db.topicMessages(first.message.id)[0]!.state, 'unknown');
+    stageDelivery(f, 'next'); f.fail('session/new', null);
+    await f.runtime.wake();
+    assert.equal(f.calls.filter(call => call.name === 'session/new').length, 1);
+    assert.equal(f.db.must('topics', 'topic').mappingState, 'unknown');
+    assert.ok(f.errors.length >= 2);
+  } finally { f.close(); }
+});
+test('missing mapped session rejects visibly, rather than creating a replacement', async () => {
+  const f = fixture();
+  try {
+    topic(f, 'topic', 'missing');
+    const staged = stageDelivery(f);
+    await f.runtime.wake();
+    assert.equal(f.db.topicMessages(staged.message.id)[0]!.state, 'rejected');
+    assert.equal(f.calls.some(call => call.name === 'session/new'), false);
+  } finally { f.close(); }
+});
+test('uncertain original load is not reset to pending or followed by a prompt', async () => {
+  const f = fixture();
+  try {
+    const staged = stageDelivery(f);
+    f.metas.get('s1')!.loaded = false;
+    f.fail('session/load', new Error('Connection lost after load may have applied'));
+    await f.runtime.wake(); await f.runtime.wake();
+    assert.equal(f.db.topicMessages(staged.message.id)[0]!.state, 'unknown');
+    assert.equal(f.calls.filter(call => call.name === 'session/load').length, 1);
+    assert.equal(f.calls.some(call => call.name === 'prompt'), false);
+  } finally { f.close(); }
+});
+test('original load is marked calling durably before invoking Host, so a crash cannot silently repeat it', async () => {
+  const f = fixture();
+  try {
+    const staged = stageDelivery(f);
+    f.metas.get('s1')!.loaded = false;
+    f.onLoad(async sessionId => {
+      assert.equal(sessionId, 's1');
+      const row = f.db.topicMessages(staged.message.id)[0]!;
+      assert.equal(row.state, 'calling');
+      assert.equal(row.sessionId, 's1');
+      assert.equal(row.mode, null);
+    });
+    await f.runtime.wake();
+    assert.equal(f.db.topicMessages(staged.message.id)[0]!.state, 'accepted');
+  } finally { f.close(); }
+});
+test('transition to internal during a confirmed original load cancels the still-unsent business content truthfully', async () => {
+  const f = fixture();
+  try {
+    const staged = stageDelivery(f);
+    f.metas.get('s1')!.loaded = false;
+    f.onLoad(async () => { f.metas.get('s1')!.roles = f.metas.get('coordinator')!.roles; });
+    await f.runtime.wake();
+    const row = f.db.topicMessages(staged.message.id)[0]!;
+    assert.equal(row.state, 'cancelled');
+    assert.equal(f.calls.some(call => call.name === 'prompt'), false);
+    assert.ok(f.errors.some(error => (error as { topicMessageId?: string }).topicMessageId === row.id));
+  } finally { f.close(); }
+});
+test('a coordinator cannot clear unknown creation back to unbound and cause a speculative recreation', () => {
+  const f = fixture();
+  try {
+    const t = topic(f, 'topic', null);
+    f.db.put('topics', { ...t, mappingState: 'unknown', mappingError: 'Unknown native creation' });
+    const m = f.service.accept({ requestId: 'clear', text: 'Another request' }).message;
+    assert.throws(() => f.service.complete({ messageId: m.id,
+      topics: [{ topicId: 'topic', title: 'topic', content: '', sessionId: null }],
+      items: [{ topicId: 'topic', prompt: 'Request' }] }), /cannot be cleared/);
+    assert.equal(f.db.must('topics', 'topic').mappingState, 'unknown');
+    assert.equal(f.db.must('messages', m.id).processed, false);
   } finally { f.close(); }
 });

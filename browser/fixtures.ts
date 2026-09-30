@@ -1,6 +1,7 @@
 import type { Page, Route } from '@playwright/test';
 import type { InputReceipt, Readiness, TimelineItem, TimelinePage } from '../src/ui-types.ts';
 import type { Operation, Role } from '../src/types.ts';
+import { mergeSnapshots } from '../frontend/timeline.ts';
 
 export const apiPattern = '**/_modules/assistant/*/api/**';
 export const longMarkdown = [
@@ -15,12 +16,18 @@ export const longMarkdown = [
   '**长回答结束标记**',
 ].join('\n\n');
 
-export function publication(sequence: number, text: string, patch: Partial<TimelineItem> = {}): TimelineItem {
+type TimelinePatch = Omit<Partial<TimelineItem>, 'question'> & {
+  question?: (Omit<NonNullable<TimelineItem['question']>, 'requestId'> & { requestId?: string }) | null;
+};
+export function publication(sequence: number, text: string, patch: TimelinePatch = {}): TimelineItem {
+  const id = patch.messageId ?? patch.id ?? `publication-${sequence}`;
   return {
-    id: `publication-${sequence}`, sequence, type: 'message', messageId: `message-${sequence}`,
-    topicId: 'topic-a', topicTitle: '旅行计划 A', topicColor: '#2563eb', text,
-    sources: [], createdAt: 1_750_000_000_000 + sequence * 1000, speaker: 'assistant',
-    sessionId: 'synthetic-reception', question: null, attachments: [], ...patch,
+    sequence, snapshotRevision: sequence, type: 'message',
+    topicId: 'topic-a', topicTitle: '旅行计划 A', text,
+    createdAt: 1_750_000_000_000 + sequence * 1000, speaker: 'assistant',
+    sessionId: 'synthetic-reception', attachments: [], clarifications: [], diagnostic: null, deliveryIssues: [], ...patch,
+    question: patch.question ? { requestId: `ask-${id}`, ...patch.question } : null,
+    id, messageId: id,
   };
 }
 export const older = [
@@ -39,15 +46,13 @@ export const timeline = [
 export function readiness(ready = true): Readiness {
   return {
     canSend: ready,
-    roles: (['coordinator', 'memory'] as Role[]).map(role => ({
-      role, sessionId: ready ? `synthetic-${role}` : null, epoch: ready ? 1 : 0,
+    roles: (['coordinator'] as Role[]).map(role => ({
+      role, sessionId: ready ? `synthetic-${role}` : null,
       modelId: ready ? 'synthetic-model' : null, cwd: ready ? '/synthetic/project' : null,
       status: ready ? 'ready' : 'unbound', detail: ready ? null : '尚未绑定',
     })),
     receptions: ready ? [{
-      id: 'synthetic-reception', label: '合成接待者', kind: 'reception', enabled: true,
-      evidence: 'Synthetic browser fixture only', availability: 'loaded', cursor: null,
-      cursorSource: 'live', cursorDirection: 'forward', baseline: true, gap: null, generation: 1, version: 1,
+      id: 'synthetic-reception', label: '合成接待者', availability: 'loaded',
     }] : [],
   };
 }
@@ -72,7 +77,7 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
   const receipts = new Map<string, InputReceipt>();
   const operations = new Map<string, Operation>();
   let currentReadiness = readiness(options.ready ?? true);
-  let latest = [...(options.items ?? timeline)];
+  let latest = mergeSnapshots(options.items ?? timeline);
   const seenUnexpected: string[] = [];
   const consoleErrors: string[] = [];
   page.on('pageerror', error => consoleErrors.push(error.message));
@@ -121,26 +126,26 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
           requestId,
           input: structuredClone(body) as InputReceipt['input'],
           message: {
-            id: `input-${requestId}`, kind: 'user', raw: String(body.text), version: 1,
-            attachments: structuredClone(body.attachments ?? []) as InputReceipt['message']['attachments'], topicId: null,
-            assignmentVersion: 0, assignmentReason: null, sessionId: null, nativeEventId: null,
-            nativeMessageId: null, nativeParentId: null, correlation: 'unknown',
-            historical: false,
-            sequence: 100, createdAt: 1_750_000_100_000,
-          }, work: [], deliveries: [], hasMore: { work: false, deliveries: false },
+            id: `input-${requestId}`, kind: 'user', raw: String(body.text),
+            attachments: structuredClone(body.attachments ?? []) as InputReceipt['message']['attachments'],
+            sessionId: null, nativeEventId: null, nativeMessageId: null,
+            sequence: 100, revision: 100, createdAt: 1_750_000_100_000,
+            processed: false, excluded: false, diagnostic: null, question: null,
+            clarification: null, clarificationHistory: [],
+          }, topicMessages: [], hasMore: { topicMessages: false },
         });
       }
       if (await options.post?.(post, route)) return;
       if (path === '/messages') { await json(route, { messageId: `input-${String(body.requestId)}`, accepted: true }); return; }
       const prefix = path === '/roles/activate' ? 'activate'
-        : path === '/sessions' ? 'create' : path === '/roles/bind' ? 'bind' : path === '/enrollment' ? 'enroll' : null;
+        : path === '/sessions' ? 'create' : path === '/roles/bind' ? 'bind' : null;
       if (prefix) {
         const result = path === '/roles/activate' ? { bindings: body.bindings }
           : path === '/sessions'
           ? { sessionId: `synthetic-created-${body.role ?? 'reception'}`, modelId: 'synthetic-model', cwd: body.cwd }
-          : path === '/roles/bind' ? { sessionId: body.sessionId, role: body.role, epoch: Number(body.expectedEpoch) + 1 }
-            : { sessionId: body.sessionId, enrolled: true };
-        const operation: Operation = { id: `${prefix}:${String(body.requestId)}`, fingerprint: 'synthetic', state: 'accepted', result };
+          : { sessionId: body.sessionId, role: body.role };
+        const operation: Operation = { id: `${prefix}:${String(body.requestId)}`, kind: prefix,
+          fingerprint: 'synthetic', state: 'accepted', result };
         operations.set(operation.id, operation);
         await json(route, operation);
         return;
@@ -152,10 +157,13 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
         const before = url.searchParams.get('before');
         const after = url.searchParams.get('after');
         const items = before ? older.filter(item => item.sequence < Number(before))
-          : after ? latest.filter(item => item.sequence > Number(after)) : latest;
+          : after ? latest.filter(item => item.snapshotRevision! > Number(after))
+            .sort((a, b) => a.snapshotRevision! - b.snapshotRevision!) : latest;
         const result: TimelinePage = {
           items, before: items[0]?.sequence ?? null,
-          hasMore: before || after ? false : (options.hasOlder ?? true), watermark: latest.at(-1)?.sequence ?? 0,
+          hasMore: before || after ? false : (options.hasOlder ?? true),
+          watermark: Math.max(0, ...latest.map(item => item.snapshotRevision!)),
+          ...(after ? { cursor: items.at(-1)?.snapshotRevision ?? Number(after) } : {}),
         };
         await json(route, result);
         return;
@@ -182,10 +190,10 @@ export async function installFixture(page: Page, options: FixtureOptions = {}) {
   return {
     posts, requests, receipts, consoleErrors, seenUnexpected,
     setReadiness: (value: Readiness) => { currentReadiness = value; },
-    setTimeline: (items: TimelineItem[]) => { latest = items; },
+    setTimeline: (items: TimelineItem[]) => { latest = mergeSnapshots(items); },
   };
 }
 
 export function streamBody(items: TimelineItem[]) {
-  return items.map(item => `event: publication\nid: ${item.sequence}\ndata: ${JSON.stringify(item)}\n\n`).join('');
+  return items.map(item => `event: publication\nid: ${item.snapshotRevision}\ndata: ${JSON.stringify(item)}\n\n`).join('');
 }

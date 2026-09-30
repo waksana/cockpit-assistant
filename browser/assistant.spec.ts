@@ -37,7 +37,7 @@ test('real host global menu opens on an empty homepage; complete conversation an
   await expect(messages.first().locator('.ca-topic-heading')).toHaveCount(0);
   await expect(messages.nth(1).locator('.ca-topic-heading')).toHaveCount(0);
   await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveText('旅行计划 A');
-  await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveCSS('border-inline-start-color', 'rgb(37, 99, 235)');
+  await expect(messages.nth(2).locator('.ca-topic-heading')).toHaveCSS('border-inline-start-width', '0px');
   await expect(messages.first()).toContainText('A：先讨论旅行计划');
   await expect(messages.nth(1)).toContainText('B：现在讨论代码审查');
   await expect(messages.nth(2)).toContainText('A：继续刚才的旅行计划');
@@ -73,13 +73,13 @@ test('real host global menu opens on an empty homepage; complete conversation an
   await page.screenshot({ path: info.outputPath('synthetic-assistant.png') });
   const back = page.getByRole('link', { name: '返回 Cockpit', exact: true });
   const coordinator = page.getByRole('button', { name: 'coordinator：已就绪', exact: true });
-  const memory = page.getByRole('button', { name: 'memory：已就绪', exact: true });
   const connection = page.getByRole('button', { name: '实时连接：已连接', exact: true });
-  await expect(page.locator('.ca-header button')).toHaveCount(3);
+  await expect(page.locator('.ca-header button')).toHaveCount(2);
+  await expect(page.getByRole('button', { name: /^memory：/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '设置', exact: true })).toHaveCount(0);
   for (const [control, title] of [[back, '返回 Cockpit'], [coordinator, 'coordinator：已就绪'],
-    [memory, 'memory：已就绪'], [connection, '实时连接：已连接']] as const) {
-    await expect(control).toHaveClass(title.startsWith('coordinator') || title.startsWith('memory')
+    [connection, '实时连接：已连接']] as const) {
+    await expect(control).toHaveClass(title.startsWith('coordinator')
       ? /ck-button/ : 'ck-icon-button');
     await expect(control).toHaveAttribute('title', title);
     await expect(control.locator('svg')).toHaveClass(/ck-icon/);
@@ -92,7 +92,6 @@ test('real host global menu opens on an empty homepage; complete conversation an
   expect((await back.boundingBox())!.x).toBeLessThan((await coordinator.boundingBox())!.x);
   await expect(back.locator('path').first()).toHaveAttribute('d', 'm12 19-7-7 7-7');
   await expect(coordinator).toHaveText('coordinator');
-  await expect(memory).toHaveText('memory');
   await expect(connection).toHaveText('');
   await coordinator.click();
   const setup = page.getByRole('region', { name: '状态详情', exact: true });
@@ -139,7 +138,7 @@ test('not-ready users can edit and preserve drafts but cannot send, then refresh
   await send.click();
   await expect(draft).toHaveValue('');
   expect(fixture.posts).toHaveLength(1);
-  expect(fixture.posts[0]?.body.text).toBe(savedText.trim());
+  expect(fixture.posts[0]?.body.text).toBe(savedText);
   expect(fixture.posts[0]?.body.requestId).toMatch(uuid);
   assertClean(fixture);
 });
@@ -296,7 +295,7 @@ test('role registration belongs to Cockpit; no manual UUID, create, bind or rece
   await expect(setup.locator('input,select,form')).toHaveCount(0);
   await expect(page.getByRole('button', { name: /^(创建会话|绑定|接入接待者|检查会话)/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'coordinator：未绑定' })).toHaveText('coordinator');
-  await expect(page.getByRole('button', { name: 'memory：未绑定' })).toHaveText('memory');
+  await expect(page.getByRole('button', { name: /^memory：/ })).toHaveCount(0);
   await expect(page.getByText(/编排者|记忆者|Assistant coordinator|Assistant memory/)).toHaveCount(0);
   expect(fixture.posts).toEqual([]);
   const ready = readiness();
@@ -336,14 +335,14 @@ test('unknown input never resends; receipt lookup uses the original ID and prese
   assertClean(fixture);
 });
 
-test('opening loads only bound unloaded carriers, preserves pending receipts and never repairs invalid roles', async ({ page }) => {
+test('opening loads the bound coordinator and preserves its pending receipt without a memory carrier', async ({ page }) => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const fixture = await installFixture(page, { ready: false, items: [], hasOlder: false,
     post: async (post, route) => {
       if (post.path !== '/roles/activate') return false;
       await gate;
-      await json(route, { id: `activate:${post.body.requestId}`, fingerprint: 'synthetic',
+      await json(route, { id: `activate:${post.body.requestId}`, kind: 'activate', fingerprint: 'synthetic',
         state: 'accepted', result: { loaded: ['synthetic-coordinator'] } });
       return true;
     },
@@ -351,15 +350,12 @@ test('opening loads only bound unloaded carriers, preserves pending receipts and
   const unloaded = readiness();
   unloaded.canSend = false;
   unloaded.roles[0]!.status = 'unloaded';
-  unloaded.roles[1]!.status = 'invalid';
-  unloaded.roles[1]!.detail = '角色已选择但尚未应用，请在 Cockpit 处理';
   fixture.setReadiness(unloaded);
   await page.goto('/');
   await openAssistant(page);
   await expect.poll(() => fixture.posts.length).toBe(1);
   expect(fixture.posts[0]).toMatchObject({ path: '/roles/activate', body: { bindings: [
-    { role: 'coordinator', sessionId: 'synthetic-coordinator', epoch: 1 },
-    { role: 'memory', sessionId: 'synthetic-memory', epoch: 1 },
+    { role: 'coordinator', sessionId: 'synthetic-coordinator' },
   ] } });
   expect(fixture.posts[0]!.body.requestId).toMatch(uuid);
   const receipt = page.getByText('正在准备角色会话…', { exact: true });
@@ -371,14 +367,15 @@ test('opening loads only bound unloaded carriers, preserves pending receipts and
   await expect(receipt).toBeVisible();
   const draft = page.getByRole('textbox', { name: '消息输入', exact: true });
   await draft.fill('加载完成不得改变此草稿');
-  await expect(page.getByRole('button', { name: 'memory：不可用' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /^memory：/ })).toHaveCount(0);
   unloaded.roles[0]!.status = 'ready';
+  unloaded.canSend = true;
   fixture.setReadiness(unloaded);
   release();
   await expect(receipt).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'coordinator：已就绪' })).toBeVisible();
   await expect(draft).toHaveValue('加载完成不得改变此草稿');
-  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled();
   expect(fixture.posts).toHaveLength(1);
   assertClean(fixture);
 });
@@ -410,19 +407,20 @@ test('late POST completion after close/reopen cannot erase new typing or duplica
   assertClean(fixture);
 });
 
-test('paging and duplicate/out-of-order SSE recover from the applied cursor without losing reading position', async ({ page }) => {
+test('paging and duplicate SSE recover sparse revisions after a disconnect without losing reading position', async ({ page }) => {
   let release: (() => void) | undefined;
   const gate = new Promise<void>(resolve => { release = resolve; });
   let streamCount = 0;
-  const ten = publication(10, '新增的完整消息十');
-  const eleven = publication(11, '补读的完整消息十一');
-  const twelve = publication(12, '补读的完整消息十二');
+  const ten = publication(10, '新增的完整消息十', { snapshotRevision: 20 });
+  const eleven = publication(11, '补读的完整消息十一', { snapshotRevision: 30 });
+  const twelve = publication(12, '补读的完整消息十二', { snapshotRevision: 50 });
   const fixture = await installFixture(page, {
     stream: async (_after, route) => {
       if (++streamCount !== 1) return false;
       await gate;
       fixture.setTimeline([...timeline, ten, eleven, twelve]);
-      await route.fulfill({ contentType: 'text/event-stream', body: streamBody([ten, ten, twelve]) });
+      await route.fulfill({ contentType: 'text/event-stream',
+        body: streamBody([ten, ten]) + 'event: error\ndata: interrupted fixture stream\n\n' });
       return true;
     },
   });
@@ -444,8 +442,8 @@ test('paging and duplicate/out-of-order SSE recover from the applied cursor with
   await expect(page.locator('[data-ca-item]')).toHaveCount(12);
   expect(await page.locator('[data-ca-item]').evaluateAll(elements => elements.map(element => element.getAttribute('data-ca-item'))))
     .toEqual(Array.from({ length: 12 }, (_, index) => `publication-${index + 1}`));
-  await expect.poll(() => fixture.requests.some(request => request.path === '/timeline' && request.query.includes('after=10'))).toBe(true);
-  await expect.poll(() => fixture.requests.some(request => request.path === '/timeline/stream' && request.query.includes('after=12'))).toBe(true);
+  await expect.poll(() => fixture.requests.some(request => request.path === '/timeline' && request.query.includes('after=20'))).toBe(true);
+  await expect.poll(() => fixture.requests.some(request => request.path === '/timeline/stream' && request.query.includes('after=50'))).toBe(true);
   await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toBeVisible();
   expect(await scroller.evaluate(element => element.scrollTop)).toBeLessThan(100);
   await page.getByRole('button', { name: '有新内容 · 回到最新' }).click();

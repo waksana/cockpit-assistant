@@ -1,12 +1,10 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { resolve } from 'node:path';
-import type { TimelineItem } from '../src/ui-types.ts';
 import { chatReference } from './chat-reference.ts';
 import { installFixture, json, longMarkdown, publication, streamBody } from './fixtures.ts';
 
-const system = (sequence: number, text: string, type: TimelineItem['type'] = 'status') =>
-  publication(sequence, text, { type, speaker: 'system', messageId: null });
-const source = (messageId: string, version = 1) => ({ messageId, version, assignmentVersion: 0 });
+const system = (sequence: number, text: string) =>
+  publication(sequence, text, { speaker: 'system' });
 
 async function ready(page: Page) {
   await expect(page.locator('.ca-page')).toBeVisible();
@@ -63,7 +61,7 @@ async function measureRows(rows: Locator) {
 test('complete public messages match real native Chat rows, Markdown, spacing, time and attachments', async ({ page }) => {
   const items = chatReference.map((message, index) => publication(index + 1, message.content, {
     id: message.id, messageId: message.id, speaker: message.role, createdAt: message.timestamp,
-    attachments: message.attachments ?? [], topicId: null, topicTitle: null, topicColor: null,
+    attachments: message.attachments ?? [], topicId: null, topicTitle: null,
   }));
   const fixture = await installFixture(page, { items, hasOlder: false });
   await page.goto('/?transcript=1');
@@ -179,13 +177,12 @@ test('interleaved status, wake, risk and correction retain only natural conversa
   const items = [
     publication(1, '用户的自然问题', { speaker: 'user' }),
     system(2, '内部状态消息不得显示'),
-    publication(3, '需要修正的旧正文', { messageId: target, sources: [source(target)], sessionId: provenance }),
+    publication(3, '需要修正的旧正文', { messageId: target, sessionId: provenance }),
     system(4, '唤醒通知不得显示'),
-    system(5, '风险报告不得显示', 'attribution'),
+    system(5, '风险报告不得显示'),
     publication(6, '第二个自然问题', { speaker: 'user', topicId: 'another-topic', topicTitle: '内部主题标题' }),
-    publication(7, '内部修正通知不得显示', {
-      type: 'correction', speaker: 'system', messageId: target, sources: [source(target, 2)],
-      revision: { version: 2, text: '修正后的完整自然回答', attachments: [] },
+    publication(3, '修正后的完整自然回答', {
+      snapshotRevision: 17, messageId: target,
     }),
     publication(8, '最后的自然回答'),
   ];
@@ -195,7 +192,7 @@ test('interleaved status, wake, risk and correction retain only natural conversa
   const rows = page.locator('[data-ca-item]');
   await expect(rows).toHaveCount(4);
   expect(await rows.evaluateAll(elements => elements.map(element => element.getAttribute('data-ca-item'))))
-    .toEqual(['publication-1', 'publication-3', 'publication-6', 'publication-8']);
+    .toEqual(['publication-1', target, 'publication-6', 'publication-8']);
   await expect(rows.nth(1)).toContainText('修正后的完整自然回答');
   const conversation = page.getByRole('region', { name: '对话记录', exact: true });
   await expect(conversation).not.toContainText(/内部|唤醒通知|风险报告|需要修正的旧正文|synthetic-reception|topic-a/);
@@ -207,8 +204,8 @@ test('interleaved status, wake, risk and correction retain only natural conversa
 });
 
 test('a system-only history is an empty conversation, not notification bubbles or an empty-state card', async ({ page }) => {
-  const items = [system(1, '内部状态'), system(2, '内部唤醒'), system(3, '内部风险', 'attribution'),
-    system(4, '内部修正', 'correction'), system(5, '内部 carrier 原文', 'message')];
+  const items = [system(1, '内部状态'), system(2, '内部唤醒'), system(3, '内部风险'),
+    system(4, '内部修正'), system(5, '内部 carrier 原文')];
   const fixture = await installFixture(page, { items, hasOlder: false });
   await page.goto('/modules/assistant/main');
   await ready(page);
@@ -227,20 +224,17 @@ test('revision projection shows original replies and clarification while applyin
   const summaryId = 'summary-message';
   const correctedId = 'status-corrected-message';
   const items = [
-    publication(1, 'coordinator 已发布的同版本自然摘要', {
-      messageId: summaryId, sources: [source(summaryId)],
-      revision: { version: 1, text: '同版本完整原始正文', attachments: [] },
+    publication(1, '同版本完整原始正文', {
+      messageId: summaryId,
     }),
-    publication(2, '待修正的第二条正文', { messageId: correctedId, sources: [source(correctedId)] }),
-    publication(3, '请补充这条输入的背景', { type: 'clarification', messageId: correctedId }),
-    publication(4, '内部状态更新通知', {
-      type: 'status', speaker: 'system', messageId: correctedId,
-      revision: { version: 2, text: '只更新第二条的完整正文',
-        attachments: [{ type: 'file', path: '/synthetic/revised.txt', displayName: 'revised.txt' }] },
+    publication(2, '待修正的第二条正文', { messageId: correctedId }),
+    publication(3, '请补充这条输入的背景'),
+    publication(2, '只更新第二条的完整正文', {
+      snapshotRevision: 20, messageId: correctedId,
+      attachments: [{ type: 'file', path: '/synthetic/revised.txt', displayName: 'revised.txt' }],
     }),
-    publication(5, '过时的内部修正通知', {
-      type: 'correction', speaker: 'system', messageId: correctedId,
-      revision: { version: 1, text: '旧版本不得回退正文', attachments: [] },
+    publication(2, '旧版本不得回退正文', {
+      snapshotRevision: 10, messageId: correctedId,
     }),
   ];
   const fixture = await installFixture(page, { items, hasOlder: false });
@@ -261,13 +255,13 @@ test('revision projection shows original replies and clarification while applyin
 test('multiple system-only history pages are traversed until older real conversation becomes readable', async ({ page }) => {
   const visited: number[] = [];
   const fixture = await installFixture(page, {
-    items: [system(90, '最新内部状态'), system(91, '最新内部风险', 'attribution')], hasOlder: true,
+    items: [system(90, '最新内部状态'), system(91, '最新内部风险')], hasOlder: true,
     read: async (url, route) => {
       if (!url.pathname.endsWith('/timeline') || !url.searchParams.has('before')) return false;
       const before = Number(url.searchParams.get('before'));
       visited.push(before);
-      const items = before === 90 ? [system(60, '第二页内部状态'), system(61, '第二页内部风险', 'attribution')]
-        : before === 60 ? [system(30, '第三页内部唤醒'), system(31, '第三页内部修正', 'correction')]
+      const items = before === 90 ? [system(60, '第二页内部状态'), system(61, '第二页内部风险')]
+        : before === 60 ? [system(30, '第三页内部唤醒'), system(31, '第三页内部修正')]
           : before === 30 ? [publication(1, '较早的真实用户问题', { speaker: 'user' }),
             publication(2, '较早的完整助手回答')] : [];
       await json(route, { items, before: items[0]?.sequence ?? null, hasMore: before !== 30, watermark: 91 });
@@ -287,28 +281,37 @@ test('multiple system-only history pages are traversed until older real conversa
   clean(fixture);
 });
 
-test('a later history read with newer question state overrides a higher-sequence cached status snapshot', async ({ page }) => {
+test('a later question snapshot updates Markdown choices in place without selection buttons', async ({ page }) => {
   const messageId = 'versioned-question';
-  const cachedStatus = publication(3, '过期的内部问题状态', {
-    type: 'status', speaker: 'system', messageId,
-    question: { state: 'unknown', stateVersion: 2, choices: ['使用新状态的选项'], allowFreeform: false },
+  const cachedStatus = publication(1, '之前的问题', {
+    snapshotRevision: 3, type: 'question', messageId,
+    question: { state: 'unknown', stateVersion: 2, choices: ['旧选项'], allowFreeform: false },
   });
   const originalQuestion = publication(1, '应该仍可选择的原始问题', {
-    type: 'question', messageId, sources: [source(messageId)],
-    revision: { version: 1, text: '应该仍可选择的原始问题', attachments: [] },
+    snapshotRevision: 30, type: 'question', messageId,
     question: { state: 'pending', stateVersion: 3, choices: ['使用新状态的选项'], allowFreeform: false },
   });
-  const fixture = await installFixture(page, { items: [cachedStatus], hasOlder: true,
-    read: async (url, route) => {
-      if (!url.pathname.endsWith('/timeline') || url.searchParams.get('before') !== '3') return false;
-      await json(route, { items: [originalQuestion], before: 1, hasMore: false, watermark: 3 });
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let first = true;
+  const fixture = await installFixture(page, { items: [cachedStatus], hasOlder: false,
+    stream: async (_after, route) => {
+      if (!first) return false;
+      first = false;
+      await gate;
+      fixture.setTimeline([originalQuestion]);
+      await route.fulfill({ contentType: 'text/event-stream', body: streamBody([originalQuestion, cachedStatus]) });
       return true;
     },
   });
   await page.goto('/modules/assistant/main');
   await ready(page);
+  const row = page.locator(`[data-ca-message-id="${messageId}"]`);
+  await row.evaluate(element => { element.setAttribute('data-preserved-row', 'yes'); });
+  release();
   await expect(page.locator('[data-ca-item]')).toHaveCount(1);
   await expect(page.getByText('应该仍可选择的原始问题', { exact: true })).toBeVisible();
+  await expect(row).toHaveAttribute('data-preserved-row', 'yes');
   await expect(page.getByRole('region', { name: '对话记录', exact: true })).not.toContainText('内部');
   await expect(page.getByRole('listitem')).toHaveText(['使用新状态的选项']);
   await expect(page.getByRole('button', { name: '使用新状态的选项', exact: true })).toHaveCount(0);
@@ -317,19 +320,18 @@ test('a later history read with newer question state overrides a higher-sequence
   clean(fixture);
 });
 
-test('classification SSE adds a colored heading to the original visible reply without another bubble', async ({ page }) => {
+test('classification SSE adds a plain multi-topic heading without rewriting or duplicating the reply', async ({ page }) => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  const unclassified = { topicId: null, topicTitle: null, topicColor: null, topicAssignmentVersion: 0 };
+  const unclassified = { topicId: null, topicTitle: null };
   const initial = [
     publication(1, '查天气，再检查代码', { ...unclassified, speaker: 'user' }),
     publication(2, '这是分类前已经显示的完整原回复', unclassified),
     publication(3, longMarkdown, unclassified),
   ];
-  const assignment = publication(4, '内部归属判断，不是新回复', {
-    type: 'attribution', speaker: 'system', messageId: initial[1]!.messageId,
-    topicId: 'weather', topicTitle: '杭州天气', topicColor: '#059669', topicAssignmentVersion: 1,
-  });
+  const assignment = { ...initial[1]!, snapshotRevision: 40,
+    topicId: 'weather', topicTitle: '关于杭州天气和代码检查',
+  };
   let first = true;
   const fixture = await installFixture(page, { items: initial, hasOlder: false,
     stream: async (_after, route) => {
@@ -351,8 +353,8 @@ test('classification SSE adds a colored heading to the original visible reply wi
   await scroller.press('Home');
   await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
   release();
-  await expect(reply.locator('.ca-topic-heading')).toHaveText('杭州天气');
-  await expect(reply.locator('.ca-topic-heading')).toHaveCSS('border-inline-start-color', 'rgb(5, 150, 105)');
+  await expect(reply.locator('.ca-topic-heading')).toHaveText('关于杭州天气和代码检查');
+  await expect(reply.locator('.ca-topic-heading')).toHaveCSS('border-inline-start-width', '0px');
   await expect(reply).toHaveAttribute('data-preserved-row', 'yes');
   await expect(reply).toContainText('这是分类前已经显示的完整原回复');
   await expect(page.locator('[data-ca-item]')).toHaveCount(3);
@@ -363,11 +365,11 @@ test('classification SSE adds a colored heading to the original visible reply wi
   await page.reload();
   await ready(page);
   await expect(page.locator('[data-ca-item]')).toHaveCount(3);
-  await expect(reply.locator('.ca-topic-heading')).toHaveText('杭州天气');
+  await expect(reply.locator('.ca-topic-heading')).toHaveText('关于杭州天气和代码检查');
   clean(fixture);
 });
 
-test('hidden SSE advances the raw cursor and corrects text without unread; only new dialogue marks new content', async ({ page }) => {
+test('sparse snapshot SSE corrects text without unread; only new dialogue marks new content', async ({ page }) => {
   let releaseHidden!: () => void;
   let releaseDialogue!: () => void;
   const hiddenGate = new Promise<void>(resolve => { releaseHidden = resolve; });
@@ -375,17 +377,16 @@ test('hidden SSE advances the raw cursor and corrects text without unread; only 
   const target = 'corrected-message';
   const initial = [
     publication(1, '开头的真实提问', { speaker: 'user' }),
-    publication(2, '修正前的自然正文', { messageId: target, sources: [source(target)] }),
+    publication(2, '修正前的自然正文', { messageId: target }),
     publication(3, longMarkdown),
     publication(4, '当前最后一条自然回答'),
   ];
   const status = system(5, '内部唤醒状态');
-  const risk = system(6, '内部风险报告', 'attribution');
-  const corrected = publication(7, '内部修正通知', {
-    type: 'correction', speaker: 'system', messageId: target, sources: [source(target, 2)],
-    revision: { version: 2, text: '修正后的自然正文', attachments: [] },
+  const risk = system(6, '内部风险报告');
+  const corrected = publication(2, '修正后的自然正文', {
+    snapshotRevision: 17, messageId: target,
   });
-  const next = publication(8, '新增的唯一自然回答');
+  const next = publication(8, '新增的唯一自然回答', { snapshotRevision: 28 });
   let connections = 0;
   const fixture = await installFixture(page, { items: initial, hasOlder: false,
     stream: async (_after, route) => {
@@ -409,11 +410,11 @@ test('hidden SSE advances the raw cursor and corrects text without unread; only 
   await scroller.press('Home');
   await expect.poll(() => scroller.evaluate(element => element.scrollTop)).toBe(0);
   releaseHidden();
-  await expect(page.locator('[data-ca-item="publication-2"]')).toContainText('修正后的自然正文');
+  await expect(page.locator(`[data-ca-item="${target}"]`)).toContainText('修正后的自然正文');
   await expect.poll(() => fixture.requests.some(request =>
-    request.path === '/timeline' && request.query.includes('after=5'))).toBe(true);
+    request.path === '/timeline' && request.query.includes('after=17'))).toBe(true);
   await expect.poll(() => fixture.requests.some(request =>
-    request.path === '/timeline/stream' && request.query.includes('after=7'))).toBe(true);
+    request.path === '/timeline/stream' && request.query.includes('after=17'))).toBe(true);
   await expect(page.locator('[data-ca-item]')).toHaveCount(4);
   await expect(page.getByRole('button', { name: '有新内容 · 回到最新' })).toHaveCount(0);
   expect(await scroller.evaluate(element => element.scrollTop)).toBeLessThan(100);
@@ -421,7 +422,7 @@ test('hidden SSE advances the raw cursor and corrects text without unread; only 
   await expect(page.locator('[data-ca-item]')).toHaveCount(5);
   await expect(page.getByRole('button', { name: '有新内容 · 回到最新', exact: true })).toBeVisible();
   await expect.poll(() => fixture.requests.some(request =>
-    request.path === '/timeline/stream' && request.query.includes('after=8'))).toBe(true);
+    request.path === '/timeline/stream' && request.query.includes('after=28'))).toBe(true);
   await expect(page.getByRole('region', { name: '对话记录', exact: true })).not.toContainText(/内部|修正前/);
   await page.getByRole('button', { name: '有新内容 · 回到最新', exact: true }).click();
   await expect(page.getByText('新增的唯一自然回答', { exact: true })).toBeInViewport();
@@ -429,15 +430,15 @@ test('hidden SSE advances the raw cursor and corrects text without unread; only 
   clean(fixture);
 });
 
-test('prepending an earlier publication of the same original retains its shared message DOM and reading anchor', async ({ page }) => {
+test('history prepend retains existing message DOM and reading anchor with stable snapshot identities', async ({ page }) => {
   const messageId = 'stable-original-across-history';
-  const text = '同一原回复不能因为读到更早发布记录而重建消息节点。';
+  const text = '同一原回复不能因为读取更早消息而重建消息节点。';
   const fixture = await installFixture(page, {
     items: [publication(50, text, { messageId }), publication(51, longMarkdown)], hasOlder: true,
     read: async (url, route) => {
       if (!url.pathname.endsWith('/timeline') || url.searchParams.get('before') !== '50') return false;
-      await json(route, { items: [publication(1, '更早的用户原话', { speaker: 'user' }),
-        publication(2, text, { messageId })], before: 1, hasMore: false, watermark: 51 });
+      await json(route, { items: [publication(1, '更早的用户原话', { speaker: 'user' })],
+        before: 1, hasMore: false, watermark: 51 });
       return true;
     },
   });
@@ -455,7 +456,7 @@ test('prepending an earlier publication of the same original retains its shared 
   const before = await body.evaluate(element => element.getBoundingClientRect().top);
   await scroller.dispatchEvent('touchstart', { touches: [] });
   await earlier.click();
-  await expect(row).toHaveAttribute('data-ca-item', 'publication-2');
+  await expect(row).toHaveAttribute('data-ca-item', messageId);
   await expect(earlier).toBeVisible();
   await expect(earlier).toBeDisabled();
   await expect(page.locator('[data-ca-item]')).toHaveCount(2);
@@ -478,11 +479,11 @@ test('late real messageList middleware registration and revocation preserve read
   const initial = [
     publication(1, '保留这段对话的阅读位置', { speaker: 'user' }),
     publication(2, longMarkdown),
-    publication(3, '最后一条短回答', { messageId: target, sources: [source(target)] }),
+    publication(3, '最后一条短回答', { messageId: target }),
   ];
-  const updates = [2, 3].map((version, index) => publication(4 + index, '内部正文修正通知', {
-    type: 'correction', speaker: 'system', messageId: target,
-    revision: { version, text: `${longMarkdown}\n\n${'内容调整后继续保持贴底。\n\n'.repeat(30 * version)}增长结束 ${version}`, attachments: [] },
+  const updates = [2, 3].map((version, index) => publication(3,
+    `${longMarkdown}\n\n${'内容调整后继续保持贴底。\n\n'.repeat(30 * version)}增长结束 ${version}`, {
+    snapshotRevision: 14 + index * 10, messageId: target,
   }));
   const releases: (() => void)[] = [];
   const gates = updates.map(() => new Promise<void>(release => { releases.push(release); }));
@@ -546,7 +547,7 @@ test('late real messageList middleware registration and revocation preserve read
     await expect.poll(() => scroller.evaluate(element =>
       element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
     releases[index]!();
-    await expect(page.locator('[data-ca-item="publication-3"]')).toContainText(`增长结束 ${index + 2}`);
+    await expect(page.locator(`[data-ca-item="${target}"]`)).toContainText(`增长结束 ${index + 2}`);
     await expect.poll(() => scroller.evaluate(element =>
       element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThan(2);
     await expect(page.getByText(`增长结束 ${index + 2}`, { exact: true })).toBeInViewport();

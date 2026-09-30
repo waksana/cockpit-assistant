@@ -1,25 +1,24 @@
-import type { Delivery, Message, Publication, Question, Reception, Role, Work } from './types.ts';
+import type { Clarification, Message, Question, Reception, Role, TopicMessage } from './types.ts';
 import type { NativeAttachment, ReceiptInput } from './attachments.ts';
-
-export interface TimelineItem extends Publication {
-  topicTitle: string | null;
-  topicColor: string | null;
-  topicAssignmentVersion?: number;
+export interface TimelineItem {
+  id: string;
+  messageId: string;
+  sequence: number;
+  snapshotRevision: number;
+  type: 'message' | 'question';
+  text: string;
+  attachments: NativeAttachment[];
+  createdAt: number;
   speaker: 'user' | 'assistant' | 'system';
   sessionId: string | null;
-  revision?: {
-    version: number;
-    text: string;
-    attachments: NativeAttachment[];
-  };
-  question: {
-    state: Question['state'];
-    stateVersion: number;
-    choices?: string[];
-    allowFreeform?: boolean;
-  } | null;
+  topicId: string | null;
+  topicTitle: string | null;
+  question: { state: Question['state']; stateVersion: number; requestId: string;
+    choices?: string[]; allowFreeform?: boolean } | null;
+  clarifications: Clarification[];
+  diagnostic: string | null;
+  deliveryIssues: { topicMessageId: string; state: 'rejected' | 'unknown' | 'cancelled'; detail: string }[];
 }
-
 export interface TimelinePage {
   items: TimelineItem[];
   before: number | null;
@@ -27,23 +26,19 @@ export interface TimelinePage {
   watermark: number;
   cursor?: number;
 }
-
 export interface RoleReadiness {
   role: Role;
   sessionId: string | null;
-  epoch: number;
   modelId: string | null;
   cwd: string | null;
-  status: 'unbound' | 'unloaded' | 'invalid' | 'unknown' | 'ready';
+  status: 'unbound' | 'unloaded' | 'invalid' | 'unknown' | 'ambiguous' | 'ready';
   detail: string | null;
 }
-
 export interface Readiness {
   roles: RoleReadiness[];
   canSend: boolean;
   receptions: Reception[];
 }
-
 export interface SessionInspection {
   sessionId: string;
   modelId: string | null;
@@ -52,12 +47,10 @@ export interface SessionInspection {
   status: string;
   rolesNeedReload: boolean | null;
 }
-
 export interface InputReceipt {
   requestId: string;
   input: ReceiptInput;
   message: Message;
-  work: Work[];
-  deliveries: Delivery[];
-  hasMore: { work: boolean; deliveries: boolean };
+  topicMessages: TopicMessage[];
+  hasMore: { topicMessages: boolean };
 }

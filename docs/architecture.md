@@ -9,21 +9,44 @@ authorization system. It never uses private SDK handles, native-home scans or
 Task state to implement conversations.
 
 The native session directory supplies bounded metadata for choosing destinations.
-It is not a chat archive. Assistant stores its own input, deliveries, all new
-ordinary primary replies and native questions, and necessary progress. Native
+It is not a chat archive. Assistant stores its own input, topic-specific results,
+new ordinary primary replies and native questions, and necessary progress. Native
 session user messages, including forwarded prompts, are not imported as user
 speech or coordinator work. The coordinator can inspect native history on demand through the
 public `session/chat` API without loading the session or importing that history.
 
-Select `coordinator` and `memory` through Cockpit's normal role controls.
-Successful role saves register carriers, but do not establish readiness.
-Registration epochs invalidate retired carriers. Readiness checks actual applied
-roles, resources and native availability; an unloaded carrier is not missing.
-Internal carriers are never ordinary destinations.
+Select `coordinator` through Cockpit's normal role controls. Role selection does
+not establish readiness. Actual applied roles, resources and native availability
+remain host-owned; an unloaded carrier is not missing. Internal carriers are
+never ordinary destinations or sources of business replies. This version does
+not run a memory role or require one before accepting conversation.
+
+## Three-table persistence
+
+The product model is topics and conversation. SQLite has exactly three application
+tables; SQLite's internal tables and indexes are not application records:
+
+| Table | Durable responsibility |
+| --- | --- |
+| `messages` | Original conversation, source/native identity, attachments, stable display order, processed flag and message-local clarification. |
+| `topic_messages` | One original-message/topic association per result. User-origin results additionally contain the split prompt and its own delivery state/receipt. Session-origin results refer to the original without copying or rewriting it. |
+| `topics` | Flat topic definition and its current session mapping. |
+
+One original message may produce several topic results. Each result belongs to
+one topic, but a topic can have many results. `processed` means the complete
+semantic result has been saved, not that every outgoing prompt was accepted or
+the underlying task finished. Unanswered clarification leaves the original
+unprocessed but not eligible for repeated coordinator calls.
+
+There is no durable batch, separate work queue, publication log, session mirror,
+native-event archive, memory store or generic metadata table. Delivery facts
+belong to the actual outgoing topic message, not a separate effects system.
+Module configuration belongs to the host configuration. Session state and
+current native questions are queried through public host APIs.
 
 ## Flat topics and one current mapping
 
-A topic has a stable ID and color, a title, content and zero or one current
+A topic has a stable ID, a title, content and zero or one current
 ordinary session. There is no parent, tree, foreground topic or implicit title
 hierarchy. A title such as `Xinjiang trip - hotels` is still an ordinary flat
 topic. Several topics may share a session, and a mapping can change without
@@ -34,10 +57,11 @@ when necessary, splits user intent faithfully and attributes replies. It does
 not create sessions, manage deliveries, claim coordinator work or adjudicate
 the quality of another session's response.
 
-One dispatch submits all inputs in the current batch as:
+For one user original, a semantic result supplies topic-specific prompts:
 
 ```json
 {
+  "messageId": "source-message-id",
   "items": [
     { "topicId": "travel", "prompt": "Compare the two travel dates." },
     { "topicId": "hotel", "prompt": "Find hotels near the station." }
@@ -45,8 +69,9 @@ One dispatch submits all inputs in the current batch as:
 }
 ```
 
-Every item has exactly `topicId` and `prompt`. IDs for work, leases, epochs,
-versions, receipts or destination sessions do not belong in this payload.
+The service supplies the original `messageId`; topic identity and faithful
+content are the semantic result. Work, leases, epochs, runtime versions and wake
+receipts are not model-managed business steps.
 Generated prompts may split or clarify the user's request but cannot add
 authorization, contradict the request or replace its saved original.
 
@@ -55,51 +80,66 @@ authorization, contradict the request or replace its saved original.
 ```text
 Assistant input -> durable original + visible user message
                           |
-                   hidden input batch
+                   one-message classification
                           |
              topic/mapping + two-field dispatch
                           |
-                 independent durable deliveries
+                 user-origin topic_messages
                           |
                   ordinary session replies
                           |
              original reply + visible reply message
                           |
-                  hidden attribution batch
+                  one-message attribution
                           |
              patch existing message's topic header
 ```
 
 Each user original appears once and never has a topic header, even when it
 produces multiple prompts. Business replies appear before classification.
-Attribution adds the stable topic color and title in place, without changing
+Attribution adds a plain title listing the related topics in place, without changing
 the body, timestamp, message identity or unread count. It neither publishes a
 second reply nor asks the responding session to rewrite one. Background
-generated prompts are delivery records, not user chat bubbles.
+generated prompts are topic-message delivery records, not user chat bubbles.
 
-Service-managed batches hold the actual work set. Text-only originals can be
-coalesced; an input with attachments occupies its own batch. Those attachments
-can accompany every topic prompt split from that one original. The coordinator
-receives natural-language source context and uses business tools rather than
-computational claim/lease/ACK tokens.
+The coordinator processes one eligible original at a time. There is no
+multi-message batch. Service saves the complete set of topic results and the
+original's processed flag in one SQLite transaction, then sends individual
+user-origin results. Original attachments accompany each of that user's split
+prompts. Classification does not require public claim, lease or ACK tokens.
+User input and earlier native observations share the same short validation and
+persistence boundary, so a delayed metadata read cannot save an answer ahead
+of its already-observed question. Coordinator execution and native delivery
+waits stay outside this boundary.
 
-A native acceptance is not a completed batch. Saved business decisions complete
-the work; neither a model turn ending nor a chronological event-parent chain
-proves that a native interaction ended. Finished inputs are not dispatched again
-because attribution or another output failed. Confirmed rejected deliveries and
-unknown send outcomes retire their batches without replaying their effects.
-Exact native tool identity prevents late work from applying to a newer batch.
-An accepted batch with unfinished decisions remains pending: elapsed time,
-idle or abort alone cannot establish its outcome. Slow or busy consumers do not
-lose their input to a wall-clock deadline; an externally abandoned accepted
-batch can therefore require explicit recovery rather than automatic completion.
-Empty queues wait for new work, not model polling.
+Native acceptance is not business completion. A failed recipient does not cause
+the already-classified original to be split again or another accepted prompt to
+be resent. Exact invocation identity prevents late coordinator tools from
+applying to a different message. Idle, turn-end and elapsed time do not establish
+the outcome of an uncertain native call. Rare unresolved calls can require
+manual handling in the original session; this module does not implement an
+automatic retry, skip, reassignment or general recovery framework.
 
-The persistent coordinator receives only new semantic batches, not a replay of
-the entire Assistant conversation. Compact tool results retain necessary IDs,
-saved changes and errors rather than repeating original bodies or prompts.
+Only the current original and necessary context are supplied. The coordinator
+can consult stored messages or related native chat when a topic is unclear;
+those reads do not become new inputs. Empty queues wait for events, not model
+polling. The model's long-term context is not the durable source of topic facts.
 
-## Durable effects and correlation
+## Message-local clarification
+
+A clarification belongs to the original message. Service saves the question and
+waiting state on that row, leaves it unprocessed and displays a question box
+under its original body. Waiting rows are not repeatedly classified. Other
+eligible originals can continue through the one-message loop.
+
+The box submits to its exact message and clarification identity. Service keeps
+the question and answer history without replacing the original text or creating
+an independent user message. Answering makes that original eligible again; it
+does not mark it processed. The coordinator receives the original plus its
+clarifications, and the processed flag advances only with a complete saved
+result. Old or conflicting answers cannot target a newer clarification.
+
+## Delivery facts and correlation
 
 SQLite uses WAL and `synchronous=FULL`. A Linux abstract-socket lease prevents
 two cooperating activations from operating the same store. Original input and
@@ -115,9 +155,9 @@ conflict; a retry of the same request returns its original receipt.
 | `unknown` | The effect may have happened; automatic resend is forbidden. |
 | `cancelled` | This local operation has been explicitly abandoned. |
 
-Each topic prompt has an independent outbox record. One destination's failure
+Each outgoing topic message has its own delivery facts. One destination's failure
 does not repeat another destination's accepted prompt. Recovery turns a
-crashed `calling` record into `unknown`, not `pending`. This is deliberately not
+crashed `calling` state into `unknown`, not `pending`. This is deliberately not
 a cross-system exactly-once promise.
 
 An unmapped topic's first delivery creates a session using configured
@@ -134,38 +174,37 @@ does not establish an unknown prompt. Bounded preparation can read the same
 native identity and continue the still-unsent message. Missing or newly
 internal targets fail explicitly instead of silently creating replacements.
 
-Business reply ingestion is not gated by delivery correlation: every new
-ordinary primary response segment is eligible, including later background
-continuations. Native user messages, internal role carriers, subagent transcripts,
-reasoning and tool payloads are not the conversation feed. Native event/message
-identities deduplicate replay and retain minimal hashes rather than another
-copy of the original body. Historical bootstrap records are not new replies.
+Business reply ingestion is live-only, not gated by delivery correlation.
+Ordinary primary response segments and native questions received while service
+runs are eligible, including background continuations. Native user messages,
+internal role carriers, subagent transcripts, reasoning and tool payloads are
+not the feed. Stable native identity deduplicates repeated notifications.
+Messages from service downtime are not backfilled, and no per-session history
+cursor is stored.
 
-Internal coordinator and memory calls have a different boundary. The host's
+Internal coordinator calls have a different boundary. The host's
 native `toolCallId` joins the exact originating `assistant.message.toolRequests`
 and `interactionId`, then the `user.message.data.messageId` matching the saved
-wake receipt. Missing, conflicting or retired-batch provenance is rejected;
-the active batch alone never authorizes a tool. This control evidence does not
+wake receipt. Missing, conflicting or stale invocation provenance is rejected;
+an in-memory current-source pointer alone never authorizes a tool. This control evidence does not
 ingest native user text into Assistant. `parentId` is chronological, not causal.
 Receipt availability and native scheduling readiness do not imply interaction
 completion, and idle/turn-end events do not end business reply observation.
 
-Expired business cursors pause observation until an operator uses the
-[bounded history resynchronization API](api.md#explicit-native-history-resynchronization).
-The explicit operation imports only bounded historical pages, preserves
-deduplication, and changes the forward cursor only after successful completion.
-
-## Questions, attachments and memory
+## Questions and attachments
 
 A business session's native question retains its exact request identity, choices and
-freeform restrictions. Once attributed to a topic, a prompt for that topic can
-answer its unique pending question. The backend rechecks the same question
+freeform restrictions. For a topic's current session, service checks the
+host's current pending question and its topic association. A user prompt for
+that topic answers that current question when present; otherwise it is sent as
+an ordinary prompt. The backend rechecks the same question
 before sending. Exact choices remain choices; allowed freeform answers retain
 the user's wording. Attachments are rejected for native answers without being
 silently discarded or bypassed through a normal prompt. All ordinary business
 questions are eligible; they need not prove ownership by a particular Assistant
-prompt. An answer stays with the question's actual source session even if the
-topic's current mapping changes.
+prompt. Historical questions in retired sessions are not candidate answers for
+the current mapping. A rare stuck handoff can be handled directly in its
+original session instead of adding historical-question arbitration.
 
 Native attachment descriptors are preserved in the immutable original,
 versioned source and independent deliveries. Preview URLs are not native
@@ -173,24 +212,24 @@ paths. Acceptance never proves that a path still exists or that a model read
 or supports the attachment. The public host draft remains the owner of editable
 text, attachments, keyboard behavior and compatible Speech/File enhancements.
 
-Memory remains a separate source-bound extraction role. Work is per topic,
-not driven by a foreground-topic switch. It retains its own source version
-proofs and computational claims; these are not coordinator tools. A compound
-original can supply context to several topics without implying that every
-sentence belongs to every topic. Corrections and changed attribution invalidate
-affected evidence. Reported and inferred memory is not silently promoted to
-confirmed fact.
-
 ## Schema and role transition
 
-Schema 2 replaces the old generated model. Schema 1 is explicitly rejected:
-there is no migration, dual protocol, compatibility anchor or automatic
-database deletion. Replacing old generated data is an operator-controlled
-action, not a side effect of loading this module. Never point development or
-acceptance runs at a production data root.
+Schema 3 uses the three-table model. Schema 1, schema 2 and a mismatched
+schema 3 layout are rejected before modifying the database. There is no automatic
+deletion, migration or reset. Replacing old state is a separately authorized
+operator action, not part of package installation or startup.
+Never point development or acceptance runs at a production data root.
 
-Role definition version 2 removes the coordinator claim/decide/create/wake-ACK
-protocol. Merely publishing a package does not apply new instructions to an
+The old release descriptor incorrectly treated target-schema tables as
+preservation projections over the source database. In particular, querying
+`batches` before upgrading schema 1 fails because that table does not exist.
+Declaring no preservation projections avoids that particular query but does
+not itself authorize a schema transition. Destructive reset must not be
+declared as a nondestructive migration. See [releases](releases.md) for the
+deployment contract and its availability boundary.
+
+The current coordinator role has no claim/lease/wake-ACK protocol and no memory
+dependency. Merely publishing a package does not apply new instructions to an
 already-loaded carrier. Use normal host role application/loading controls and
 then inspect actual readiness; do not silently replace registered carriers.
 
@@ -203,19 +242,19 @@ state makes a native model forget its conversation.
 | Product requirement | Disposition |
 | --- | --- |
 | D01: one topic per input | One original may dispatch to several flat topics. |
-| D02: one decision per claimed work | One service-managed batch uses one dispatch array. |
+| D02: one decision per claimed work | One original produces one complete set of topic results. |
 | D03: full-text multi-target forwarding | Topic-specific prompts preserve the original separately. |
 | D04: classification before visibility | Originals appear first; replies gain headers later. |
 | D05: coordinator proof/lease/version | Removed from coordinator business tools. |
 | D06: model-managed session creation | Service creates only when a mapped destination is needed. |
 | D07: wake ACK | No coordinator ACK protocol. |
-| D08: old rejection blocks new work | Definitive failures have bounded recovery, unlike unknown effects. |
-| D09: per-event reminders and empty polling | Durable batches coalesce work and wait when empty. |
+| D08: old rejection blocks new work | Failures remain explicit; no general retry/recovery framework. Rare stuck work is handled in its original session. |
+| D09: per-event reminders and empty polling | One eligible original at a time; unanswered clarification waits on that message and empty queues do not call the model. |
 | D10: metadata-only routing | Coordinator submits faithful topic-specific prompts. |
 | D11: publish/rewrite gate | Attribution only; original replies are already visible. |
 | D12: route context and handoff procedure | Replaced by topic content and current session mapping. |
 | D13: `replyTo` | Rejected at the input boundary; native asks retain real identity. |
-| D14: foreground-centered memory | Per-topic source-bound memory. |
+| D14: foreground-centered memory | No foreground pointer or memory dependency in this version. |
 | D15: normal technical receipt UI | Receipts remain diagnostic, not normal conversation controls. |
 | D16: topic tree | Flat records only. |
-| D17: old and new protocols together | Schema 2 and role version 2; no compatibility execution path. |
+| D17: old and new protocols together | Three-table schema and one coordinator protocol; no compatibility execution path. |

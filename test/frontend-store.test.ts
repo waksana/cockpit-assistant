@@ -6,19 +6,17 @@ import { conversationItems } from '../frontend/timeline.ts';
 import type { Readiness, TimelineItem } from '../src/ui-types.ts';
 import { hostState } from './frontend-host.ts';
 
-const ready: Readiness = { canSend: true, roles: ['coordinator', 'memory'].map(role => ({
-  role: role as 'coordinator' | 'memory', sessionId: role, epoch: 1, modelId: 'test', cwd: '/test',
+const ready: Readiness = { canSend: true, roles: ['coordinator' as const].map(role => ({
+  role, sessionId: role, modelId: 'test', cwd: '/test',
   status: 'ready', detail: null,
-})), receptions: [{ id: 'reception', label: '接待者', kind: 'reception', enabled: true,
-  evidence: 'fixture', availability: 'loaded', cursor: null, cursorSource: 'live', cursorDirection: 'forward',
-  baseline: true, gap: null, generation: 1, version: 1 }] };
+})), receptions: [{ id: 'reception', label: '接待者', availability: 'loaded' }] };
 const item = (sequence: number, topicId = 'a'): TimelineItem => ({
-  id: `p${sequence}`, sequence, type: 'message', text: `message ${sequence}`, messageId: `m${sequence}`,
-  topicId, sources: [], createdAt: sequence * 1000,
-  topicTitle: topicId, topicColor: '#2563eb', speaker: 'assistant', sessionId: 'reception', question: null, attachments: [],
+  id: `m${sequence}`, sequence, snapshotRevision: sequence, type: 'message', text: `message ${sequence}`, messageId: `m${sequence}`,
+  topicId, createdAt: sequence * 1000, diagnostic: null, clarifications: [], deliveryIssues: [],
+  topicTitle: topicId, speaker: 'assistant', sessionId: 'reception', question: null, attachments: [],
 });
 const frame = (record: TimelineItem) =>
-  `id: ${record.sequence}\nevent: publication\ndata: ${JSON.stringify(record)}\n\n`;
+  `id: ${record.snapshotRevision}\nevent: publication\ndata: ${JSON.stringify(record)}\n\n`;
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(yes => { resolve = yes; });
@@ -46,13 +44,17 @@ async function fixture(handler?: (path: string, init?: RequestInit) => Promise<R
       if (path.startsWith('/timeline/stream')) return new Response(new ReadableStream<Uint8Array>({
         start(stream) { streams.push(stream); },
       }));
+      if (path.startsWith('/timeline?after=')) {
+        const cursor = Number(new URL(path, 'http://fixture').searchParams.get('after'));
+        return Response.json({ items: [], before: null, watermark: cursor, cursor, hasMore: false });
+      }
       if (path.startsWith('/timeline')) return Response.json({
         items: [item(10)], before: 10, watermark: 10, hasMore: false,
       });
       if (path.startsWith('/inputs/')) {
         const requestId = path.split('/').at(-1)!;
         return Response.json({ requestId, input: inputs.get(requestId), message: { id: `saved-${requestId}` },
-          work: [], deliveries: [], hasMore: { work: false, deliveries: false } });
+          topicMessages: [], hasMore: { topicMessages: false } });
       }
       return Response.json({});
     },
@@ -76,6 +78,25 @@ test('opening reads bounded tail and fresh readiness; closing aborts stream with
     assert.equal(f.requests.filter(request => request.path === '/readiness').length, 2);
     assert.equal(f.store.getSnapshot().draft.text, '保留草稿');
     assert.equal(f.requests.some(request => request.init?.method === 'POST'), false);
+  } finally { f.store.dispose(); }
+});
+
+test('delivery failures survive both initial timeline validation and subsequent SSE snapshots', async () => {
+  const rejected = { topicMessageId: 'outgoing-1', state: 'rejected' as const, detail: '目标会话已不存在' };
+  const original = { ...item(10), speaker: 'user' as const, deliveryIssues: [rejected] };
+  const f = await fixture(path => path === '/timeline?limit=50'
+    ? Response.json({ items: [original], before: 10, watermark: 10, hasMore: false }) : undefined);
+  try {
+    f.store.open(); await turn();
+    assert.deepEqual(f.store.getSnapshot().items[0]!.deliveryIssues, [rejected]);
+    const unknown = { topicMessageId: 'outgoing-2', state: 'unknown' as const, detail: '投递回执无法确认' };
+    f.streams[0]!.enqueue(new TextEncoder().encode(frame({
+      ...original, snapshotRevision: 11, deliveryIssues: [unknown],
+    })));
+    await turn();
+    assert.deepEqual(f.store.getSnapshot().items[0]!.deliveryIssues, [unknown]);
+    assert.equal(f.store.getSnapshot().items[0]!.text, original.text);
+    assert.equal(f.store.getSnapshot().items.length, 1);
   } finally { f.store.dispose(); }
 });
 
@@ -111,7 +132,7 @@ test('ordinary input omits replyTo and preserves newer edits across page navigat
     f.store.open(); await turn(); f.store.edit('old reply');
     const sending = f.store.send();
     f.store.close(); f.store.open(); f.store.edit('new draft'); await turn();
-    pending.resolve(Response.json({ message: { id: 'saved' }, work: {} })); await sending;
+    pending.resolve(Response.json({ message: { id: 'saved' } })); await sending;
     assert.equal(f.store.getSnapshot().draft.text, 'new draft');
     assert.equal(f.store.getSnapshot().submissions[0]?.state, 'accepted');
     const body = JSON.parse(String(f.requests.find(request => request.path === '/messages')?.init?.body));
@@ -121,16 +142,16 @@ test('ordinary input omits replyTo and preserves newer edits across page navigat
   } finally { f.store.dispose(); }
 });
 
-test('input receipt inspection exposes preparation and delivery failures without resending input', async () => {
+test('input receipt inspection exposes topic-message delivery failures without resending input', async () => {
   let input: Record<string, unknown>;
   let failed = false;
   const f = await fixture((path, init) => {
     if (path === '/messages') input = JSON.parse(String(init?.body));
     if (path.startsWith('/inputs/')) return Response.json({
       requestId: input.requestId, input, message: { id: 'saved' },
-      deliveries: [failed
+      topicMessages: [failed
         ? { state: 'rejected', error: 'The selected session no longer exists' }
-        : { state: 'pending', error: null, preparation: { error: 'The selected session is closing' } }],
+        : { state: 'calling', error: 'The selected session is closing' }],
     });
   });
   try {
@@ -241,7 +262,7 @@ test('a successful POST cannot ACK without a receipt matching the entire immutab
       if (field === 'attachments') input.attachments = [{ type: 'file', path: '/not-the-captured-file' }];
       else if (field !== 'missing-input') input[field] = 'different';
       return Response.json({ requestId: captured.requestId,
-        ...(field === 'missing-input' ? {} : { input }), message: { id: 'saved' }, deliveries: [] });
+        ...(field === 'missing-input' ? {} : { input }), message: { id: 'saved' }, topicMessages: [] });
     });
     try {
       f.store.open(); await turn();
@@ -262,7 +283,7 @@ test('activation HTTP rejection with unknown durable receipt cannot be repeated 
       roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
     if (path === '/roles/activate') return Response.json({ error: { code: 'ROLE_NOT_READY', message: 'preparation ran' } }, { status: 409 });
     if (path.startsWith('/operations/')) return Response.json({ id: decodeURIComponent(path.split('/').at(-1)!),
-      state: 'unknown', fingerprint: 'x', result: null });
+      state: 'unknown', kind: 'activate', fingerprint: 'x', result: null });
   });
   try {
     f.store.open(); await turn();
@@ -272,7 +293,7 @@ test('activation HTTP rejection with unknown durable receipt cannot be repeated 
   } finally { f.store.dispose(); }
 });
 
-test('fresh opening captures bound role epochs before activation; late completion preserves newer drafts', async () => {
+test('fresh opening captures the bound session before activation; late completion preserves newer drafts', async () => {
   const pending = deferred<Response>();
   let readiness: Readiness = { ...ready, canSend: false,
     roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) };
@@ -286,8 +307,7 @@ test('fresh opening captures bound role epochs before activation; late completio
     assert.equal(operation.state, 'pending');
     const post = f.requests.find(request => request.path === '/roles/activate')!;
     assert.deepEqual(JSON.parse(String(post.init?.body)), { requestId: operation.requestId, bindings: [
-      { role: 'coordinator', sessionId: 'coordinator', epoch: 1 },
-      { role: 'memory', sessionId: 'memory', epoch: 1 },
+      { role: 'coordinator', sessionId: 'coordinator' },
     ] });
     f.store.close();
     assert.equal(post.init?.signal?.aborted, false);
@@ -295,7 +315,7 @@ test('fresh opening captures bound role epochs before activation; late completio
     assert.equal(f.store.getSnapshot().setup[0]?.requestId, operation.requestId);
     assert.equal(f.requests.filter(request => request.path === '/roles/activate').length, 1);
     readiness = ready;
-    pending.resolve(Response.json({ id: operation.receiptId, fingerprint: 'x', state: 'accepted', result: { loaded: true } }));
+    pending.resolve(Response.json({ id: operation.receiptId, kind: 'activate', fingerprint: 'x', state: 'accepted', result: { loaded: true } }));
     await turn();
     assert.equal(f.store.getSnapshot().setup[0]?.state, 'accepted');
     assert.equal(f.store.getSnapshot().readiness?.canSend, true);
@@ -309,9 +329,9 @@ test('unknown activation never retries on refresh or reopen; exact receipt remai
     if (path === '/readiness') return Response.json({ ...ready, canSend: false,
       roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
     if (path === '/roles/activate') return Response.json({ id: `activate:${JSON.parse(String(init?.body)).requestId}`,
-      state: 'unknown', fingerprint: 'x', result: { detail: 'Unconfirmed load' } });
+      state: 'unknown', kind: 'activate', fingerprint: 'x', result: { detail: 'Unconfirmed load' } });
     if (path.startsWith('/operations/')) return Response.json({ id: decodeURIComponent(path.split('/').at(-1)!),
-      state: inspectionState, fingerprint: 'x', result: {} });
+      state: inspectionState, kind: 'activate', fingerprint: 'x', result: {} });
   });
   try {
     f.store.open(); await turn();
@@ -350,15 +370,15 @@ test('stale readiness cannot activate a former carrier and unknown/invalid roles
   } finally { f.store.dispose(); }
 });
 
-test('a confirmed carrier can be activated after a later unload without requiring the other role to be ready', async () => {
+test('the coordinator can be activated after a later unload without a memory carrier', async () => {
   const readiness: Readiness = { ...ready, canSend: false,
-    roles: ready.roles.map((role, index) => ({ ...role, status: index ? 'invalid' : 'unloaded' })) };
+    roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) };
   const f = await fixture((path, init) => {
     if (path === '/readiness') return Response.json(readiness);
     if (path === '/roles/activate') {
       readiness.roles[0]!.status = 'ready';
       return Response.json({ id: `activate:${JSON.parse(String(init?.body)).requestId}`,
-        fingerprint: 'x', state: 'accepted', result: {} });
+        kind: 'activate', fingerprint: 'x', state: 'accepted', result: {} });
     }
   });
   try {
@@ -379,7 +399,7 @@ test('activation errors or malformed receipt IDs stay unknown when effect cannot
       if (path === '/readiness') return Response.json({ ...ready, canSend: false,
         roles: ready.roles.map(role => ({ ...role, status: 'unloaded' })) });
       if (path === '/roles/activate') return malformed
-        ? Response.json({ id: 'wrong-id', fingerprint: 'x', state: 'accepted', result: {} })
+        ? Response.json({ id: 'wrong-id', kind: 'activate', fingerprint: 'x', state: 'accepted', result: {} })
         : Promise.reject(new Error('network lost'));
       if (path.startsWith('/operations/')) return Response.json(
         { error: { code: 'NOT_FOUND', message: 'not known yet' } }, { status: 404 });
@@ -420,18 +440,99 @@ test('SSE deduplicates applied publications and older pages merge without losing
   } finally { f.store.dispose(); }
 });
 
-test('out-of-order SSE never advances cursor and reconnect backfills from last applied sequence', async () => {
-  const f = await fixture(path => path === '/timeline?after=10&limit=100'
-    ? Response.json({ items: [item(11), item(12)], watermark: 12, before: 11, hasMore: false, cursor: 12 }) : undefined);
+test('sparse SSE revisions update old messages in place and reconnect reads by revision, not sequence', async () => {
+  const updated = { ...item(10), snapshotRevision: 30, text: 'Updated original' };
+  const f = await fixture(path => path === '/timeline?after=30&limit=100'
+    ? Response.json({ items: [item(11), { ...updated, snapshotRevision: 50, topicTitle: 'Assigned' }]
+      .map((entry, index) => ({ ...entry, snapshotRevision: index ? 50 : 40 })),
+    watermark: 55, before: 11, hasMore: false, cursor: 50 }) : undefined);
   try {
     f.store.open(); await turn();
-    f.streams[0]!.enqueue(new TextEncoder().encode(frame(item(12)))); await turn();
+    f.streams[0]!.enqueue(new TextEncoder().encode(frame(updated) + frame(item(10)))); await turn();
     assert.deepEqual(f.store.getSnapshot().items.map(entry => entry.sequence), [10]);
-    assert.equal(f.store.getSnapshot().stream, 'disconnected');
+    assert.equal(f.store.getSnapshot().items[0]!.text, updated.text);
+    assert.equal(f.store.getSnapshot().stream, 'connected');
     f.store.reconnect(); await turn();
-    assert.deepEqual(f.store.getSnapshot().items.map(entry => entry.sequence), [10, 11, 12]);
-    assert.ok(f.requests.some(request => request.path === '/timeline/stream?after=12'));
+    assert.deepEqual(f.store.getSnapshot().items.map(entry => entry.sequence), [10, 11]);
+    assert.equal(f.store.getSnapshot().items[0]!.topicTitle, 'Assigned');
+    assert.ok(f.requests.some(request => request.path === '/timeline/stream?after=55'));
   } finally { f.store.dispose(); }
+});
+
+test('opening uses the global watermark even when the final display item has an older revision', async () => {
+  const f = await fixture(path => path === '/timeline?limit=50'
+    ? Response.json({ items: [{ ...item(9), snapshotRevision: 70 }, item(10)],
+      watermark: 90, before: 9, hasMore: false }) : undefined);
+  try {
+    f.store.open(); await turn();
+    const request = f.requests.find(request => request.path === '/timeline/stream?after=90');
+    assert.equal(new Headers(request?.init?.headers).get('last-event-id'), '90');
+    f.streams[0]!.enqueue(new TextEncoder().encode(frame({ ...item(9), snapshotRevision: 100, text: 'Latest' })));
+    await turn();
+    assert.deepEqual(f.store.getSnapshot().items.map(entry => entry.sequence), [9, 10]);
+    assert.equal(f.store.getSnapshot().items[0]!.text, 'Latest');
+  } finally { f.store.dispose(); }
+});
+
+test('an updated older message cannot move the history cursor or let stale history replace its snapshot', async () => {
+  const pending = deferred<Response>();
+  const f = await fixture(path => {
+    if (path === '/timeline?limit=50') return Response.json({
+      items: [item(10)], watermark: 10, before: 10, hasMore: true,
+    });
+    if (path === '/timeline?before=10&limit=50') return pending.promise;
+  });
+  try {
+    f.store.open(); await turn();
+    const changed = { ...item(8), snapshotRevision: 30, text: 'Fresh source', topicTitle: 'Fresh attribution',
+      question: { state: 'answered' as const, stateVersion: 2, requestId: 'ask-8' } };
+    f.streams[0]!.enqueue(new TextEncoder().encode(frame(changed)));
+    await turn();
+    const loading = f.store.loadOlder();
+    assert.ok(f.requests.some(request => request.path === '/timeline?before=10&limit=50'));
+    pending.resolve(Response.json({ items: [item(8), item(9)], watermark: 10, before: 8, hasMore: false }));
+    await loading;
+    assert.deepEqual(f.store.getSnapshot().items.map(entry => entry.sequence), [8, 9, 10]);
+    assert.equal(f.store.getSnapshot().items[0]!.text, changed.text);
+    assert.equal(f.store.getSnapshot().items[0]!.question?.state, 'answered');
+    f.store.reconnect(); await turn();
+    assert.ok(f.requests.some(request => request.path === '/timeline?after=30&limit=100'));
+  } finally { f.store.dispose(); }
+});
+
+test('invalid catch-up ordering cannot partially apply a page or advance the retry cursor', async () => {
+  let invalid = true;
+  const f = await fixture(path => path === '/timeline?after=10&limit=100' ? Response.json({
+    items: invalid ? [{ ...item(11), snapshotRevision: 30 }, { ...item(12), snapshotRevision: 20 }] : [],
+    watermark: invalid ? 30 : 10, before: invalid ? 11 : null, hasMore: false, cursor: invalid ? 20 : 10,
+  }) : undefined);
+  try {
+    f.store.open(); await turn();
+    f.store.reconnect(); await turn();
+    assert.equal(f.store.getSnapshot().stream, 'disconnected');
+    assert.match(f.store.getSnapshot().error!, /修订游标/);
+    assert.deepEqual(f.store.getSnapshot().items.map(entry => entry.sequence), [10]);
+    invalid = false;
+    f.store.reconnect(); await turn();
+    assert.equal(f.requests.filter(request => request.path === '/timeline?after=10&limit=100').length, 2);
+    assert.equal(f.store.getSnapshot().stream, 'connected');
+  } finally { f.store.dispose(); }
+});
+
+test('malformed snapshot revisions and mismatched identities are explicit stream errors without applying', async () => {
+  for (const malformed of [
+    { ...item(1), snapshotRevision: undefined }, { ...item(1), messageId: 'different' },
+    { ...item(1), type: 'correction' },
+  ]) {
+    let applied = false;
+    await assert.rejects(readPublications(new Response(
+      `id: 1\nevent: publication\ndata: ${JSON.stringify(malformed)}\n\n`),
+    () => { applied = true; }, new AbortController().signal));
+    assert.equal(applied, false);
+  }
+  for (const body of ['event: message\ndata: unexpected\n\n', 'data: unexpected\n\n']) {
+    await assert.rejects(readPublications(new Response(body), () => {}, new AbortController().signal), /事件异常/);
+  }
 });
 
 test('SSE validates chunked CRLF frames, reports stream errors and rejects mismatched IDs', async () => {
@@ -449,11 +550,11 @@ test('SSE validates chunked CRLF frames, reports stream errors and rejects misma
   await assert.rejects(readPublications(response, entry => seen.push(entry.sequence), new AbortController().signal), /error/);
   assert.deepEqual(seen, [1]);
   await assert.rejects(readPublications(new Response(frame(item(1)).replace('id: 1', 'id: 2')),
-    () => {}, new AbortController().signal), /序号/);
+    () => {}, new AbortController().signal), /修订游标/);
 });
 
 const systemItem = (sequence: number): TimelineItem => ({
-  ...item(sequence), type: 'status', speaker: 'system', text: 'Native wake accepted',
+  ...item(sequence), speaker: 'system', text: 'Native wake accepted',
 });
 
 test('system-only tail and intervening history pages advance raw cursors to earlier conversation', async () => {
@@ -525,15 +626,14 @@ test('non-advancing system-only history is an explicit error, not an infinite pa
 });
 
 test('Speech reference follows the corrected visible assistant text rather than hidden diagnostics', async () => {
-  const original = { ...item(10), sources: [{ messageId: 'm10', version: 1, assignmentVersion: 0 }] };
+  const original = item(10);
   const f = await fixture(path => path === '/timeline?limit=50'
     ? Response.json({ items: [original], watermark: 10, before: 10, hasMore: false }) : undefined);
   try {
     f.store.open(); await turn();
     assert.equal(f.store.getSnapshot().draft.referenceText, original.text);
     f.streams[0]!.enqueue(new TextEncoder().encode(frame({
-      ...systemItem(11), type: 'correction', messageId: original.messageId,
-      revision: { version: 2, text: 'Current user-facing answer', attachments: [] },
+      ...original, snapshotRevision: 11, text: 'Current user-facing answer',
     }) + frame(systemItem(12))));
     await turn();
     assert.equal(f.store.getSnapshot().draft.referenceText, 'Current user-facing answer');

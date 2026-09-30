@@ -68,7 +68,7 @@ test('only a new local draft submission follows, not passive settlement of its e
   assert.equal(follows, 2);
 });
 
-test('shared Chat rows show original user once and colored reply headings without receipt controls', () => {
+test('shared Chat rows show originals once and plain multi-topic headings without memory controls', () => {
   const messages: Record<string, unknown>[] = [];
   const composers: Record<string, unknown>[] = [];
   let buttons = 0;
@@ -76,7 +76,8 @@ test('shared Chat rows show original user once and colored reply headings withou
     ...presentation,
     chatMessage: (props: Record<string, unknown>) => {
       messages.push(props);
-      return React.createElement('article', null, props.header as React.ReactNode, String(props.body));
+      return React.createElement('article', null, props.header as React.ReactNode, String(props.body),
+        props.children as React.ReactNode);
     },
     messageList: ({ children }: { children?: React.ReactNode }) => React.createElement('main', null, children),
     composer: (props: Record<string, unknown>) => { composers.push(props); return React.createElement('textarea'); },
@@ -87,12 +88,15 @@ test('shared Chat rows show original user once and colored reply headings withou
     },
   };
   const item = (id: string, speaker: TimelineItem['speaker'], text: string): TimelineItem => ({
-    id, sequence: id === 'user' ? 1 : 2, type: 'message', messageId: id, topicId: 'topic',
-    topicTitle: 'Weather', topicColor: '#2563eb', text, attachments: [], sources: [], createdAt: 1,
+    id, sequence: id === 'user' ? 1 : 2, snapshotRevision: id === 'user' ? 1 : 2,
+    type: 'message', messageId: id, topicId: 'topic',
+    topicTitle: '关于Weather和Code', text, attachments: [], createdAt: 1,
+    diagnostic: null, deliveryIssues: [], clarifications: [],
     speaker, sessionId: null, question: null,
   });
 
   const user = item('user', 'user', 'Weather and code, please');
+  user.deliveryIssues = [{ topicMessageId: 'outgoing-1', state: 'rejected', detail: '目标会话已不存在' }];
   const answer = item('answer', 'assistant', 'Original full answer');
   const snapshot = {
     items: [user, answer, user], loading: false, hasOlder: false, loadingOlder: false,
@@ -109,15 +113,16 @@ test('shared Chat rows show original user once and colored reply headings withou
   assert.equal(messages.length, 2);
   assert.equal(composers.length, 1);
   assert.equal(composers[0]?.sendBlocked, true);
-  assert.equal(buttons, 3);
-  assert.deepEqual(used, ['composer', 'conversationFrame', 'conversationHeader', 'conversationTranscript', 'chatMessage', 'button']);
+  assert.equal(buttons, 2);
+  assert.deepEqual(used, ['composer', 'conversationFrame', 'conversationHeader', 'conversationTranscript', 'chatMessage', 'button', 'composerEditor']);
   assert.equal(messages[0]?.header, undefined, 'user originals never receive a topic header');
   assert.ok(messages[1]?.header, 'topic heading belongs inside the shared row, not a surrounding wrapper');
   assert.deepEqual(messages.map(message => message.body), [user.text, answer.text]);
   assert.equal((html.match(/ca-topic-heading/g) ?? []).length, 1);
-  assert.match(html, /border-inline-start-color:#2563eb/);
-  assert.match(html, />Weather<\/h3>/);
+  assert.doesNotMatch(html, /border-inline-start-color|memory/);
+  assert.match(html, />关于Weather和Code<\/h3>/);
   assert.match(html, /草稿已保留/);
+  assert.match(html, /role="alert"[^>]*>目标会话已不存在/);
   assert.doesNotMatch(html, /发送回执|请求编号|展开完整|检查操作|恢复原提交|private-request-id|internal-json/);
 });
 
@@ -135,10 +140,11 @@ test('question and original options remain ordinary Chat Markdown without a deci
       button: () => React.createElement('button'),
     };
     const question: TimelineItem = {
-      id: 'question', sequence: 1, type: 'question', messageId: 'native-question', topicId: null,
-      topicTitle: null, topicColor: null, text: 'Choose a route', attachments: [], sources: [], createdAt: 1,
+      id: 'question', sequence: 1, snapshotRevision: 1, type: 'question', messageId: 'question', topicId: null,
+      topicTitle: null, text: 'Choose a route', attachments: [], createdAt: 1,
+      diagnostic: null, deliveryIssues: [], clarifications: [],
       speaker: 'assistant', sessionId: null,
-      question: { state, stateVersion: 1, choices: ['Train', 'Plane\nwith luggage'], allowFreeform: false },
+      question: { state, stateVersion: 1, requestId: 'ask-question', choices: ['Train', 'Plane\nwith luggage'], allowFreeform: false },
     };
     const snapshot = {
       items: [question], loading: false, hasOlder: false, loadingOlder: false,
@@ -152,7 +158,7 @@ test('question and original options remain ordinary Chat Markdown without a deci
     assert.equal(messages.length, 1);
     assert.equal(messages[0]?.body, 'Choose a route\n\n- Train\n- Plane\n  with luggage');
     assert.equal(messages[0]?.children, undefined);
-    assert.equal((html.match(/<button/g) ?? []).length, 3, 'only global role/connection controls remain');
+    assert.equal((html.match(/<button/g) ?? []).length, 2, 'only coordinator/connection controls remain');
     assert.doesNotMatch(html, /ca-choices|decision-card|发送选项/);
   }
 });

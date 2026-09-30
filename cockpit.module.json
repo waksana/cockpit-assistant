@@ -18,19 +18,7 @@
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_topic", "assistant_map", "assistant_sessions", "assistant_history", "assistant_dispatch", "assistant_attribute", "assistant_clarify"]
-        }
-      }
-    },
-    {
-      "id": "memory",
-      "name": "memory",
-      "instructions": "roles/memory.md",
-      "mcpServers": {
-        "assistant": {
-          "type": "http",
-          "path": "/mcp",
-          "tools": ["assistant_memory_read", "assistant_memory_claim", "assistant_remember"]
+          "tools": ["assistant_topics", "assistant_sessions", "assistant_history", "assistant_source", "assistant_complete", "assistant_clarify"]
         }
       }
     }

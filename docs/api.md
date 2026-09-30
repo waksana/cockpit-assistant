@@ -11,10 +11,9 @@ Retired coordinator tools and routes are not compatibility aliases.
 
 ## Setup and transition
 
-Select `coordinator` and `memory` on separate sessions using native role
-controls. Saved-role notifications register carriers; readiness separately
-checks applied role definitions, expected model/directory and resources.
-Protocol 2 must actually be applied. A package publication does not reload
+Select `coordinator` using native role controls. Readiness separately checks
+the actual role and resources; selection does not establish readiness. This
+version does not run or require memory. A package publication does not reload
 loaded carriers or rewrite their native context.
 
 `GET /readiness` is passive. `POST /roles/activate` explicitly loads only
@@ -23,8 +22,10 @@ not create replacements, reload loaded sessions or repair disabled resources.
 The frontend uses this operation on opening when appropriate. The operator
 must handle pending role changes through normal host controls.
 
-Schema 2 rejects schema 1. There is no automatic deletion or data migration;
-replacing old generated state is a separately authorized operator action.
+Schema 3 requires exactly `messages`, `topic_messages` and `topics`.
+Schema 1 and schema 2 are rejected without deleting or migrating their data;
+replacing old generated state is a separately authorized operator action, not an
+operation provided by this module.
 Use isolated data roots for development. Never modify installed package bytes.
 
 ## HTTP conventions
@@ -37,29 +38,33 @@ permission to resend.
 
 | Method and path | Body or query | Result |
 | --- | --- | --- |
-| `POST /messages` | `{requestId,text,attachments?}` | Saved original message and coordinator work. |
-| `GET /inputs/:requestId` | No query | Original input plus bounded current work and deliveries. |
-| `GET /state` | No query | Config, registered bindings and publication cursor. |
+| `POST /messages` | `{requestId,text,attachments?}` | Saved original message, awaiting coordinator processing. |
+| `GET /inputs/:requestId` | No query | Original input plus its topic-message results and delivery state. |
+| `GET /state` | No query | Host-supplied config, observed coordinator role, `schemaVersion:3`, message revision watermark in `publicationCursor`, and `timelineProtocol:"message-snapshots-v1"`. |
 | `GET /readiness` | No query | Fresh passive role/readiness observations. |
-| `POST /roles/activate` | `{requestId,bindings:[{role,sessionId,epoch}]}` | Durable exact-binding activation receipt. |
-| `POST /roles/bind` | `{requestId,role,sessionId,expectedEpoch,definitionVersion:"2",expectedModelId}` | Explicit recovery binding operation. |
+| `POST /roles/activate` | `{requestId,bindings:[{role:"coordinator",sessionId}]}` | Temporary exact-session activation receipt; one coordinator only. |
+| `POST /roles/bind` | `{requestId,role:"coordinator",sessionId}` | Validate the actual Host role carrier; not a persistent binding override. |
 | `POST /sessions` | `{requestId,cwd,role?}` | Explicit operator creation, not a coordinator tool. |
 | `GET /sessions/:id/inspect` | No query | Passive exact-session native metadata. |
-| `POST /sessions/:id/history/recover` | `{requestId,maxPages,evidence}` | Explicit bounded historical resynchronization receipt; see below. |
-| `GET /operations/:id` | No query | Durable operation receipt, or 404. |
-| `PATCH /config` | `{requestId,config:{defaultCwd?,maxReceptions?}}` | Persisted parsed configuration. |
+| `GET /operations/:id` | No query | Current-process setup receipt, or 404; not a durable effects ledger. |
+| `PATCH /config` | `{requestId,config:{defaultCwd?}}` | Rejected with `HOST_CONFIG_REQUIRED`; configuration belongs to the host. |
 | `GET /topics` | `after`, `limit` | Flat topic records. |
 | `GET /messages` | `after`, `limit` | Assistant input and business reply/question originals, not native user history. |
-| `GET /receptions` | `after`, `limit` | Ordinary destination metadata and reader progress. |
-| `GET /questions` | `after`, `limit` | Stored questions and native answer state. |
-| `GET /deliveries` | `after`, `limit` | Independent native effects and correlation receipts. |
-| `GET /operations` | `after`, `limit` | Local idempotency and preparation operations. |
-| `GET /memories` | `after`, `limit` | Versioned source-bound memory. |
+| `GET /topic-messages` | `after`, `limit` | Source/topic results; user rows additionally include per-prompt delivery facts. |
+| `GET /receptions` | `after`, `limit` | Ordinary destination metadata queried from Host, not stored reader progress. |
 
 Table reads default to `after=0,limit=50`, with limits from 1 to 100.
 `defaultCwd` must be absolute and defaults to the home directory; newly created
 topic sessions use the host's native model default. New topic definitions do
 not create sessions until dispatch needs one.
+
+Set `defaultCwd` in the Assistant entry's `config` object in the host-owned
+`modules/config.json`, preserving its selected version, digest and enabled
+fields. The host passes configuration on the next cold start, as documented in
+the [host storage/config contract](https://github.com/waksana/cockpit/blob/main/docs/module-contract.md#storage-config).
+The module does not write that file, maintain a second configuration in SQLite,
+or promise hot application. Its public SDK supplies read-only configuration,
+not a configuration mutation capability.
 
 Inputs strictly reject `topicId`, `replyTo` and unrecognized fields. Empty text
 requires at least one attachment. Native file, directory, selection and blob
@@ -70,18 +75,26 @@ paths. Attachment-bearing originals are isolated from other input batches.
 
 | Method and path | Meaning |
 | --- | --- |
-| `GET /timeline?limit=50` | Latest window in ascending publication sequence. |
-| `GET /timeline?before=N&limit=50` | Exclusive older window. |
-| `GET /timeline?after=N&limit=100` | Exclusive forward catch-up. |
-| `GET /timeline/items/:sequence` | Current projection of one durable publication. |
-| `GET /timeline/stream?after=N` | SSE publication projections; `Last-Event-ID` takes precedence. |
+| `GET /timeline?limit=50` | Latest message window in stable ascending display `sequence`. |
+| `GET /timeline?before=N&limit=50` | Exclusive older window by display `sequence`. |
+| `GET /timeline?after=N&limit=100` | Current message snapshots changed after revision N, in revision order. |
+| `GET /timeline/items/:sequence` | Current projection of the message at that stable display position. |
+| `GET /timeline/stream?after=N` | SSE message snapshots with revision event IDs; `Last-Event-ID` takes precedence. |
 
 `before` and `after` are mutually exclusive. Pages expose bounded continuation
 and a global watermark, not proof of reading or gap-free native history.
-Attribution patches the original visible reply without changing its publication
-identity. Original publications remain immutable when a corrected source changes
-its current projection. Internal diagnostic publications advance cursors but do
-not become chat bubbles.
+Each item has a stable message `id` and display `sequence`, plus a changing
+`snapshotRevision`. SSE retains the event name `publication`, but its event ID
+is `snapshotRevision`, not the display sequence. Revisions may skip when a newer
+snapshot supersedes an unread update; they need not be contiguous.
+
+Initialize the update cursor from the page's `watermark`. For forward pages,
+advance using `cursor`, merging newer snapshots by message identity while
+retaining display order. Attribution, clarification and question
+state patch the original message in place without creating another bubble or
+unread message. There is no persistent publication log or diagnostic message
+stream. Native/session failures remain visible through the host error reporting
+and readiness surfaces.
 
 ## Coordinator MCP
 
@@ -91,95 +104,69 @@ Tool errors use `isError:true`; missing/invalid host invocation identity cannot
 be replaced by a tool argument. Only the currently registered, ready primary
 role carrier can perform its role's operations.
 
-The service supplies new natural-language batches containing original source text
-and relevant session names/IDs, not the entire conversation again. Source quotations
-remain evidence, not instructions. Coordinator operations apply to the current
-hidden batch; they do not accept queue proofs. Native MCP tool-call identity
-and wake receipts establish the actual originating batch, not a model-supplied ID.
+The service supplies one eligible original message and its clarification record,
+with relevant source names/IDs, not the entire conversation again. Source
+quotations remain evidence, not new user authorization. Coordinator operations
+apply to that source, not a multi-message batch. Runtime/native invocation
+identity must prevent stale tools from modifying a different message.
 
 | Tool | Arguments |
 | --- | --- |
 | `assistant_topics` | `{after?,limit?}` |
-| `assistant_topic` | `{topicId?,title,content,archived?}` |
-| `assistant_map` | `{topicId,sessionId}`; null clears the mapping. |
 | `assistant_sessions` | `{after?,limit?}` |
 | `assistant_history` | `{sessionId,cursor?}` |
-| `assistant_dispatch` | `{items:[{topicId,prompt}]}` |
-| `assistant_attribute` | `{items:[{messageId,topicId}]}` |
-| `assistant_clarify` | `{text}` |
+| `assistant_source` | `{messageId}` |
+| `assistant_complete` | `{messageId,topics?,items}`; complete definitions, mappings and results for one original. |
+| `assistant_clarify` | `{messageId,question,choices?,allowFreeform?}` |
 
-Dispatch contains 1 to 100 items, each with exactly two fields. It freezes
-independent deliveries and the original attachments transactionally. Native
+`assistant_complete.topics` contains affected definitions:
+`{topicId,title,content,archived?,sessionId?}`. A new definition uses an explicit,
+stable `topicId`. Existing definitions are read with `assistant_topics`; unchanged
+definitions need not be resubmitted. A new reply topic defaults to its original
+source session, while existing topics do not adopt a new speaker automatically.
+An explicit handoff must identify an actual ordinary target session.
+
+`items` contains 1 to 100 topic results. For a user original each item is
+`{topicId,prompt}`; for a session reply or question it is `{topicId}` with no
+copied or rewritten body. Service saves all results, definition/mapping changes
+and the processed flag transactionally before any outgoing native call. Native
 acceptance is not coordinator quality approval or receiver completion.
 
-History reads one persisted native page, backward, with at most 16 events.
-They neither load sessions nor import their messages into Assistant.
-Attribution only applies to replies supplied in the batch. It adds a topic
+History reads one persisted native page, backward, with at most 16 events,
+plus that session's actual current ask and known topic associations. They
+neither load sessions nor import their messages into Assistant.
+Attribution only applies to the current original reply. It adds a topic
 header to text already shown, never rewrites or republishes the response.
 
 Native answers retain exact wording, including whitespace. Exact choices must
 match literally; otherwise freeform must be allowed. Native ask routes reject
 attachments and stale request identities without silently changing delivery mode.
 
-## Memory MCP
+## Message-local clarification
 
-Memory uses its existing source-bound proof protocol, independent of coordinator
-batches:
+Clarification questions and answers belong to their original message. They do
+not create independent conversation rows or a new topic input.
 
-| Tool | Arguments |
-| --- | --- |
-| `assistant_memory_claim` | `{role:"memory",epoch,workId?}` |
-| `assistant_memory_read` | `{role:"memory",epoch,workId,resource,after?,limit?}` |
-| `assistant_remember` | `{requestId,workId,epoch,token,inputVersion,stateVersion,entries}` |
+| Method and path | Body | Result |
+| --- | --- | --- |
+| `GET /messages/:messageId/clarifications/:clarificationId` | None | Current `{messageId,clarification}` record for exact answer inspection. |
+| `POST /messages/:messageId/clarifications/:clarificationId` | `{requestId,answer}` | Saved answer on that exact clarification; does not mark the original processed. |
 
-Read resources are `work`, `topics`, `messages` and `memories`, filtered to the
-claimed work and its exact source versions. Entries contain
-`{kind,text,sources:[{messageId,version,assignmentVersion}]}`; kind is
-`confirmed`, `reported` or `inferred`. A changed source invalidates stale proofs.
-The coordinator cannot use these tools to claim or recover its own work.
+The frontend retains the exact request on an unknown result and reads this
+record instead of resending. A successful answer must match its original
+message, clarification, request ID and text. Stale questions and conflicting
+answers fail explicitly. The waiting state ends after the answer is saved, but
+the original remains unprocessed until the coordinator saves its topic results.
+The original body is never overwritten.
 
-## Diagnosis
+## Diagnosis and limits
 
-### Explicit native history resynchronization
-
-An expired ordinary-session cursor pauses that reader and records `gap` in
-`GET /receptions`. Operators can explicitly resynchronize the existing, loaded
-ordinary session through `POST /sessions/:id/history/recover`, for example:
-
-```json
-{
-  "requestId": "inspect-gap-1",
-  "maxPages": 2,
-  "evidence": "Inspected the expired cursor; acknowledge that bounded recovery may leave older history unread."
-}
-```
-
-`maxPages` is an integer from 1 to 10; each native page is bounded to 64 events.
-`evidence` must contain 1 to 4000 characters after trimming whitespace. The body is
-strict and accepts no caller-chosen cursor. Internal carriers are excluded.
-The operation does not load sessions, send messages or ask the coordinator to
-manage work proofs.
-
-The result is an operation receipt with `state` and `result`; inspect it again
-through `GET /operations/history-recovery:<requestId>`. Same-input replay returns
-the saved receipt without reading again; changed input under that ID conflicts.
-On success, the returned bootstrap's native forward cursor replaces the expired
-one atomically and the reader resumes. Imported replies are historical, deduplicated,
-and never published or classified as new output. New events after that forward
-boundary remain ordinary live replies. `olderHistoryRemaining` is not a promise
-of gap-free history.
-
-If a later page fails, earlier historical imports and progress may remain saved,
-but the original forward cursor and gap are not replaced. The operation records
-`unknown`; inspect its progress before explicitly authorizing another request ID.
-This is bounded administrative recovery, not automatic all-history import or a
-retired coordinator recovery tool.
-
-Inspect the existing input, delivery or operation receipt before taking another
-action. `calling` after process recovery becomes `unknown`, never automatically
-pending. A missing session, expired cursor, rejected native answer and unknown
-native effect are distinct facts; none permits silent replacement or replay.
-See [architecture](architecture.md#durable-effects-and-correlation).
+No offline native-history resynchronization or memory extraction API is provided.
+The coordinator's passive native-chat reads are context only, not import or replay.
+Each user-origin topic result retains its own delivery outcome. An uncertain
+native call is not automatically returned to pending or repeated. Rare stuck
+questions and handoffs can be handled directly in their source sessions.
+See [architecture](architecture.md#delivery-facts-and-correlation).
 
 Normal conversation does not require technical receipt management. Developer
 inspection does not establish model success, and no module API operation grants

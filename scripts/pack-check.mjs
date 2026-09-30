@@ -4,6 +4,7 @@ import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { verifySchemaBoundary } from './schema-preflight.mjs';
 
 const temporary = await mkdtemp(join(tmpdir(), 'assistant-pack-'));
 try {
@@ -21,7 +22,9 @@ try {
   assert.equal(typeof backend.activate, 'function');
   const frontend = await import(pathToFileURL(join(temporary, 'package', manifest.frontend.entry)).href);
   assert.equal(typeof frontend.activate, 'function');
+  await verifySchemaBoundary(backend.activate, temporary);
   console.log(`Pack closure verified: ${pack.filename}`);
+  console.log('Packaged schema boundary verified: fresh three-table store; incompatible databases unchanged');
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

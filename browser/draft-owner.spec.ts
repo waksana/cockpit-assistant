@@ -48,7 +48,7 @@ for (const selected of [false, true]) {
     await expect(page.locator('[data-ca-item]').getByText('history.txt')).toBeVisible();
     const events = await page.evaluate(() => window.assistantProbe.events);
     expect(events.some(event => event.boundary === 'message'
-      && JSON.stringify(event.identity) === JSON.stringify({ owner: 'assistant', id: 'message:message-1', kind: 'message', role: 'user' }))).toBe(true);
+      && JSON.stringify(event.identity) === JSON.stringify({ owner: 'assistant', id: 'message:publication-1', kind: 'message', role: 'user' }))).toBe(true);
     expect(events.some(event => event.boundary === 'attachment'
       && JSON.stringify(event.attachment) === JSON.stringify(attachment))).toBe(true);
     expect(events.every(event => event.origin === undefined)).toBe(true);

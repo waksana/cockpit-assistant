@@ -45,14 +45,27 @@ The product is module **`assistant`**, backend API 1, requiring public frontend
 API 3, public components/conversation presentation/owner drafts v1, draft submission v2,
 module pages/message presentation/menu/UI/surfaces v1, service readiness, chat reads, ask
 responses, resource preparation, role assignments, session discovery and session
-load v1. Internal coordinator and memory batch isolation additionally requires
+load v1. Coordinator invocation attribution additionally requires
 `promptReceipt.v1` and native MCP `toolCallId` metadata. Earlier hosts without
-these capabilities cannot run protocol 2 consumers.
-Required intents are extracted from actual host calls. The database declaration
-is derived from the real database initialized **in memory**, enumerating all
-application tables/columns for preservation. It declares `assistant.sqlite`,
-schema 2, and `migrations: []`. A different existing schema is not compatible;
-there is no automatic migration and no production data is inspected by packaging.
+these capabilities cannot run the coordinator protocol.
+Required intents are extracted from actual backend host calls. Packaging creates
+the real database **in memory** and checks that it has exactly `messages`,
+`topic_messages` and `topics`. The descriptor declares `assistant.sqlite`,
+schema 3, `preserve: []` and `migrations: []`.
+
+There is no upgrade or reset contract for an incompatible existing database.
+An empty preserve list means no row-projection queries, not permission to
+discard data. In particular, a target-only `topic_messages` query must not run
+against schema 1 or 2 before their incompatibility is detected. Such a transition
+has no declared migration and must not be represented as a supported upgrade.
+Fresh installation and compatible three-table schema 3 are separate from old
+database replacement, which requires a separately authorized operator procedure.
+
+`pack:check` loads the actual packaged backend in isolated data directories.
+It verifies the fresh three-table layout and proves that real synthetic schema 1,
+schema 2 and incompatible four-table schema 3 shapes are rejected without
+changing their bytes or creating target tables. No production database or
+native session is used.
 
 Publication creates a draft prerelease, uploads each asset once, downloads every
 asset by ID, checks API digest/size, checksum, archive identity and embedded

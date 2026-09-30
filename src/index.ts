@@ -22,18 +22,10 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
     requireFact(!context.signal.aborted, 'STOPPING', 'Host stopped during activation');
     db = new Database(join(context.dataRoot, 'assistant.sqlite'));
   } catch (error) { release(); throw error; }
-  const service = new AssistantService(db);
-  try {
-    db.transaction(() => {
-      if (!db.meta<boolean>('configured', false)) {
-        db.setMeta('config', config);
-        db.setMeta('configured', true);
-      }
-    });
-  } catch (error) { db.close(); release(); throw error; }
+  const service = new AssistantService(db, Date.now, config);
   let notified = 0;
   const runtime = new Runtime(service, native, error => context.report(error), () => {
-    const cursor = db.meta('publicationSequence', 0);
+    const cursor = db.watermark;
     if (cursor === notified) return;
     context.publish({ type: 'publications-available', cursor });
     notified = cursor;
@@ -69,7 +61,9 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return track(async () => {
           requireFact(!disposed && !signal.aborted, 'STOPPING', 'Assistant is stopping');
           const roles: Role[] = input.roles.flatMap(item => item.moduleId === 'assistant'
-            && (item.roleId === 'coordinator' || item.roleId === 'memory') ? [item.roleId] : []);
+            && item.roleId === 'coordinator' ? [item.roleId] : []);
+          if (input.roles.some(item => item.moduleId === 'assistant' && item.roleId === 'memory'))
+            return { allowed: false, reason: 'Memory role is retired for this iteration' };
           return runtime.allowRoles(input.operation === 'create' ? null : input.sessionId, roles);
         });
       },
@@ -77,7 +71,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return track(async () => {
           requireFact(!disposed && !signal.aborted, 'STOPPING', 'Assistant stopped before role registration');
           const roles: Role[] = input.roles.flatMap(item => item.moduleId === 'assistant'
-            && (item.roleId === 'coordinator' || item.roleId === 'memory') ? [item.roleId] : []);
+            && item.roleId === 'coordinator' ? [item.roleId] : []);
           if (roles.length) await runtime.registerRoles(input.sessionId, roles, input.notificationId, signal);
         });
       },
@@ -89,7 +83,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         return track(async () => route.handler({ ...request, signal: AbortSignal.any([request.signal, local.signal]) }));
       },
     })),
-    publicConfig: { backendOnly: true, protocolVersion: 2 },
+    publicConfig: { backendOnly: true, protocolVersion: 3 },
     async onReady() {
       if (disposed || context.signal.aborted) return;
       ready = true;
@@ -107,6 +101,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         if (event.type === 'session/added') wake(event.session.sessionId);
         else if ('sessionId' in event) {
           if (event.type === 'session/patch') {
+            if (event.ask) runtime.noteQuestion(event.sessionId, event.ask);
             const relevant = ['ask', 'decisions', 'loaded', 'status', 'activity', 'closing', 'currentModelId',
               'roles', 'appliedRoles', 'rolesNeedReload'];
             if (!relevant.some(key => key in event)) return;

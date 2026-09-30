@@ -82,7 +82,7 @@ test('role names and status icons are independent; checking and every nonready r
     await expect(control).toHaveAttribute('aria-label', `coordinator：${label}`);
     await expect(control).toHaveText('coordinator');
     await expect(control).toHaveAttribute('title', `coordinator：${label}`);
-    await expect(page.getByRole('button', { name: 'memory：已就绪' })).toBeVisible();
+    await expect(page.getByRole('button', { name: /^memory：/ })).toHaveCount(0);
     await expect(page.getByRole('button', { name: '实时连接：已连接' })).toBeVisible();
     if (status === 'ready') await expect(page.getByRole('button', { name: '发送', exact: true })).toBeEnabled();
     else await expect(page.getByRole('button', { name: '发送', exact: true })).toBeDisabled();
@@ -90,7 +90,7 @@ test('role names and status icons are independent; checking and every nonready r
   gate = new Promise<void>(resolve => { releaseReadiness = resolve; });
   await page.getByRole('button', { name: '刷新就绪状态', exact: true }).click();
   await expect(page.getByRole('button', { name: 'coordinator：检查中' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'memory：检查中' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /^memory：/ })).toHaveCount(0);
   await expect(page.getByRole('button', { name: '实时连接：已连接' })).toBeVisible();
   failed = true;
   releaseReadiness!();
@@ -105,7 +105,7 @@ test('role names and status icons are independent; checking and every nonready r
   await page.getByRole('button', { name: '重新连接', exact: true }).click();
   await expect(page.getByRole('button', { name: '实时连接：已断开' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'coordinator：已就绪' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'memory：已就绪' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /^memory：/ })).toHaveCount(0);
   disconnected = false;
   await page.getByRole('button', { name: '重新连接', exact: true }).click();
   await expect(page.getByRole('button', { name: '实时连接：已连接' })).toBeVisible();
@@ -126,7 +126,7 @@ test('connecting SSE uses an accessible loader without changing role readiness',
   await expect(connection.locator('svg')).toHaveAttribute('aria-hidden', 'true');
   await expect(connection.locator('path').first()).toHaveAttribute('d', 'M12 2v4');
   await expect(page.getByRole('button', { name: 'coordinator：已就绪', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'memory：已就绪', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /^memory：/ })).toHaveCount(0);
   await connection.click();
   await expect(page.getByRole('button', { name: '重新连接', exact: true })).toBeDisabled();
   release();
@@ -174,12 +174,12 @@ test('320px wrapping header and long status detail retain a visible Composer wit
   await page.setViewportSize({ width: 320, height: 568 });
   const fixture = await installFixture(page, { items: [], hasOlder: false });
   const status = readiness();
-  status.roles[1]!.status = 'invalid';
-  status.roles[1]!.detail = '合成长详情'.repeat(100) + 'x'.repeat(200);
+  status.roles[0]!.status = 'invalid';
+  status.roles[0]!.detail = '合成长详情'.repeat(100) + 'x'.repeat(200);
   status.canSend = false;
   fixture.setReadiness(status);
   await page.goto('/'); await enter(page);
-  const control = page.getByRole('button', { name: 'memory：不可用', exact: true });
+  const control = page.getByRole('button', { name: 'coordinator：不可用', exact: true });
   if (info.project.name.startsWith('mobile')) await control.tap();
   else { await control.focus(); await page.keyboard.press('Enter'); }
   await expect(page.getByRole('region', { name: '状态详情' })).toBeVisible();

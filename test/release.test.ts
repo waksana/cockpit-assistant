@@ -114,7 +114,7 @@ test('Only actual accepted main merges in the intended repository qualify', () =
   assert.throws(() => checkEvent({ ...event, repository: { full_name: 'someone/fork' } }, sha));
 });
 
-test('Descriptor derives real public requirements and all database preservation columns', async () => {
+test('descriptor declares only the three-table schema without source-schema preservation queries', async () => {
   const actual = await product(resolve('.'));
   assert.equal(actual.id, 'assistant');
   assert.ok(actual.requiresCapabilities.includes('page.v1'));
@@ -129,10 +129,8 @@ test('Descriptor derives real public requirements and all database preservation 
   assert.ok(actual.requiredIntents.includes('respondAsk'));
   assert.deepEqual(actual.migrations, []);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
-  assert.equal(actual.databases[0].schema, 2);
-  assert.deepEqual(actual.databases[0].preserve.find((table: any) => table.table === 'messages').columns,
-    ['ordinal', 'id', 'document']);
-  assert.ok(actual.databases[0].preserve.some((table: any) => table.table === 'meta'));
+  assert.equal(actual.databases[0].schema, 3);
+  assert.deepEqual(actual.databases[0].preserve, []);
 });
 
 test('Checksums, embedded descriptor and archive identity must all agree', () => {

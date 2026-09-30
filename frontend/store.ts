@@ -1,32 +1,36 @@
 import type { ModuleFrontendContext } from '@waksana/cockpit-module-sdk/frontend';
 import { z } from 'zod';
-import type { Readiness, TimelineItem, TimelinePage } from '../src/ui-types.ts';
+import type { Readiness, TimelineItem } from '../src/ui-types.ts';
 import type { Operation, Role } from '../src/types.ts';
 import type { AssistantActions, SetupOperation, Snapshot } from './contracts.ts';
 import { createInput } from './input.ts';
 import { attachmentsSchema } from '../src/attachments.ts';
-import { conversationItems, isConversationItem } from './timeline.ts';
+import { conversationItems, isConversationItem, mergeSnapshots } from './timeline.ts';
+import { clarificationSchema, createClarification, type ClarificationActions } from './clarification.ts';
 
 const sequence = z.number().int().nonnegative().safe();
 const itemSchema = z.object({
-  id: z.string(), sequence: sequence.positive(),
-  type: z.enum(['message', 'question', 'status', 'correction', 'attribution', 'clarification']),
-  messageId: z.string().nullable(), topicId: z.string().nullable(), text: z.string(),
+  id: z.string().min(1), sequence: sequence.positive(), snapshotRevision: sequence.positive(),
+  type: z.enum(['message', 'question']),
+  messageId: z.string().min(1), topicId: z.string().nullable(), text: z.string(),
   createdAt: z.number().finite(),
-  sources: z.array(z.object({ messageId: z.string(), version: sequence, assignmentVersion: sequence })),
-  topicTitle: z.string().nullable(), topicColor: z.string().nullable(), speaker: z.enum(['user', 'assistant', 'system']),
-  topicAssignmentVersion: sequence.optional(),
+  topicTitle: z.string().nullable(), speaker: z.enum(['user', 'assistant', 'system']),
   sessionId: z.string().nullable(),
   question: z.object({ state: z.enum(['pending', 'stale', 'answered', 'unknown']),
-    stateVersion: sequence.default(0), choices: z.array(z.string()).optional(),
+    stateVersion: sequence, requestId: z.string().min(1), choices: z.array(z.string()).optional(),
     allowFreeform: z.boolean().optional() }).nullable(),
   attachments: attachmentsSchema.default([]),
-  revision: z.object({ version: sequence.positive(), text: z.string(), attachments: attachmentsSchema }).optional(),
-});
+  clarifications: z.array(clarificationSchema).default([]),
+  diagnostic: z.string().nullable(),
+  deliveryIssues: z.array(z.object({
+    topicMessageId: z.string().min(1), state: z.enum(['rejected', 'unknown', 'cancelled']), detail: z.string().min(1),
+  })).default([]),
+}).refine(item => item.id === item.messageId, 'Message identity must match');
 const pageSchema = z.object({ items: z.array(itemSchema), before: sequence.nullable(),
   hasMore: z.boolean(), watermark: sequence, cursor: sequence.optional() });
 const operationSchema = z.object({ id: z.string(), fingerprint: z.string(),
-  state: z.enum(['pending', 'calling', 'accepted', 'rejected', 'unknown', 'cancelled']), result: z.unknown() });
+  state: z.enum(['pending', 'calling', 'accepted', 'rejected', 'unknown', 'cancelled']),
+  kind: z.enum(['create', 'load', 'bind', 'activate']), result: z.unknown() });
 const operationState = (state: Operation['state']): SetupOperation['state'] =>
   state === 'accepted' ? 'accepted' : state === 'rejected' || state === 'cancelled' ? 'error'
     : state === 'pending' || state === 'calling' ? 'pending' : 'unknown';
@@ -39,8 +43,8 @@ const errorText = (error: unknown): string => error instanceof z.ZodError ? '返
   : error instanceof Error ? error.message : String(error);
 const id = (): string => crypto.randomUUID();
 
-/** A stream cursor advances only after the entire validated publication is applied. */
-export async function readPublications(response: Response, apply: (item: TimelineItem) => void,
+/** A stream cursor advances only after the entire validated message snapshot is applied. */
+export async function readPublications(response: Response, apply: (item: z.infer<typeof itemSchema>) => void,
   signal: AbortSignal): Promise<void> {
   if (!response.body) throw new Error('完整消息流没有响应正文');
   const reader = response.body.getReader();
@@ -69,14 +73,14 @@ export async function readPublications(response: Response, apply: (item: Timelin
         const event = field('event')[0];
         if (event === 'publication') {
           const item = itemSchema.parse(JSON.parse(field('data').join('\n')));
-          if (field('id')[0] !== String(item.sequence)) throw new Error('消息流序号不一致');
+          if (field('id')[0] !== String(item.snapshotRevision)) throw new Error('消息流修订游标不一致');
           if (!signal.aborted) apply(item);
-        } else if (event && event !== 'message') {
-          throw new Error(`消息流事件异常：${event}`);
+        } else if (event || field('data').length) {
+          throw new Error(`消息流事件异常：${event ?? 'message'}`);
         }
       }
     }
-    if (!signal.aborted) throw new Error('消息流已断开；将从已应用序号重新连接');
+    if (!signal.aborted) throw new Error('消息流已断开；将从已应用修订游标重新连接');
   } finally {
     signal.removeEventListener('abort', abort);
     await cancellation;
@@ -96,6 +100,8 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     submissions: input.business().submissions, setup: [],
   };
   const listeners = new Set<() => void>();
+  const clarifications = new Map<string, ClarificationActions>();
+  const clarificationKey = (messageId: string, clarificationId: string) => JSON.stringify([messageId, clarificationId]);
   let disposed = false;
   notify = () => {
     if (disposed) return;
@@ -109,14 +115,26 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
   let streamController: AbortController | null = null;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let applied = 0;
+  let historyBefore: number | null = null;
   let backoff = 1000;
   const activationAttempts = new Map<string, Role[]>();
   const update = (patch: Partial<Snapshot>) => {
     if (disposed) return;
     state = { ...state, ...patch };
+    if (patch.items) {
+      for (const item of patch.items) for (const value of item.clarifications ?? []) {
+        const key = clarificationKey(item.id, value.id);
+        let client = clarifications.get(key);
+        if (!client) {
+          client = createClarification(context, item.id, value, () => notify());
+          clarifications.set(key, client);
+        } else client.update(value);
+        void client.inspect();
+      }
+    }
     input.update(state.open, !!state.readiness?.canSend && !state.checking && !state.readinessError
-      && (['coordinator', 'memory'] as const).every(role =>
-        state.readiness?.roles.some(entry => entry.role === role && entry.status === 'ready')), conversationItems(state.items));
+      && !!state.readiness?.roles.some(entry => entry.role === 'coordinator' && entry.status === 'ready'),
+    conversationItems(state.items));
     for (const listener of listeners) listener();
   };
   const current = (epoch: number) => !disposed && state.open && epoch === generation;
@@ -137,13 +155,9 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body), signal: context.signal,
   });
-  const page = async (query: string, signal?: AbortSignal): Promise<TimelinePage> =>
+  const page = async (query: string, signal?: AbortSignal) =>
     pageSchema.parse(await read(`/timeline${query}`, signal));
-  const merge = (items: TimelineItem[]) => {
-    const bySequence = new Map(state.items.map(item => [item.sequence, item]));
-    for (const item of items) bySequence.set(item.sequence, item);
-    return [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
-  };
+  const merge = (items: TimelineItem[]) => mergeSnapshots([...state.items, ...items]);
   const stopStream = () => {
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = null;
@@ -155,11 +169,15 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       const result = await page(`?after=${applied}&limit=100`, signal);
       if (!current(epoch) || signal.aborted) return;
       if (!result.items.length && result.hasMore) throw new Error('补读游标未前进');
+      let cursor = applied;
       for (const item of result.items) {
-        if (item.sequence <= applied) throw new Error('补读序号未前进');
-        applied = item.sequence;
+        if (item.snapshotRevision <= cursor || item.snapshotRevision > result.watermark)
+          throw new Error('补读修订游标未前进');
+        cursor = item.snapshotRevision;
       }
+      if (result.cursor !== cursor || result.watermark < cursor) throw new Error('补读修订游标不一致');
       update({ items: merge(result.items) });
+      applied = result.hasMore ? cursor : result.watermark;
       if (!result.hasMore) return;
     }
   };
@@ -178,11 +196,10 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       if (!current(epoch) || signal.aborted) { await response.body?.cancel(); return; }
       update({ stream: 'connected', error: null });
       await readPublications(response, item => {
-        if (!current(epoch) || signal.aborted || item.sequence <= applied) return;
-        if (item.sequence !== applied + 1) throw new Error('消息乱序，正在从最后已应用序号补读');
-        applied = item.sequence;
+        if (!current(epoch) || signal.aborted || item.snapshotRevision <= applied) return;
+        update({ items: merge([item]) });
+        applied = item.snapshotRevision;
         backoff = 1000;
-        update({ items: [...state.items, item] });
       }, signal);
     } catch (error) {
       if (!current(epoch) || signal.aborted) return;
@@ -200,7 +217,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       if (current(epoch) && check === readinessGeneration) {
         update({ readiness: result, checking: false });
         const bindings = result.roles.filter(role => role.sessionId !== null)
-          .map(({ role, sessionId, epoch }) => ({ role, sessionId, epoch }))
+          .map(({ role, sessionId }) => ({ role, sessionId }))
           .sort((a, b) => a.role.localeCompare(b.role));
         const key = JSON.stringify(bindings);
         const uncertain = state.setup.some(operation => operation.receiptId.startsWith('activate:')
@@ -225,8 +242,11 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
     try {
       const result = await page('?limit=50', signal);
       if (!current(epoch)) return;
-      applied = result.items.at(-1)?.sequence ?? result.watermark;
-      update({ items: result.items, hasOlder: result.hasMore, error: null });
+      if (result.items.some(item => item.snapshotRevision > result.watermark))
+        throw new Error('消息快照超出修订水位');
+      applied = result.watermark;
+      historyBefore = result.before;
+      update({ items: merge(result.items), hasOlder: result.hasMore, error: null });
       if (!result.items.some(isConversationItem) && result.hasMore) await older(epoch, signal);
       if (!current(epoch)) return;
       update({ loading: false });
@@ -237,19 +257,21 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
   };
   const older = async (epoch: number, signal: AbortSignal) => {
     while (current(epoch) && state.hasOlder) {
-      const before = state.items[0]?.sequence;
-      if (before === undefined) throw new Error('历史消息游标缺失');
+      const before = historyBefore;
+      if (before === null) throw new Error('历史消息游标缺失');
       const result = await page(`?before=${before}&limit=50`, signal);
       if (!current(epoch) || signal.aborted) return;
       if ((!result.items.length && result.hasMore)
-        || result.items.some(item => item.sequence >= before)) throw new Error('历史消息游标未前进');
+        || result.items.some(item => item.sequence >= before)
+        || result.before !== (result.items[0]?.sequence ?? null)) throw new Error('历史消息游标未前进');
       update({ items: merge(result.items), hasOlder: result.hasMore });
+      historyBefore = result.before;
       if (result.items.some(isConversationItem)) return;
     }
   };
   const setOperation = (requestId: string, patch: Partial<SetupOperation>) =>
     update({ setup: state.setup.map(entry => entry.requestId === requestId ? { ...entry, ...patch } : entry) });
-  const activateRoles = async (bindings: { role: Role; sessionId: string | null; epoch: number }[]) => {
+  const activateRoles = async (bindings: { role: Role; sessionId: string | null }[]) => {
     if (state.setup.some(operation => operation.label === activationLabel
       && (operation.state === 'pending' || operation.state === 'unknown'))) return;
     const requestId = id();
@@ -315,6 +337,9 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
       try { await input.inspectInput(requestId); }
       catch (error) { update({ error: errorText(error) }); if (disposed) context.report(error); }
     },
+    getClarification(messageId, clarificationId) {
+      return clarifications.get(clarificationKey(messageId, clarificationId));
+    },
     async loadOlder() {
       if (state.loading || !state.hasOlder || state.loadingOlder || !state.items.length) return;
       const epoch = generation;
@@ -355,7 +380,7 @@ export function createStore(context: Pick<ModuleFrontendContext, 'request' | 'si
         return null;
       }
     },
-    dispose() { input.dispose(); store.close(); disposed = true; listeners.clear(); },
+    dispose() { input.dispose(); store.close(); disposed = true; listeners.clear(); clarifications.clear(); },
   };
   return store;
 }

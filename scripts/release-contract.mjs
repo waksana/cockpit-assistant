@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { applicationTables, schemaVersion } from './schema-preflight.mjs';
 
 export const repository = 'waksana/cockpit-assistant';
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -38,6 +39,8 @@ export async function product(root) {
   assert.equal(manifest.apiVersion, 1);
   const sources = Object.fromEntries(['src/index.ts', 'src/native.ts', 'src/runtime.ts', 'frontend/index.ts']
     .map(name => [name, readFileSync(join(root, name), 'utf8')]));
+  const hostSources = readdirSync(join(root, 'src')).filter(name => name.endsWith('.ts'))
+    .map(name => readFileSync(join(root, 'src', name), 'utf8'));
   for (const [file, gate] of [
     ['src/index.ts', 'context.serviceReadyVersion === 1'],
     ['src/native.ts', 'host.chatReadVersion === 1'],
@@ -63,21 +66,21 @@ export async function product(root) {
   const db = new Database(':memory:');
   try {
     const schema = db.sql.prepare('PRAGMA user_version').get().user_version;
-    assert.equal(schema, 2, 'Review schema changes; no automatic migration is declared');
-    const preserve = db.sql.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-      .all().map(({ name }) => {
-        assert.match(name, /^[a-zA-Z_][a-zA-Z0-9_]*$/);
-        return { table: name, columns: db.sql.prepare(`PRAGMA table_info("${name}")`).all().map(row => row.name) };
-      });
+    assert.equal(schema, schemaVersion, 'Review schema changes; no automatic migration is declared');
+    const tables = db.sql.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+      .all().map(({ name }) => name);
+    assert.deepEqual(tables, applicationTables, 'The released database must contain only the agreed three tables');
     return {
       kind: 'module', id: manifest.id, hostApi: { min: 1, max: 1 },
       requiresCapabilities: ['module-api.v1', 'serviceReady.v1', 'chatRead.v1', 'askResponse.v1',
         'resourcePreparation.v1', 'roleAssignment.v1', 'sessionDirectory.v1', 'sessionLoad.v1', 'promptReceipt.v1',
         'frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2',
         'page.v1', 'messagePresentation.v1', 'menu.v1', 'ui.v1', 'uiSurface.v1'],
-      requiredIntents: [...new Set(Object.values(sources).flatMap(source =>
+      requiredIntents: [...new Set(hostSources.flatMap(source =>
         [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1])))].sort(),
-      databases: [{ path: 'assistant.sqlite', schema, preserve }], migrations: [],
+      // No target-only projection may run against an incompatible source schema.
+      // Empty preserve is not an upgrade: schema mismatch still has no migration.
+      databases: [{ path: 'assistant.sqlite', schema, preserve: [] }], migrations: [],
     };
   } finally { db.close(); }
 }

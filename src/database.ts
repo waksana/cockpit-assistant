@@ -1,20 +1,66 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, chmodSync } from 'node:fs';
+import { mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import type { Table, Tables } from './types.ts';
+import type { Message, Table, Tables, Topic, TopicMessage } from './types.ts';
 import { requireFact } from './errors.ts';
-import { withAttachments } from './attachments.ts';
+import { attachmentsSchema } from './attachments.ts';
 
-const tables: Table[] = ['topics', 'messageTopics', 'batches', 'receptions', 'messages', 'questions', 'work',
-  'bindings', 'deliveries', 'publications', 'memories', 'native', 'operations'];
-
-function record<T extends Table>(table: T, document: unknown): Tables[T] {
-  const value = JSON.parse(String(document)) as Tables[T];
-  if (table === 'questions') return { stateVersion: 0, ...value };
-  return ['messages', 'work', 'deliveries', 'publications'].includes(table) ? withAttachments(value) : value;
+export const SCHEMA_VERSION = 3;
+const definitions = {
+  messages: `CREATE TABLE messages (
+    id TEXT PRIMARY KEY NOT NULL, sequence INTEGER NOT NULL UNIQUE, revision INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('user','reply','ask')), raw TEXT NOT NULL,
+    attachments TEXT NOT NULL CHECK(json_valid(attachments)),
+    source_session_id TEXT, native_message_id TEXT, native_event_id TEXT,
+    created_at INTEGER NOT NULL, processed INTEGER NOT NULL CHECK(processed IN (0,1)),
+    excluded INTEGER NOT NULL CHECK(excluded IN (0,1)), diagnostic TEXT,
+    input_request_id TEXT UNIQUE, input_fingerprint TEXT,
+    question_request_id TEXT,
+    question_choices TEXT CHECK(question_choices IS NULL OR (json_valid(question_choices) AND json_type(question_choices)='array')),
+    question_allow_freeform INTEGER CHECK(question_allow_freeform IN (0,1)),
+    question_state TEXT CHECK(question_state IN ('pending','stale','answered','unknown')),
+    question_version INTEGER NOT NULL CHECK(question_version>=0),
+    clarification_history TEXT NOT NULL CHECK(json_valid(clarification_history)),
+    UNIQUE(source_session_id,native_message_id),
+    UNIQUE(source_session_id,native_event_id), UNIQUE(source_session_id,question_request_id),
+    CHECK((kind='user' AND source_session_id IS NULL AND input_request_id IS NOT NULL AND input_fingerprint IS NOT NULL)
+      OR (kind='reply' AND source_session_id IS NOT NULL AND (native_message_id IS NOT NULL OR native_event_id IS NOT NULL)
+        AND input_request_id IS NULL AND input_fingerprint IS NULL)
+      OR (kind='ask' AND source_session_id IS NOT NULL AND input_request_id IS NULL AND input_fingerprint IS NULL)),
+    CHECK((kind='ask' AND question_request_id IS NOT NULL AND question_state IS NOT NULL AND question_version>0)
+      OR (kind!='ask' AND question_request_id IS NULL AND question_choices IS NULL AND question_allow_freeform IS NULL
+        AND question_state IS NULL AND question_version=0)))`,
+  topics: `CREATE TABLE topics (
+    id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+    archived INTEGER NOT NULL CHECK(archived IN (0,1)), version INTEGER NOT NULL,
+    session_id TEXT, mapping_state TEXT NOT NULL CHECK(mapping_state IN ('unbound','bound','calling','unknown')),
+    mapping_error TEXT, creation_receipt TEXT CHECK(creation_receipt IS NULL OR json_valid(creation_receipt)),
+    CHECK((mapping_state='bound' AND session_id IS NOT NULL) OR (mapping_state!='bound' AND session_id IS NULL)))`,
+  topic_messages: `CREATE TABLE topic_messages (
+    id TEXT PRIMARY KEY NOT NULL, message_id TEXT NOT NULL REFERENCES messages(id),
+    topic_id TEXT NOT NULL REFERENCES topics(id), origin TEXT NOT NULL CHECK(origin IN ('user','session')),
+    prompt TEXT, session_id TEXT, state TEXT CHECK(state IN ('pending','calling','accepted','rejected','unknown','cancelled')),
+    mode TEXT CHECK(mode IN ('prompt','ask')), request_id TEXT, was_freeform INTEGER CHECK(was_freeform IN (0,1)),
+    native_message_id TEXT, result TEXT CHECK(result IS NULL OR json_valid(result)), error TEXT,
+    created_at INTEGER NOT NULL, UNIQUE(message_id,topic_id),
+    CHECK((origin='session' AND prompt IS NULL AND state IS NULL AND mode IS NULL
+      AND request_id IS NULL AND was_freeform IS NULL AND native_message_id IS NULL AND result IS NULL AND error IS NULL)
+      OR (origin='user' AND prompt IS NOT NULL AND state IS NOT NULL)),
+    CHECK(mode!='ask' OR (request_id IS NOT NULL AND was_freeform IS NOT NULL)))`,
+} as const;
+const normalize = (sql: string) => sql.replace(/\s+/g, ' ').trim();
+function inspectSchema(sql: DatabaseSync): number {
+  const version = Number(sql.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+  const existing = sql.prepare("SELECT name,type,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','view','trigger')").all();
+  requireFact(version === SCHEMA_VERSION || version === 0 && existing.length === 0,
+    'SCHEMA_VERSION', 'Assistant requires its three-table schema 3; existing data must not be migrated or reset automatically');
+  if (version === SCHEMA_VERSION) requireFact(existing.length === 3 && existing.every(row =>
+    row.type === 'table' && Object.hasOwn(definitions, String(row.name))
+    && normalize(String(row.sql)) === normalize(definitions[String(row.name) as Table])),
+  'SCHEMA_TABLES', 'Assistant schema 3 must exactly match messages, topic_messages and topics');
+  return version;
 }
-
 export function fingerprint(value: unknown): string {
   const canonical = (v: unknown): string => {
     if (v === null || typeof v !== 'object') return JSON.stringify(v);
@@ -24,174 +70,220 @@ export function fingerprint(value: unknown): string {
   };
   return createHash('sha256').update(canonical(value)).digest('hex');
 }
+type Row = Record<string, unknown>;
+const parse = (value: unknown): unknown => value === null ? null : JSON.parse(String(value));
+function decode<T extends Table>(table: T, row: Row): Tables[T] {
+  if (table === 'messages') {
+    const attachments = attachmentsSchema.parse(parse(row.attachments));
+    const history = parse(row.clarification_history) as Message['clarificationHistory'];
+    const message: Message = { id: String(row.id), sequence: Number(row.sequence), revision: Number(row.revision),
+      kind: row.kind as Message['kind'], raw: String(row.raw), attachments,
+      sessionId: row.source_session_id as string | null, nativeMessageId: row.native_message_id as string | null,
+      nativeEventId: row.native_event_id as string | null, createdAt: Number(row.created_at),
+      processed: !!row.processed, excluded: !!row.excluded, diagnostic: row.diagnostic as string | null,
+      question: row.question_request_id === null ? null : {
+        request: { requestId: String(row.question_request_id), question: String(row.raw),
+          ...(row.question_choices === null ? {} : { choices: parse(row.question_choices) as string[] }),
+          ...(row.question_allow_freeform === null ? {} : { allowFreeform: !!row.question_allow_freeform }) },
+        state: row.question_state as NonNullable<Message['question']>['state'], stateVersion: Number(row.question_version) },
+      clarificationHistory: history,
+      clarification: history.find(item => item.answer === null) ?? null };
+    if (row.input_request_id) message.input = { requestId: String(row.input_request_id),
+      text: message.raw, attachments, fingerprint: String(row.input_fingerprint) };
+    return message as Tables[T];
+  }
+  if (table === 'topics') return { id: String(row.id), title: String(row.title), content: String(row.content),
+    archived: !!row.archived, version: Number(row.version), sessionId: row.session_id as string | null,
+    mappingState: row.mapping_state as Topic['mappingState'], mappingError: row.mapping_error as string | null,
+    creationReceipt: parse(row.creation_receipt) } as Tables[T];
+  return { id: String(row.id), messageId: String(row.message_id), topicId: String(row.topic_id),
+    origin: row.origin as TopicMessage['origin'], prompt: row.prompt as string | null,
+    sessionId: row.session_id as string | null, state: row.state as TopicMessage['state'],
+    mode: row.mode as TopicMessage['mode'], requestId: row.request_id as string | null,
+    wasFreeform: row.was_freeform === null ? null : !!row.was_freeform,
+    nativeMessageId: row.native_message_id as string | null, result: parse(row.result),
+    error: row.error as string | null, createdAt: Number(row.created_at) } as Tables[T];
+}
 
-/** One database is one explicitly configured Assistant space, never the host catalog. */
+/** Only original messages, per-topic associations/sends, and topic definitions are stored. */
 export class Database {
   readonly sql: DatabaseSync;
   private inTransaction = false;
   constructor(path: string) {
+    if (path !== ':memory:' && existsSync(path)) {
+      const inspection = new DatabaseSync(path, { readOnly: true });
+      try { inspectSchema(inspection); } finally { inspection.close(); }
+    }
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.sql = new DatabaseSync(path);
-    if (path !== ':memory:') chmodSync(path, 0o600);
-    this.sql.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
-    const schema = this.sql.prepare('PRAGMA user_version').get();
-    if (schema?.user_version !== 0 && schema?.user_version !== 2) {
-      this.sql.close();
-      requireFact(false, 'SCHEMA_VERSION',
-        'Assistant requires schema 2. Legacy generated data is not migrated. Use a separately authorized fresh data directory.');
-    }
-    this.sql.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
-    for (const table of tables) {
-      this.sql.exec(`CREATE TABLE IF NOT EXISTS ${table} (
-        ordinal INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-        document TEXT NOT NULL CHECK(json_valid(document)))`);
-    }
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS publications_sequence
-      ON publications(json_extract(document, '$.sequence'))`);
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS receptions_active_kind
-      ON receptions(json_extract(document, '$.enabled'), json_extract(document, '$.kind'), ordinal)`);
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS native_session_type
-      ON native(json_extract(document, '$.sessionId'), json_extract(document, '$.event.type'), ordinal)`);
-    for (const field of ['messageId', 'interactionId']) this.sql.exec(`CREATE INDEX IF NOT EXISTS native_${field}
-      ON native(json_extract(document, '$.sessionId'), json_extract(document, '$.event.type'),
-        json_extract(document, '$.event.data.${field}'))`);
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS messages_native_message
-      ON messages(json_extract(document, '$.sessionId'), json_extract(document, '$.nativeMessageId'))`);
-    this.sql.exec(`CREATE INDEX IF NOT EXISTS messages_native_event
-      ON messages(json_extract(document, '$.sessionId'), json_extract(document, '$.nativeEventId'))`);
-    for (const table of ['questions', 'work', 'deliveries']) {
-      this.sql.exec(`CREATE INDEX IF NOT EXISTS ${table}_message
-        ON ${table}(json_extract(document, '$.messageId'), ordinal)`);
-    }
-    this.sql.exec('PRAGMA user_version=2');
+    try {
+      const version = inspectSchema(this.sql);
+      // No DDL, PRAGMA writes or permission changes precede the compatibility check.
+      if (path !== ':memory:') chmodSync(path, 0o600);
+      this.sql.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000');
+      if (version === 0) this.transaction(() => {
+        this.sql.exec(definitions.messages);
+        this.sql.exec(definitions.topics);
+        this.sql.exec(definitions.topic_messages);
+        this.sql.exec(`CREATE INDEX messages_revision ON messages(revision);
+          CREATE INDEX messages_eligible ON messages(processed,excluded,sequence);
+          CREATE INDEX topic_messages_pending ON topic_messages(origin,state);
+          PRAGMA user_version=3`);
+      });
+    } catch (error) { this.sql.close(); throw error; }
   }
   transaction<T>(fn: () => T): T {
     requireFact(!this.inTransaction, 'NESTED_TRANSACTION', 'Nested transactions are not supported');
-    this.sql.exec('BEGIN IMMEDIATE');
-    this.inTransaction = true;
+    this.sql.exec('BEGIN IMMEDIATE'); this.inTransaction = true;
     try {
-      const value = fn();
-      requireFact(!(value instanceof Promise), 'ASYNC_TRANSACTION', 'Native effects cannot run inside a transaction');
-      this.sql.exec('COMMIT');
-      return value;
-    } catch (error) {
-      this.sql.exec('ROLLBACK');
-      throw error;
-    } finally {
-      this.inTransaction = false;
-    }
+      const result = fn();
+      requireFact(!(result instanceof Promise), 'ASYNC_TRANSACTION', 'Native effects cannot run inside a transaction');
+      this.sql.exec('COMMIT'); return result;
+    } catch (error) { this.sql.exec('ROLLBACK'); throw error; }
+    finally { this.inTransaction = false; }
   }
   get<T extends Table>(table: T, id: string): Tables[T] | undefined {
-    const row = this.sql.prepare(`SELECT document FROM ${table} WHERE id=?`).get(id);
-    return row ? record(table, row.document) : undefined;
+    const row = this.sql.prepare(`SELECT * FROM ${table} WHERE id=?`).get(id);
+    return row ? decode(table, row) : undefined;
   }
   must<T extends Table>(table: T, id: string): Tables[T] {
-    const value = this.get(table, id);
-    requireFact(value, 'NOT_FOUND', `${table} record not found`, 404);
-    return value;
+    const row = this.get(table, id);
+    requireFact(row, 'NOT_FOUND', `${table} record not found`, 404);
+    return row;
   }
-  put<T extends Table>(table: T, record: Tables[T]): void {
-    if (table === 'questions') {
-      this.sql.prepare(`INSERT INTO questions(id,document) VALUES(?,json_set(?, '$.stateVersion', 1))
-        ON CONFLICT(id) DO UPDATE SET document=json_set(excluded.document, '$.stateVersion',
-          COALESCE(json_extract(questions.document, '$.stateVersion'), 0)
-          + CASE WHEN json_extract(questions.document, '$.state') IS json_extract(excluded.document, '$.state')
-            THEN 0 ELSE 1 END)`).run(record.id, JSON.stringify(record));
+  put<T extends Table>(table: T, value: Tables[T]): void {
+    if (!this.inTransaction) { this.transaction(() => this.put(table, value)); return; }
+    if (table === 'messages') {
+      const m = value as Message, old = this.get('messages', m.id);
+      if (old) requireFact(fingerprint([old.kind, old.raw, old.attachments, old.sessionId,
+        old.nativeMessageId, old.nativeEventId, old.sequence, old.createdAt, old.input, old.question?.request])
+        === fingerprint([m.kind, m.raw, m.attachments, m.sessionId,
+          m.nativeMessageId, m.nativeEventId, m.sequence, m.createdAt, m.input, m.question?.request]),
+      'IMMUTABLE_ORIGINAL', 'Original input, native body, source identity and display order cannot change');
+      for (const entry of old?.clarificationHistory ?? []) {
+        const current = m.clarificationHistory.find(item => item.id === entry.id);
+        requireFact(current && fingerprint([entry.id, entry.question, entry.choices, entry.allowFreeform, entry.createdAt])
+          === fingerprint([current.id, current.question, current.choices, current.allowFreeform, current.createdAt])
+          && (entry.answer === null || fingerprint(entry) === fingerprint(current)),
+        'IMMUTABLE_CLARIFICATION', 'Saved clarification questions and acknowledged answers are append-only');
+      }
+      requireFact(m.clarificationHistory.filter(item => item.answer === null).length <= 1,
+        'CLARIFICATION_WAITING', 'Only one local question may wait on an original');
+      requireFact(!old?.processed || m.processed, 'PROCESSED_IMMUTABLE', 'Completed semantic results cannot be reopened');
+      requireFact(!old?.excluded || m.excluded, 'INTERNAL_SOURCE', 'An old internalized source cannot be resumed as business input');
+      m.revision = this.watermark + 1;
+      this.sql.prepare(`INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,processed=excluded.processed,
+          excluded=excluded.excluded,diagnostic=excluded.diagnostic,question_state=excluded.question_state,
+          question_version=excluded.question_version,
+          clarification_history=excluded.clarification_history`).run(
+        m.id, m.sequence, m.revision, m.kind, m.raw, JSON.stringify(m.attachments), m.sessionId,
+        m.nativeMessageId, m.nativeEventId, m.createdAt, Number(m.processed), Number(m.excluded), m.diagnostic,
+        m.input?.requestId ?? null, m.input?.fingerprint ?? null, m.question?.request.requestId ?? null,
+        m.question?.request.choices ? JSON.stringify(m.question.request.choices) : null,
+        m.question?.request.allowFreeform === undefined ? null : Number(m.question.request.allowFreeform),
+        m.question?.state ?? null, m.question?.stateVersion ?? 0,
+        JSON.stringify(m.clarificationHistory));
       return;
     }
-    this.sql.prepare(`INSERT INTO ${table}(id,document) VALUES(?,?)
-      ON CONFLICT(id) DO UPDATE SET document=excluded.document`).run(record.id, JSON.stringify(record));
+    if (table === 'topics') {
+      const t = value as Topic;
+      this.sql.prepare(`INSERT INTO topics VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+        title=excluded.title,content=excluded.content,archived=excluded.archived,version=excluded.version,
+        session_id=excluded.session_id,mapping_state=excluded.mapping_state,mapping_error=excluded.mapping_error,
+        creation_receipt=excluded.creation_receipt`).run(t.id, t.title, t.content, Number(t.archived),
+        t.version, t.sessionId, t.mappingState, t.mappingError, t.creationReceipt === null ? null : JSON.stringify(t.creationReceipt));
+      for (const m of this.relatedMessages(t.id)) this.put('messages', m);
+      return;
+    }
+    const t = value as TopicMessage, old = this.get('topic_messages', t.id);
+    const original = this.must('messages', t.messageId);
+    requireFact(original.kind === 'user' ? t.origin === 'user' : t.origin === 'session' && t.sessionId === original.sessionId,
+      'TOPIC_MESSAGE_ORIGIN', 'Topic-message origin and source identity must agree with the immutable original');
+    if (old) {
+      requireFact(fingerprint([old.messageId, old.topicId, old.origin, old.prompt, old.createdAt])
+        === fingerprint([t.messageId, t.topicId, t.origin, t.prompt, t.createdAt]),
+      'IMMUTABLE_SPLIT', 'Topic association and faithful split prompt cannot change');
+      requireFact(!old.sessionId || old.sessionId === t.sessionId,
+        'FROZEN_TARGET', 'A send retains its actual target despite later mapping changes');
+      requireFact(old.state !== 'calling' || t.state !== 'pending',
+        'UNCERTAIN_SEND', 'A native call cannot be returned to pending');
+      requireFact(!['accepted','rejected','unknown','cancelled'].includes(old.state ?? '')
+        || old.state === t.state, 'TERMINAL_SEND', 'Settled or uncertain sends cannot be repeated');
+      if (['accepted','rejected','unknown','cancelled'].includes(old.state ?? ''))
+        requireFact(fingerprint([old.mode,old.requestId,old.wasFreeform,old.nativeMessageId,old.result,old.error])
+          === fingerprint([t.mode,t.requestId,t.wasFreeform,t.nativeMessageId,t.result,t.error]),
+        'IMMUTABLE_RECEIPT', 'Settled native send facts cannot be rewritten');
+    }
+    this.sql.prepare(`INSERT INTO topic_messages VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id,state=excluded.state,mode=excluded.mode,
+        request_id=excluded.request_id,was_freeform=excluded.was_freeform,native_message_id=excluded.native_message_id,
+        result=excluded.result,error=excluded.error`).run(t.id, t.messageId, t.topicId, t.origin, t.prompt,
+      t.sessionId, t.state, t.mode, t.requestId, t.wasFreeform === null ? null : Number(t.wasFreeform),
+      t.nativeMessageId, t.result === null ? null : JSON.stringify(t.result), t.error, t.createdAt);
+    this.put('messages', this.must('messages', t.messageId));
   }
   list<T extends Table>(table: T, after = 0, limit = 100): { items: Tables[T][]; cursor: number; hasMore: boolean } {
     requireFact(Number.isSafeInteger(after) && after >= 0 && Number.isSafeInteger(limit) && limit >= 1 && limit <= 200,
       'PAGINATION', 'Use a nonnegative cursor and limit 1..200', 400);
-    const rows = this.sql.prepare(`SELECT ordinal,document FROM ${table} WHERE ordinal>? ORDER BY ordinal LIMIT ?`)
-      .all(after, limit + 1);
-    const page = rows.slice(0, limit);
-    return { items: page.map(row => record(table, row.document)),
-      cursor: page.length ? Number(page[page.length - 1]!.ordinal) : after, hasMore: rows.length > limit };
+    const rows = this.sql.prepare(`SELECT rowid AS ordinal,* FROM ${table} WHERE rowid>? ORDER BY rowid LIMIT ?`).all(after, limit + 1);
+    const selected = rows.slice(0, limit);
+    return { items: selected.map(row => decode(table, row)),
+      cursor: selected.length ? Number(selected.at(-1)!.ordinal) : after, hasMore: rows.length > limit };
   }
   find<T extends Table>(table: T, predicate: (item: Tables[T]) => boolean): Tables[T][] {
-    const found: Tables[T][] = [];
-    let cursor = 0;
-    for (;;) {
+    const items: Tables[T][] = [];
+    for (let cursor = 0; ;) {
       const page = this.list(table, cursor, 200);
-      found.push(...page.items.filter(predicate));
-      if (!page.hasMore) return found;
+      items.push(...page.items.filter(predicate));
+      if (!page.hasMore) return items;
       cursor = page.cursor;
     }
   }
-  publication(sequence: number): Tables['publications'] | undefined {
-    const row = this.sql.prepare(`SELECT document FROM publications
-      WHERE json_extract(document, '$.sequence')=? LIMIT 1`).get(sequence);
-    return row ? record('publications', row.document) : undefined;
+  get watermark(): number { return Number(this.sql.prepare('SELECT MAX(revision) AS n FROM messages').get()?.n ?? 0); }
+  get nextSequence(): number { return Number(this.sql.prepare('SELECT MAX(sequence) AS n FROM messages').get()?.n ?? 0) + 1; }
+  input(requestId: string): Message | undefined {
+    const row = this.sql.prepare('SELECT * FROM messages WHERE input_request_id=?').get(requestId);
+    return row ? decode('messages', row) : undefined;
   }
-  activeReceptions(): Tables['receptions'][] {
-    const rows = this.sql.prepare(`SELECT document FROM receptions
-      WHERE json_extract(document, '$.enabled')=1 AND json_extract(document, '$.kind')='reception'
-      ORDER BY ordinal LIMIT 100`).all();
-    return rows.map(row => JSON.parse(String(row.document)) as Tables['receptions']);
+  nativeMessage(sessionId: string, nativeMessageId: string): Message | undefined {
+    const row = this.sql.prepare('SELECT * FROM messages WHERE source_session_id=? AND native_message_id=?').get(sessionId, nativeMessageId);
+    return row ? decode('messages', row) : undefined;
   }
-  nativeByType(sessionId: string, type: string, after = 0) {
-    const rows = this.sql.prepare(`SELECT ordinal,document FROM native
-      WHERE json_extract(document, '$.sessionId')=? AND json_extract(document, '$.event.type')=?
-      AND ordinal>? AND NOT EXISTS
-        (SELECT 1 FROM meta WHERE key='consumed:' || native.id AND value='true')
-      ORDER BY ordinal LIMIT 200`).all(sessionId, type, after);
-    return rows.map(row => ({ ordinal: Number(row.ordinal),
-      record: JSON.parse(String(row.document)) as Tables['native'] }));
+  nativeEvent(sessionId: string, nativeEventId: string): Message | undefined {
+    const row = this.sql.prepare('SELECT * FROM messages WHERE source_session_id=? AND native_event_id=?').get(sessionId, nativeEventId);
+    return row ? decode('messages', row) : undefined;
   }
-  nativeMessage(sessionId: string, messageId: string | null, eventId: string): Tables['messages'] | undefined {
-    const field = messageId ? 'nativeMessageId' : 'nativeEventId';
-    const row = this.sql.prepare(`SELECT document FROM messages WHERE json_extract(document, '$.sessionId')=?
-      AND json_extract(document, '$.${field}')=? ORDER BY ordinal LIMIT 1`).get(sessionId, messageId ?? eventId);
-    return row ? record('messages', row.document) : undefined;
+  nativeQuestion(sessionId: string, requestId: string): Message | undefined {
+    const row = this.sql.prepare('SELECT * FROM messages WHERE source_session_id=? AND question_request_id=?').get(sessionId, requestId);
+    return row ? decode('messages', row) : undefined;
   }
-  consumerEvidence(sessionId: string, field: 'messageId' | 'interactionId' | 'toolCallId', value: string) {
-    const tool = field === 'toolCallId';
-    const rows = this.sql.prepare(`SELECT document FROM native
-      WHERE json_extract(document, '$.sessionId')=? AND json_extract(document, '$.event.type')=?
-      AND ${tool ? `EXISTS (SELECT 1 FROM json_each(json_extract(document, '$.event.data.toolRequests'))
-        WHERE json_extract(value, '$.toolCallId')=?)` : `json_extract(document, '$.event.data.${field}')=?`}
-      ORDER BY ordinal LIMIT 2`).all(sessionId, tool ? 'assistant.message' : 'user.message', value);
-    return rows.map(row => record('native', row.document).event);
+  topicMessages(messageId: string): TopicMessage[] {
+    return this.sql.prepare('SELECT * FROM topic_messages WHERE message_id=? ORDER BY rowid').all(messageId)
+      .map(row => decode('topic_messages', row));
   }
-  publicationPage(direction: 'before' | 'after', cursor: number | undefined, limit: number) {
-    requireFact((cursor === undefined || Number.isSafeInteger(cursor) && cursor >= 0)
-      && Number.isSafeInteger(limit) && limit >= 1 && limit <= 100,
-    'PAGINATION', 'Use a nonnegative cursor and limit 1..100', 400);
-    const watermarkRow = this.sql.prepare(`SELECT MAX(json_extract(document, '$.sequence')) AS maximum FROM publications`).get();
-    const watermark = Number(watermarkRow?.maximum ?? 0);
-    const forward = direction === 'after';
-    const rows = this.sql.prepare(`SELECT document FROM publications
-      WHERE json_extract(document, '$.sequence') ${forward ? '>' : cursor === undefined ? '<=' : '<'} ?
-      ORDER BY json_extract(document, '$.sequence') ${forward ? 'ASC' : 'DESC'} LIMIT ?`)
-      .all(cursor ?? (forward ? 0 : watermark), limit + 1);
-    const items = rows.slice(0, limit).map(row => record('publications', row.document));
-    if (!forward) items.reverse();
-    return { items, before: items[0]?.sequence ?? null, hasMore: rows.length > limit, watermark,
-      ...(forward ? { cursor: items.at(-1)?.sequence ?? cursor ?? 0 } : {}) };
+  relatedMessages(topicId: string): Message[] {
+    return this.sql.prepare('SELECT m.* FROM messages m JOIN topic_messages tm ON tm.message_id=m.id WHERE tm.topic_id=?')
+      .all(topicId).map(row => decode('messages', row));
   }
-  forMessage<T extends 'work' | 'deliveries' | 'questions'>(table: T, messageId: string, limit = 100) {
-    requireFact(Number.isSafeInteger(limit) && limit >= 1 && limit <= 100,
-      'PAGINATION', 'Use limit 1..100', 400);
-    const rows = this.sql.prepare(`SELECT document FROM ${table}
-      WHERE json_extract(document, '$.messageId')=? ORDER BY ordinal DESC LIMIT ?`).all(messageId, limit + 1);
-    return { items: rows.slice(0, limit).reverse().map(row => record(table, row.document)),
-      hasMore: rows.length > limit };
+  eligible(): Message | undefined {
+    const row = this.sql.prepare(`SELECT * FROM messages WHERE processed=0 AND excluded=0 AND diagnostic IS NULL
+      AND NOT EXISTS(SELECT 1 FROM json_each(clarification_history) WHERE json_extract(value,'$.answer') IS NULL)
+      ORDER BY sequence LIMIT 1`).get();
+    return row ? decode('messages', row) : undefined;
   }
-  meta<T>(key: string, fallback: T): T {
-    const row = this.sql.prepare('SELECT value FROM meta WHERE key=?').get(key);
-    return row ? JSON.parse(String(row.value)) as T : fallback;
-  }
-  setMeta(key: string, value: unknown): void {
-    this.sql.prepare('INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-      .run(key, JSON.stringify(value));
-  }
-  next(key: string): number {
-    const next = this.meta(key, 0) + 1;
-    this.setMeta(key, next);
-    return next;
+  messagePage(direction: 'before' | 'after', cursor: number | undefined, limit: number) {
+    requireFact(Number.isSafeInteger(limit) && limit >= 1 && limit <= 100
+      && (cursor === undefined || Number.isSafeInteger(cursor) && cursor >= 0), 'PAGINATION', 'Invalid message cursor', 400);
+    const field = direction === 'before' ? 'sequence' : 'revision';
+    const rows = this.sql.prepare(`SELECT * FROM messages WHERE ${field}${direction === 'before' ? '<' : '>'}?
+      ORDER BY ${field} ${direction === 'before' ? 'DESC' : 'ASC'} LIMIT ?`)
+      .all(cursor ?? (direction === 'before' ? Number.MAX_SAFE_INTEGER : 0), limit + 1);
+    const selected = rows.slice(0, limit), items = selected.map(row => decode('messages', row));
+    if (direction === 'before') items.reverse();
+    return { items, before: items.length ? Math.min(...items.map(m => m.sequence)) : null,
+      cursor: direction === 'after' ? items.at(-1)?.revision ?? cursor ?? 0 : undefined,
+      hasMore: rows.length > limit, watermark: this.watermark };
   }
   close(): void { this.sql.close(); }
 }

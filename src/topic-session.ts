@@ -1,57 +1,49 @@
+import type { ModuleHostApi } from '@waksana/cockpit-module-sdk/backend';
 import type { AssistantService } from './service.ts';
-import type { Runtime } from './runtime.ts';
-import { requireFact } from './errors.ts';
+import { errorText, requireFact } from './errors.ts';
 
-function createdId(value: unknown): string | null {
-  if (!value || typeof value !== 'object') return null;
-  const result = value as Record<string, unknown>;
-  for (const key of ['sessionId', 'createdId']) {
-    if (typeof result[key] === 'string' && result[key]) return result[key];
-  }
-  return null;
-}
-
-/** Creation is reserved by topic, not by an input, model request, or observation attempt. */
-export async function ensureTopicSession(service: AssistantService,
-  runtime: Pick<Runtime, 'create' | 'observe'>, deliveryId: string): Promise<string> {
+/** An uncertain topic creation is durable and never silently repeated. */
+export async function ensureTopicSession(service: AssistantService, host: ModuleHostApi, topicMessageId: string): Promise<string> {
   const { db } = service;
-  const delivery = db.must('deliveries', deliveryId);
-  if (delivery.sessionId) return delivery.sessionId;
-  requireFact(delivery.topicId, 'TOPIC_REQUIRED', 'Delivery has no topic or session');
-  let topic = db.must('topics', delivery.topicId);
-  let sessionId = topic.sessionId;
-  if (!sessionId) {
-    const requestId = `topic:${topic.id}`;
-    const key = `create:${requestId}`;
-    if (!db.get('operations', key)) {
-      // Runtime persists the intent before calling native, including an ID carried by a partial error.
-      try { await runtime.create({ requestId, cwd: service.config.defaultCwd }); }
-      catch (error) {
-        if (!createdId(db.get('operations', key)?.result)) throw error;
+  let row = db.must('topic_messages', topicMessageId);
+  if (row.sessionId) return row.sessionId;
+  let topic = db.must('topics', row.topicId);
+  if (!topic.sessionId) {
+    requireFact(topic.mappingState === 'unbound', 'TOPIC_CREATE_UNKNOWN',
+      topic.mappingError ?? 'Topic session creation is uncertain; inspect the original native session');
+    topic.mappingState = 'calling';
+    db.put('topics', topic);
+    let result: { sessionId: string };
+    try {
+      result = await host.call('session/new', { cwd: service.config.defaultCwd });
+      requireFact(typeof result.sessionId === 'string' && !!result.sessionId, 'CREATE_UNCONFIRMED', 'Native creation has no confirmed real ID');
+    } catch (error) {
+      db.transaction(() => {
+        topic = db.must('topics', topic.id);
+        if (topic.mappingState === 'calling') {
+          topic.mappingState = 'unknown'; topic.mappingError = errorText(error);
+          const detail = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+          topic.creationReceipt = { error: errorText(error),
+            ...(typeof detail.sessionId === 'string' ? { sessionId: detail.sessionId } : {}),
+            ...(typeof detail.createdId === 'string' ? { createdId: detail.createdId } : {}) };
+          db.put('topics', topic);
+        }
+      });
+      throw error;
+    }
+    db.transaction(() => {
+      topic = db.must('topics', topic.id);
+      topic.creationReceipt = result;
+      if (!topic.sessionId) {
+        topic.sessionId = result.sessionId; topic.mappingState = 'bound'; topic.mappingError = null; topic.version++;
       }
-    }
-    sessionId = createdId(db.must('operations', key).result);
-    requireFact(sessionId, 'TOPIC_CREATE_UNKNOWN',
-      'Session creation has an uncertain result for this topic; it will not be repeated');
-  }
-  const resolved = sessionId;
-  db.transaction(() => {
-    topic = db.must('topics', topic.id);
-    const current = db.must('deliveries', deliveryId);
-    if (!topic.sessionId) {
-      topic.sessionId = resolved;
-      topic.version++;
       db.put('topics', topic);
-      service.changed();
-    }
-    // A concurrent explicit mapping wins; the created identity remains in its operation receipt.
-    if (!current.sessionId) {
-      current.sessionId = topic.sessionId;
-      db.put('deliveries', current);
-    }
-    sessionId = current.sessionId;
+    });
+  }
+  db.transaction(() => {
+    row = db.must('topic_messages', row.id); topic = db.must('topics', topic.id);
+    requireFact(topic.sessionId, 'TOPIC_CREATE_UNKNOWN', 'No confirmed topic session mapping');
+    if (!row.sessionId) { row.sessionId = topic.sessionId; db.put('topic_messages', row); }
   });
-  // Mapping and creation identity are durable before observation can fail.
-  await runtime.observe(sessionId);
-  return sessionId;
+  return db.must('topic_messages', row.id).sessionId!;
 }

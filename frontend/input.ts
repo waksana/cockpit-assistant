@@ -22,12 +22,11 @@ const receiptSchema = z.union([
 ]);
 const projectedSchema = z.strictObject({ attachments: attachmentsSchema.optional() });
 const deliverySchema = z.object({
-  state: z.string(), error: z.string().nullable().optional(),
-  preparation: z.object({ error: z.string().nullable() }).optional(),
+  state: z.enum(['pending', 'calling', 'accepted', 'rejected', 'unknown', 'cancelled']),
+  error: z.string().nullable().optional(),
 });
 const deliveryDetail = (deliveries: z.infer<typeof deliverySchema>[]) => deliveries.length
-  ? deliveries.map(entry => `${entry.state}${entry.error || entry.preparation?.error
-    ? `：${entry.error || entry.preparation?.error}` : ''}`).join('；')
+  ? deliveries.map(entry => `${entry.state}${entry.error ? `：${entry.error}` : ''}`).join('；')
   : '等待编排';
 const submissionSchema = z.strictObject({
   requestId: identifier, submissionId: identifier,
@@ -81,15 +80,15 @@ export function createInput(context: InputContext, changed: () => void) {
       const receipt = await request(`/inputs/${encodeURIComponent(saved.payload.requestId)}`);
       const proof = z.object({
         requestId: identifier, input: recoveryPayloadSchema, message: z.object({ id: identifier }),
-        deliveries: z.array(deliverySchema),
+        topicMessages: z.array(deliverySchema),
       }).parse(receipt);
       if (proof.requestId !== saved.payload.requestId || JSON.stringify(proof.input) !== JSON.stringify(saved.payload)) {
         throw new Error('原回执与完整输入快照不匹配');
       }
       setSubmission(saved.payload.requestId, {
         receipt: z.json().parse(receipt),
-        detail: proof.deliveries.length
-          ? `输入已保存；投递：${deliveryDetail(proof.deliveries)}（接受不代表完成）`
+        detail: proof.topicMessages.length
+          ? `输入已保存；投递：${deliveryDetail(proof.topicMessages)}（接受不代表完成）`
           : '输入已持久保存，等待编排和投递；尚不代表完成',
       });
       return { status: 'accepted' as const,
@@ -109,7 +108,7 @@ export function createInput(context: InputContext, changed: () => void) {
       const fields = projectedSchema.parse(snapshot.fields);
       return newRequestSchema.parse({
         version: 2, submissionId: snapshot.id, actionRevision: snapshot.base.actionRevision,
-        payload: { requestId: crypto.randomUUID(), text: snapshot.text, attachments: fields.attachments ?? [] },
+        payload: { requestId: crypto.randomUUID(), text: snapshot.base.text, attachments: fields.attachments ?? [] },
       });
     },
     async send(saved) {
@@ -232,10 +231,10 @@ export function createInput(context: InputContext, changed: () => void) {
       if (submissionId === owner.reference.getSnapshot().submissionId) reflect(await owner.reconcile(submissionId));
       else {
         const receipt = await request(`/inputs/${encodeURIComponent(requestId)}`);
-        const proof = z.object({ requestId: identifier, deliveries: z.array(deliverySchema) }).parse(receipt);
+        const proof = z.object({ requestId: identifier, topicMessages: z.array(deliverySchema) }).parse(receipt);
         if (proof.requestId !== requestId) throw new Error('回执编号不匹配');
         setSubmission(requestId, { receipt: z.json().parse(receipt),
-          detail: `输入已保存；投递：${deliveryDetail(proof.deliveries)}（接受不代表完成）` });
+          detail: `输入已保存；投递：${deliveryDetail(proof.topicMessages)}（接受不代表完成）` });
       }
     },
     dispose() {

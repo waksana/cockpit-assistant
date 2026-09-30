@@ -14,4 +14,8 @@
 .ca-status-detail { flex: 0 1 auto; max-height: 30dvh; overflow-y: auto; padding: var(--ck-space); border-bottom: 1px solid var(--ck-color-border); }
 .ca-status-detail p { margin-block: var(--ck-space); }
 .ca-wrap { overflow-wrap: anywhere; white-space: pre-wrap; }
-.ca-topic-heading { margin: var(--ck-space) 0 0; padding-inline-start: calc(.75 * var(--ck-space)); border-inline-start: 3px solid; font-size: var(--ck-text-body); font-weight: 600; overflow-wrap: anywhere; }
+.ca-topic-heading { margin: var(--ck-space) 0 0; font-size: var(--ck-text-body); font-weight: 600; overflow-wrap: anywhere; }
+.ca-clarification { margin-block-start: var(--ck-space); padding: var(--ck-space); border: 1px solid var(--ck-color-border); border-radius: var(--ck-radius); }
+.ca-clarification-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--ck-space); }
+.ca-clarification-heading [role="status"] { color: var(--ck-color-muted); font-size: var(--ck-text-meta); }
+.ca-clarification-choices { display: flex; flex-wrap: wrap; gap: calc(.5 * var(--ck-space)); margin-block: var(--ck-space); }

@@ -1,195 +1,152 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { homedir } from 'node:os';
-import { Database } from '../src/database.ts';
-import { dispatchSchema } from '../src/schema.ts';
 import { fixture, topic } from './fixtures.ts';
-import { timeline } from '../src/ui.ts';
 
-function batch(f: ReturnType<typeof fixture>) {
-  return f.service.startBatch(f.db.must('bindings', 'coordinator'))!;
-}
-
-test('compound original is immediately visible once before classification and immutable on replay', t => {
-  const f = fixture(); t.after(() => f.close());
-  const input = { requestId: 'one', text: 'Weather and code please' };
-  const first = f.service.accept(input);
-  assert.equal(timeline(f.service, undefined, undefined, 100).items[0]?.text, input.text);
-  assert.equal(f.db.list('publications').items[0]?.topicId, null);
-  assert.equal(f.service.accept(input).message.id, first.message.id);
-  assert.equal(f.db.list('messages').items.length, 1);
-  assert.equal(f.db.list('publications').items.length, 1);
-  assert.throws(() => f.service.accept({ ...input, text: 'Different' }), /different input/);
-  assert.equal(f.service.config.defaultCwd, homedir());
+test('original input and request receipt are immutable, deduplicated, and never include split prompts', () => {
+  const f = fixture();
+  try {
+    const input = { requestId: 'stable', text: '  Raw original\n', attachments: [{ type: 'file' as const, path: '/synthetic/input' }] };
+    const receipt = f.service.accept(input);
+    assert.equal(f.service.accept(input).message.id, receipt.message.id);
+    assert.deepEqual(receipt.input, input);
+    assert.throws(() => f.service.accept({ ...input, text: 'changed' }), /request changed/);
+    for (const edit of [{ raw: 'changed' }, { attachments: [] }, { sequence: 99 }, { sessionId: 's1' }])
+      assert.throws(() => f.db.put('messages', { ...receipt.message, ...edit }), /cannot change/);
+    topic(f);
+    f.service.complete({ messageId: receipt.message.id, items: [{ topicId: 'topic', prompt: 'Relevant split' }] });
+    const saved = f.db.must('messages', receipt.message.id);
+    assert.equal(saved.raw, input.text);
+    for (const key of ['topicIds','dispatches','coordinator','work','batch']) assert.equal(key in saved, false);
+    assert.deepEqual(f.service.receipt(saved).input, input);
+  } finally { f.close(); }
 });
-
-test('one dispatch freezes different topic prompts without duplicating the original bubble', t => {
-  const f = fixture(); t.after(() => f.close());
-  topic(f, 'weather', 's1'); topic(f, 'code', 's2');
-  const original = f.service.accept({ requestId: 'one', text: 'Weather and code' });
-  const current = batch(f);
-  const value = { items: [{ topicId: 'weather', prompt: 'Weather only' }, { topicId: 'code', prompt: 'Code only' }] };
-  assert.deepEqual(f.service.dispatch(f.identities.coordinator, value), { queued: 2 });
-  assert.deepEqual(f.db.list('deliveries').items.map(d => [d.sessionId, d.text]), [['s1', 'Weather only'], ['s2', 'Code only']]);
-  assert.equal(f.db.must('messages', original.message.id).topicId, null);
-  assert.equal(f.db.list('messageTopics').items.length, 2);
-  assert.equal(f.db.list('publications').items.length, 1);
-  f.service.dispatch(f.identities.coordinator, value);
-  assert.equal(f.db.list('deliveries').items.length, 2);
-  assert.throws(() => f.service.dispatch(f.identities.coordinator, { items: [value.items[0]] }), /different durable dispatch/);
-  assert.equal(f.db.must('work', original.work.id).state, 'done');
-  f.service.finishBatch(current.id, 'finished');
-  assert.equal(f.service.activeBatch(), undefined);
-  assert.equal(batch(f), null);
+test('complete result transaction rolls back definitions, mapping, associations and processed on any error', () => {
+  const f = fixture();
+  try {
+    const message = f.service.accept({ requestId: 'atomic', text: 'A and B' }).message;
+    topic(f, 'a', 's1');
+    const watermark = f.db.watermark;
+    assert.throws(() => f.service.complete({ messageId: message.id,
+      topics: [{ topicId: 'a', title: 'Changed', content: 'changed', sessionId: 's2' }],
+      items: [{ topicId: 'a', prompt: 'A' }, { topicId: 'missing', prompt: 'B' }] }), /record not found/);
+    assert.equal(f.db.must('topics', 'a').title, 'a');
+    assert.equal(f.db.must('topics', 'a').sessionId, 's1');
+    assert.equal(f.db.topicMessages(message.id).length, 0);
+    assert.equal(f.db.must('messages', message.id).processed, false);
+    assert.equal(f.db.watermark, watermark);
+    const result = f.service.complete({ messageId: message.id,
+      topics: [{ topicId: 'b', title: 'B', content: 'B' }],
+      items: [{ topicId: 'a', prompt: 'A' }, { topicId: 'b', prompt: 'B' }] });
+    assert.equal(result.message.processed, true);
+    assert.equal(result.topicMessages.length, 2);
+    assert.equal(result.topicMessages.every(row => row.state === 'pending'), true);
+  } finally { f.close(); }
 });
-
-test('dispatch schema contains exactly two fields per item and no coordinator proof', () => {
-  const item = { topicId: 'topic', prompt: 'hello' };
-  for (const field of ['sessionId', 'workId', 'token', 'epoch', 'lease', 'replyTo', 'context'])
-    assert.equal(dispatchSchema.safeParse({ items: [{ ...item, [field]: 'invalid' }] }).success, false);
-  assert.equal(dispatchSchema.safeParse({ items: [item], workId: 'old' }).success, false);
-  assert.equal(dispatchSchema.safeParse({ items: [item] }).success, true);
+test('completed results are idempotent and never reapplied, even when a newer decision differs', () => {
+  const f = fixture();
+  try {
+    const message = f.service.accept({ requestId: 'done', text: 'Original' }).message;
+    topic(f);
+    const value = { messageId: message.id, items: [{ topicId: 'topic', prompt: 'Prompt' }] };
+    f.service.complete(value);
+    const revision = f.db.watermark;
+    assert.equal(f.service.complete({ ...value, topics: [{ topicId: 'topic', title: 'Changed', content: '' }] }).alreadyProcessed, true);
+    assert.equal(f.db.watermark, revision);
+    assert.equal(f.db.must('topics', 'topic').title, 'topic');
+    assert.equal(f.db.topicMessages(message.id).length, 1);
+  } finally { f.close(); }
 });
-
-test('multiple text inputs coalesce and attachment input isolates from both adjacent batches', t => {
-  const f = fixture(); t.after(() => f.close());
-  topic(f);
-  f.service.accept({ requestId: 'a', text: 'First' });
-  f.service.accept({ requestId: 'b', text: 'Second' });
-  const attached = f.service.accept({ requestId: 'c', text: 'File',
-    attachments: [{ type: 'file', path: '/fixture.ts' }] });
-  f.service.accept({ requestId: 'd', text: 'Last' });
-  const first = batch(f);
-  assert.equal(first.workIds.length, 2);
-  f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'topic', prompt: 'First two' }] });
-  f.service.finishBatch(first.id, 'finished');
-  const second = batch(f);
-  assert.deepEqual(second.workIds, [attached.work.id]);
-  f.service.dispatch(f.identities.coordinator, { items: [
-    { topicId: 'topic', prompt: 'Read file' }, { topicId: 'topic', prompt: 'Explain file' },
-  ] });
-  const deliveries = f.db.list('deliveries').items;
-  assert.equal(deliveries[0]!.attachments.length, 0);
-  assert.deepEqual(deliveries[1]!.attachments, attached.message.attachments);
-  assert.deepEqual(deliveries[2]!.attachments, attached.message.attachments);
-  f.service.finishBatch(second.id, 'finished');
-  assert.equal(batch(f).workIds.length, 1);
+test('session association neither copies nor rewrites native reply, and only new topics adopt the source', () => {
+  const f = fixture();
+  try {
+    topic(f, 'existing', 's1');
+    const source = f.service.addMessage({ kind: 'reply', raw: 'I mention existing and introduce a new topic.',
+      attachments: [], sessionId: 's2', nativeMessageId: 'native' });
+    assert.throws(() => f.service.complete({ messageId: source.id, items: [{ topicId: 'existing', prompt: 'Rewrite' }] }), /must not copy/);
+    f.service.complete({ messageId: source.id, topics: [{ topicId: 'new', title: 'New', content: '' }],
+      items: [{ topicId: 'existing' }, { topicId: 'new' }] });
+    assert.equal(f.db.must('topics', 'existing').sessionId, 's1');
+    assert.equal(f.db.must('topics', 'new').sessionId, 's2');
+    for (const row of f.db.topicMessages(source.id)) {
+      assert.equal(row.origin, 'session'); assert.equal(row.prompt, null); assert.equal(row.state, null);
+    }
+    assert.equal(f.db.must('messages', source.id).raw, source.raw);
+  } finally { f.close(); }
 });
-
-test('topic management is flat and session creation belongs to the service not topic creation', t => {
-  const f = fixture(); t.after(() => f.close());
-  f.service.accept({ requestId: 'one', text: 'A new topic' }); batch(f);
-  const created = f.service.topic(f.identities.coordinator, { title: 'Trip-hotels', content: 'Find a hotel' });
-  assert.equal(created.sessionId, null);
-  assert.equal(f.calls.length, 0);
-  assert.equal(f.service.topic(f.identities.coordinator, { title: 'Trip-hotels', content: 'Find a hotel' }).id, created.id);
-  assert.throws(() => f.service.topic(f.identities.coordinator, {
-    title: 'Child', content: '', parentTopicId: created.id,
-  }));
-  f.service.map(f.identities.coordinator, { topicId: created.id, sessionId: 's1' });
-  assert.equal(f.db.must('topics', created.id).sessionId, 's1');
-  f.service.dispatch(f.identities.coordinator, { items: [{ topicId: created.id, prompt: 'Find hotel' }] });
-  assert.throws(() => f.service.map(f.identities.coordinator, { topicId: created.id, sessionId: 's2' }), /current topic delivery/);
+test('explicit native handoff can remap only a real affected topic, not arbitrary Task/general subtask prose', () => {
+  const f = fixture();
+  try {
+    topic(f);
+    const source = f.service.addMessage({ kind: 'reply', raw: 'I created/assigned session s2 to handle this topic.',
+      attachments: [], sessionId: 's1', nativeMessageId: 'handoff' });
+    f.service.complete({ messageId: source.id, topics: [{ topicId: 'topic', title: 'topic', content: '', sessionId: 's2' }],
+      items: [{ topicId: 'topic' }] });
+    assert.equal(f.db.must('topics', 'topic').sessionId, 's2');
+    const vague = f.service.addMessage({ kind: 'reply', raw: 'Task abc owns a general subtask.', attachments: [],
+      sessionId: 's1', nativeMessageId: 'vague' });
+    assert.throws(() => f.service.complete({ messageId: vague.id,
+      topics: [{ topicId: 'topic', title: 'topic', content: '', sessionId: 's1' }],
+      items: [{ topicId: 'topic' }] }), /explicitly identify/);
+  } finally { f.close(); }
 });
-
-test('shared session receives short current-topic context and no forced migration', t => {
-  const f = fixture(); t.after(() => f.close());
-  topic(f, 'one'); topic(f, 'two');
-  f.service.accept({ requestId: 'input', text: 'Both topics' }); batch(f);
-  f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'one', prompt: 'First topic' }] });
-  const delivery = f.db.list('deliveries').items[0]!;
-  assert.match(delivery.supplement!, /Current topic is "one"/);
-  assert.match(delivery.supplement!, /not additional user authorization/);
-  assert.equal(f.db.must('topics', 'two').sessionId, 's1');
+test('a source-local question leaves raw and processed untouched, skips waiting work, and preserves its answer', () => {
+  const f = fixture();
+  try {
+    const first = f.service.accept({ requestId: 'first', text: 'Ambiguous raw' }).message;
+    const second = f.service.accept({ requestId: 'second', text: 'Clear raw' }).message;
+    const q = f.service.clarify({ messageId: first.id, question: 'Which?', choices: ['A','B'], allowFreeform: false }).clarification;
+    assert.equal(f.db.must('messages', first.id).processed, false);
+    assert.equal(f.db.eligible()!.id, second.id);
+    assert.throws(() => f.service.answerClarification(first.id, q.id, { requestId: 'answer', answer: 'not offered' }), /exact offered/);
+    const result = f.service.answerClarification(first.id, q.id, { requestId: 'answer', answer: 'A' });
+    assert.equal(result.clarification.answer, 'A');
+    assert.equal(f.db.eligible()!.id, first.id);
+    assert.equal(f.db.must('messages', first.id).processed, false);
+    assert.equal(f.db.must('messages', first.id).raw, 'Ambiguous raw');
+    assert.equal(f.db.find('messages', () => true).length, 2);
+    topic(f);
+    f.service.complete({ messageId: first.id, items: [{ topicId: 'topic', prompt: 'Clarified raw A' }] });
+    assert.equal(f.db.must('messages', first.id).clarificationHistory[0]!.answer, 'A');
+  } finally { f.close(); }
 });
-
-test('reply appears before attribution and gains one original-text heading in place', t => {
-  const f = fixture(); t.after(() => f.close());
-  topic(f, 'topic');
-  const message = f.service.addMessage({ kind: 'reply', raw: 'The original answer', sessionId: 's1' });
-  f.service.addWork(message);
-  const before = timeline(f.service, undefined, undefined, 100).items[0]!;
-  assert.equal(before.text, 'The original answer');
-  assert.equal(before.topicId, null);
-  batch(f);
-  f.service.attribute(f.identities.coordinator, { items: [{ messageId: message.id, topicId: 'topic' }] });
-  const after = timeline(f.service, undefined, undefined, 100).items[0]!;
-  assert.equal(after.id, before.id);
-  assert.equal(after.text, before.text);
-  assert.equal(after.topicTitle, 'topic');
-  assert.equal(after.topicColor, '#336699');
-  assert.equal(f.db.find('publications', p => p.type === 'message').length, 1);
-  f.service.attribute(f.identities.coordinator, { items: [{ messageId: message.id, topicId: 'topic' }] });
-  assert.equal(f.db.find('publications', p => p.type === 'attribution').length, 1);
+test('clarification exact identity, duplicate receipts, stale question and changed request are explicit', () => {
+  const f = fixture();
+  try {
+    const m = f.service.accept({ requestId: 'q', text: 'Raw' }).message;
+    const q1 = f.service.clarify({ messageId: m.id, question: 'First?' }).clarification;
+    const answer = { requestId: 'a1', answer: 'First answer' };
+    f.service.answerClarification(m.id, q1.id, answer);
+    assert.equal(f.service.answerClarification(m.id, q1.id, answer).clarification.requestId, 'a1');
+    const q2 = f.service.clarify({ messageId: m.id, question: 'Second?' }).clarification;
+    assert.equal(f.service.answerClarification(m.id, q1.id, answer).clarification.id, q1.id);
+    assert.equal(f.db.must('messages', m.id).clarification!.id, q2.id);
+    assert.throws(() => f.service.answerClarification(m.id, q1.id, { requestId: 'different', answer: 'late' }), /no longer waiting/);
+    assert.throws(() => f.service.answerClarification(m.id, q2.id, { requestId: 'a1', answer: 'First answer' }), /already names another/);
+    assert.throws(() => f.service.answerClarification(m.id, 'not-this-question', answer), /does not belong/);
+    assert.throws(() => f.service.answerClarification(m.id, q1.id, { ...answer, answer: 'Changed' }), /already names another/);
+  } finally { f.close(); }
 });
-
-test('source batch contains actual source text and session identities, not metadata-only notices', t => {
-  const f = fixture(); t.after(() => f.close());
-  f.service.accept({ requestId: 'one', text: 'My exact input' });
-  const reply = f.service.addMessage({ kind: 'reply', raw: 'Exact original reply', sessionId: 's2' });
-  f.service.addWork(reply);
-  const text = f.service.batchText(batch(f));
-  assert.match(text, /My exact input/); assert.match(text, /Exact original reply/);
-  assert.match(text, /sessionId: s2/); assert.match(text, /not new user authorization/);
-});
-
-test('interrupted batch does not repeat completed dispatch, retries only unfinished attribution', t => {
-  const f = fixture(); t.after(() => f.close());
-  topic(f);
-  const input = f.service.accept({ requestId: 'one', text: 'Input' });
-  const reply = f.service.addMessage({ kind: 'reply', raw: 'Reply', sessionId: 's1' });
-  const output = f.service.addWork(reply);
-  const first = batch(f);
-  f.service.dispatch(f.identities.coordinator, { items: [{ topicId: 'topic', prompt: 'Input' }] });
-  f.service.finishBatch(first.id, 'rejected');
-  assert.equal(f.db.must('work', input.work.id).state, 'done');
-  const next = batch(f);
-  assert.deepEqual(next.workIds, [output.id]);
-  f.service.attribute(f.identities.coordinator, { items: [{ messageId: reply.id, topicId: 'topic' }] });
-  assert.equal(f.db.list('deliveries').items.length, 1);
-});
-
-test('definite old failures do not block new inputs, unknown control effects do not blind replay', t => {
-  const f = fixture(); t.after(() => f.close());
-  const first = f.service.accept({ requestId: 'a', text: 'Old input' });
-  f.service.finishBatch(batch(f).id, 'rejected');
-  f.service.finishBatch(batch(f).id, 'rejected');
-  assert.equal(f.db.must('work', first.work.id).state, 'failed');
-  const second = f.service.accept({ requestId: 'b', text: 'New input' });
-  const next = batch(f);
-  assert.deepEqual(next.workIds, [second.work.id]);
-  f.service.finishBatch(next.id, 'unknown');
-  assert.equal(f.service.activeBatch(), undefined);
-  assert.equal(f.db.must('batches', next.id).state, 'unknown');
-  assert.equal(batch(f), null);
-});
-
-test('memory receives multi-topic source context without a foreground pointer', t => {
-  const f = fixture(); t.after(() => f.close());
-  topic(f, 'a'); topic(f, 'b');
-  const input = f.service.accept({ requestId: 'one', text: 'Two goals' }); batch(f);
-  f.service.dispatch(f.identities.coordinator, { items: [
-    { topicId: 'a', prompt: 'Goal A' }, { topicId: 'b', prompt: 'Goal B' },
-  ] });
-  const memory = f.db.find('work', work => work.role === 'memory');
-  assert.deepEqual(memory.map(work => work.topicId).sort(), ['a', 'b']);
-  assert.ok(memory.every(work => work.sources[0]?.messageId === input.message.id));
-  assert.equal(f.db.meta('foregroundTopic', null), null);
-});
-
-test('strict role identity and protocol revision exclude stale carriers and subagents', t => {
-  const f = fixture(); t.after(() => f.close());
-  f.service.accept({ requestId: 'input', text: 'Hello' }); batch(f);
-  assert.throws(() => f.service.topic({ ...f.identities.coordinator, subagent: true }, { title: 'X', content: '' }), /Internal agents/);
-  assert.throws(() => f.service.topic(f.identities.memory, { title: 'X', content: '' }), /ready current role/);
-  f.db.put('bindings', { ...f.db.must('bindings', 'coordinator'), definitionVersion: '1' });
-  assert.throws(() => f.service.topic(f.identities.coordinator, { title: 'X', content: '' }), /protocol 2/);
-});
-
-test('schema 2 rejects legacy files without clearing their tables', t => {
-  const db = new Database(':memory:'); t.after(() => db.close());
-  assert.equal(db.sql.prepare('PRAGMA user_version').get()!.user_version, 2);
-  const names = db.sql.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name);
-  assert.ok(names.includes('messageTopics'));
-  for (const old of ['anchors', 'routes', 'risks', 'exposures']) assert.ok(!names.includes(old));
+test('original text, local question, literal choices, answers and split prompts preserve whitespace exactly', () => {
+  const f = fixture();
+  try {
+    const raw = ' \tOriginal wording\r\n trailing  ';
+    const literal = ' \tLiteral choice A\n  ';
+    const question = '  Which literal choice?\n ';
+    const receipt = f.service.accept({ requestId: 'exact-wording', text: raw });
+    assert.equal(receipt.input.text, raw);
+    assert.equal(receipt.message.raw, raw);
+    const card = f.service.clarify({ messageId: receipt.message.id, question, choices: [literal], allowFreeform: false }).clarification;
+    assert.equal(card.question, question);
+    assert.deepEqual(card.choices, [literal]);
+    assert.throws(() => f.service.answerClarification(receipt.message.id, card.id,
+      { requestId: 'trimmed-choice', answer: literal.trim() }), /exact offered/);
+    const answer = { requestId: 'literal-answer', answer: literal };
+    assert.equal(f.service.answerClarification(receipt.message.id, card.id, answer).clarification.answer, literal);
+    assert.equal(f.service.answerClarification(receipt.message.id, card.id, answer).clarification.answer, literal);
+    topic(f);
+    const result = f.service.complete({ messageId: receipt.message.id, items: [{ topicId: 'topic', prompt: literal }] });
+    assert.equal(result.topicMessages[0]!.prompt, literal);
+    assert.equal(result.message.clarificationHistory[0]!.answer, literal);
+    assert.equal(f.service.receipt(result.message).input.text, raw);
+  } finally { f.close(); }
 });

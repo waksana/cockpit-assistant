@@ -7,29 +7,40 @@ session-independent SPA page, including on an empty Cockpit home. Direct URLs,
 refresh and browser forward/back navigation retain the page; its return arrow
 always goes to Cockpit home.
 
-The coordinator maintains flat topics, maps each to one current session, splits
-inputs into topic-specific prompts and attributes business session replies. The
-service persists originals, creates or loads targets, queues prompts and receives
-all new ordinary primary replies and native questions. A separate memory role extracts versioned, source-bound
-memory per topic. Neither internal role is a receptionist.
-Select `coordinator` and `memory` on two separate sessions using Cockpit's
-normal role controls; successful role saves register their carriers with the
-module. Registration does not claim readiness. Assistant is the user input
-entry: native session user messages, forwarded prompts and internal role output
-do not become new Assistant inputs. Native history remains available through
-the public session history API when explicitly needed.
+The coordinator processes one original message at a time, identifies flat topics
+and produces topic-specific results. The service saves those results, creates or
+loads target sessions, queues user prompts and displays original conversation.
+Select `coordinator` through Cockpit's normal role controls; role selection does
+not itself prove readiness. This version does not run or require a memory role.
 
-Inputs need no reply selection or `replyTo`. The coordinator uses conversation
-context to choose the recipient and forwards the user's wording to a real native
-question when appropriate. Only an ambiguous destination needs clarification;
-native choice/freeform and attachment restrictions still apply.
+Assistant is the user input entry. New ordinary primary replies and native
+questions are collected while the service runs. Native session user messages,
+forwarded prompt copies and internal role output do not become new Assistant
+inputs. Events from service downtime are not backfilled. The coordinator can
+read stored messages or related native history on demand to clarify a topic;
+those reads do not import or reprocess history.
 
-The page presents ordinary conversation using the same public message and
-Composer surfaces as Chat. Internal wake/status/risk records and correction
-notices stay out of the reading flow; corrections update the actual message
-instead. User originals appear once without topic labels. Related replies are
-visible immediately, then gain a stable topic color and title in place after
-attribution. Generated prompts are not additional user bubbles.
+Inputs need no reply selection or `replyTo`. The service uses a topic's current
+session and its current matching native question, answering through the real
+request ID when one is pending and otherwise sending a prompt. Native
+choice/freeform and attachment restrictions still apply. Rare unresolved
+handoffs or questions can be handled in the original session.
+
+The page uses the same public conversation layout, message and Composer surfaces
+as Chat. Originals appear once immediately. User originals have no topic label;
+session replies acquire a plain heading listing their topics in place, without
+topic colors or rewritten answers. Generated prompts are not additional bubbles.
+When meaning is unclear, a clarification box belongs to the original message.
+Its answer is saved with that message before the coordinator resumes processing;
+it is not another ordinary input to classify.
+
+The persistence model has three application tables: `messages` for originals and
+local clarification, `topic_messages` for topic associations and user-prompt
+delivery, and `topics` for definitions and current mappings. There is no separate
+batch, work, session mirror, delivery ledger or publication log.
+See [architecture](docs/architecture.md#three-table-persistence) for ownership and
+the schema compatibility boundary. Installing a new package does not authorize
+replacing an incompatible old database.
 
 ## Development
 

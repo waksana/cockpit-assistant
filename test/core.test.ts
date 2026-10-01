@@ -138,8 +138,8 @@ test('existing sessions keep their IDs and new topics create ordinary sessions w
     assert.deepEqual(create.body, { cwd: '/synthetic' });
     assert.equal(f.store.topic('new').session_id, 'worker-1');
     assert.deepEqual(f.calls.filter(call => call.name === 'prompt').map(call => call.body), [
-      { sessionId: 'a', mode: 'enqueue', text: 'Old target' },
-      { sessionId: 'worker-1', mode: 'enqueue', text: 'New target' },
+      { sessionId: 'a', mode: 'immediate', text: 'Old target' },
+      { sessionId: 'worker-1', mode: 'immediate', text: 'New target' },
     ]);
   } finally { f.close(); }
 });
@@ -475,6 +475,7 @@ test('only owned main-agent messages enter inbox; complete text accompanying too
     await f.assistant.observe('a', event);
     assert.equal(f.store.inbox().length, 1);
     assert.equal(f.calls.length, 0);
+    await f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
     f.sessions.get('assistant')!.status = 'idle'; await f.assistant.notify();
     assert.equal(f.calls.length, 1);
     assert.equal((f.calls[0]!.body as { text: string }).text.includes('Progress report'), false);
@@ -486,12 +487,13 @@ test('a notice in flight cannot restore consumed items or lose another result ar
     f.topic('topic', 'a');
     f.onCall(async (name, target) => { if (name === 'prompt' && target === 'assistant') { entered.resolve(); await release.promise; } });
     const first = f.assistant.observe('a', { id: 'first', type: 'assistant.message', data: { content: 'First' } });
+    const idle = f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
     await entered.promise;
     await f.invoke('assistant_inbox');
     f.store.enqueue({ session_id: 'a', native_id: 'later', kind: 'reply', text: 'Later', attachments: [], question: null });
     f.sessions.get('assistant')!.status = 'running';
     const again = f.assistant.notify();
-    release.resolve(); await first; await again;
+    release.resolve(); await first; await idle; await again;
     assert.deepEqual(f.store.inbox().map(item => item.text), ['Later']);
     assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
   } finally { release.resolve(); f.close(); }
@@ -556,8 +558,210 @@ test('a result arriving while the empty notification loop exits receives its rem
     const empty = f.assistant.notify();
     const arrived = f.assistant.observe('a', { id: 'at-loop-exit', type: 'assistant.message',
       data: { messageId: 'at-loop-exit', content: 'Do not lose this wake' } });
-    await Promise.all([empty, arrived]);
+    const idle = f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
+    await Promise.all([empty, arrived, idle]);
     assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
     assert.equal(f.store.inbox()[0]!.notice_state, 'notified');
   } finally { f.close(); }
+});
+test('source progress and queued replies wait for known idle; frontend remains enqueue and idle is not success', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    const source = f.sessions.get('a')!;
+    source.status = 'running'; source.activity!.processing = true; source.activity!.hasActiveWork = true;
+    const progress = { ...message('progress'), data: { content: 'Checking', toolRequests: [{ toolCallId: 'tool' }] } };
+    for (const event of [progress, message('final-a'), { id: 'turn', type: 'assistant.turn_end', data: { turnId: '0' } },
+      message('queued-b'), message('final-b')]) await f.assistant.observe('a', event);
+    assert.equal(f.store.inbox().length, 4);
+    assert.equal(f.calls.length, 0);
+    source.status = 'idle'; source.activity!.processing = false; source.activity!.hasActiveWork = false;
+    source.activity!.queue.pendingCount = 1;
+    await f.assistant.notify(); assert.equal(f.calls.length, 0);
+    source.activity!.queue.pendingCount = 0;
+    const activity = source.activity; source.activity = null;
+    await f.assistant.notify(); assert.equal(f.calls.length, 0);
+    source.activity = activity;
+    f.sessions.get('assistant')!.status = 'running';
+    await f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
+    assert.equal(f.calls.length, 0);
+    f.sessions.get('assistant')!.status = 'idle';
+    await f.assistant.notify();
+    assert.equal(f.calls.length, 1);
+    const notice = f.calls[0]!.body as { mode: string; text: string };
+    assert.equal(notice.mode, 'enqueue');
+    assert.match(notice.text, /not evidence of business success/);
+    await f.invoke('assistant_inbox');
+    await f.assistant.observe('a', progress);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.store.inbox().length, 0);
+  } finally { f.close(); }
+});
+test('active source asks bypass idle, but ordinary progress does not ride along in the reminder', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    const source = f.sessions.get('a')!;
+    source.status = 'running'; source.activity!.processing = true;
+    source.ask = { requestId: 'current', question: 'Choose', choices: ['A', 'B'], allowFreeform: false };
+    await f.assistant.observe('a', message('progress'));
+    assert.equal(f.calls.length, 1);
+    const notice = f.calls[0]!.body as { text: string };
+    assert.match(notice.text, /"kind":"ask"/);
+    assert.doesNotMatch(notice.text, /"kind":"reply"/);
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['pending', 'notified']);
+    source.ask = null;
+    const result = await f.invoke('assistant_inbox') as { items: { type: string }[] };
+    assert.deepEqual(result.items.map(item => item.type), ['reply']);
+    await f.assistant.notify();
+    assert.equal(f.calls.length, 1);
+  } finally { f.close(); }
+});
+test('asks are revalidated before reminders, and unloaded questions wait without losing their identities', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    const source = f.sessions.get('a')!;
+    f.sessions.get('assistant')!.status = 'running';
+    source.ask = { requestId: 'old', question: 'Obsolete?' };
+    await f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
+    source.ask = { requestId: 'new', question: 'Current?', choices: ['Yes'] };
+    await f.assistant.observe('a');
+    source.loaded = false;
+    assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 0 });
+    assert.equal(f.store.inbox().length, 2);
+    assert.deepEqual(await f.invoke('assistant_inbox', {}, 'unavailable'), { items: [], alreadyRead: false, hasMore: false });
+    source.loaded = true;
+    f.sessions.get('assistant')!.status = 'idle';
+    await f.assistant.notify();
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.store.inbox().map(item => item.native_id), ['new']);
+    const result = await f.invoke('assistant_inbox', {}, 'available') as { items: { question: unknown }[] };
+    assert.deepEqual(result.items.map(item => item.question), [source.ask]);
+    await f.assistant.observe('a');
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.store.inbox().length, 0);
+  } finally { f.close(); }
+});
+test('manual progress consumption before source idle does not leave a new reminder', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    const source = f.sessions.get('a')!;
+    source.status = 'running'; source.activity!.processing = true;
+    await f.assistant.observe('a', message('manual-progress'));
+    assert.equal(f.calls.length, 0);
+    await f.invoke('assistant_inbox');
+    source.status = 'idle'; source.activity!.processing = false;
+    await f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
+    assert.equal(f.calls.length, 0);
+  } finally { f.close(); }
+});
+test('native cancellation and errors retain explicit incomplete facts, not successful completion', async () => {
+  for (const type of ['abort', 'session.error']) {
+    const f = fixture();
+    try {
+      f.topic('topic', 'a');
+      const source = f.sessions.get('a')!;
+      source.status = 'running'; source.activity!.processing = true;
+      const event = { id: type, type, data: { message: 'Synthetic failure' } };
+      await f.assistant.observe('a', message('partial'));
+      await f.assistant.observe('a', event);
+      assert.equal(f.calls.length, 0);
+      source.status = type === 'abort' ? 'idle' : 'error'; source.activity!.processing = false;
+      await f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
+      assert.equal(f.calls.length, 1);
+      assert.match(f.store.inbox()[1]!.text, /incomplete.*not a successful/s);
+      await f.invoke('assistant_inbox');
+      await f.assistant.observe('a', event);
+      assert.equal(f.calls.length, 1);
+    } finally { f.close(); }
+  }
+});
+test('busy dispatch uses immediate with distinct human receipts and never aborts, clears, or loses repeated text', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    f.sessions.get('a')!.status = 'running'; f.sessions.get('a')!.activity!.processing = true;
+    const query = { items: [{ topicId: 'topic', prompt: 'Same request' }] };
+    await f.invoke('assistant_dispatch', query, 'first');
+    f.input({ messageId: 'next-human-message', interactionId: 'next-human-interaction' });
+    await f.invoke('assistant_dispatch', query, 'second');
+    assert.deepEqual(f.calls, [1, 2].map(() => ({ name: 'prompt',
+      body: { sessionId: 'a', mode: 'immediate', text: 'Same request' } })));
+    assert.equal(f.store.deliveries('assistant', 'human-message')[0]!.state, 'accepted');
+    assert.equal(f.store.deliveries('assistant', 'next-human-message')[0]!.state, 'accepted');
+  } finally { f.close(); }
+});
+test('overlapping native callbacks drain in order even when metadata already reports idle', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    f.topic('topic', 'a');
+    let first = true;
+    f.onMeta(async id => {
+      if (id === 'a' && first) { first = false; entered.resolve(); await release.promise; }
+    });
+    const progress = f.assistant.observe('a', message('slow-progress'));
+    await entered.promise;
+    const final = f.assistant.observe('a', message('final'));
+    release.resolve();
+    await Promise.all([progress, final]);
+    assert.equal(f.calls.length, 0, 'Idle metadata alone must not flush a partial live callback batch');
+    await f.assistant.observe('a', { id: 'idle', type: 'session.idle', ephemeral: true, data: {} });
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.store.inbox().map(item => [item.text, item.notice_state]),
+      [['slow-progress', 'notified'], ['final', 'notified']]);
+    await f.invoke('assistant_inbox');
+    await f.assistant.observe('a', message('final'));
+    assert.equal(f.calls.length, 1);
+  } finally { release.resolve(); f.close(); }
+});
+test('a question invalidated while another source is sampled stays unread and is not returned as live', async () => {
+  for (const unloaded of [true, false]) {
+    const f = fixture(), entered = deferred(), release = deferred();
+    try {
+      f.topic('one', 'a'); f.topic('two', 'b'); f.sessions.get('assistant')!.status = 'running';
+      for (const id of ['a', 'b']) {
+        f.sessions.get(id)!.ask = { requestId: id, question: id };
+        await f.assistant.observe(id);
+      }
+      let paused = false;
+      f.onMeta(async id => { if (id === 'b' && !paused) { paused = true; entered.resolve(); await release.promise; } });
+      const read = f.invoke('assistant_inbox');
+      await entered.promise;
+      if (unloaded) f.sessions.get('a')!.loaded = false;
+      else f.sessions.get('a')!.ask = null;
+      const invalidation = f.assistant.observe('a');
+      release.resolve();
+      const result = await read as { items: { sessionId: string }[] };
+      await invalidation;
+      assert.deepEqual(result.items.map(item => item.sessionId), ['b']);
+      assert.deepEqual(f.store.inbox().map(item => item.session_id), ['a']);
+      assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 0 });
+      assert.equal(f.store.inbox().length, unloaded ? 1 : 0);
+    } finally { release.resolve(); f.close(); }
+  }
+});
+test('source resumption during another source lookup invalidates notice eligibility before reservation', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    f.topic('one', 'a'); f.topic('two', 'b');
+    for (const id of ['a', 'b']) f.store.enqueue({
+      session_id: id, native_id: id, kind: 'reply', text: id, attachments: [], question: null,
+    });
+    let paused = false;
+    f.onMeta(async id => { if (id === 'b' && !paused) { paused = true; entered.resolve(); await release.promise; } });
+    const notice = f.assistant.notify();
+    await entered.promise;
+    f.sessions.get('a')!.status = 'running'; f.sessions.get('a')!.activity!.processing = true;
+    const resumed = f.assistant.observe('a', message('resumed-progress'));
+    release.resolve();
+    await Promise.all([notice, resumed]);
+    assert.equal(f.calls.length, 1);
+    assert.doesNotMatch((f.calls[0]!.body as { text: string }).text, /"sessionId":"a"/);
+    assert.deepEqual(f.store.inbox().filter(item => item.session_id === 'a').map(item => item.notice_state), ['pending', 'pending']);
+    f.sessions.get('a')!.status = 'idle'; f.sessions.get('a')!.activity!.processing = false;
+    await f.assistant.observe('a', { id: 'idle', type: 'session.idle', ephemeral: true, data: {} });
+    assert.equal(f.calls.length, 2);
+  } finally { release.resolve(); f.close(); }
 });

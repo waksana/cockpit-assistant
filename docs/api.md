@@ -78,6 +78,18 @@ Native attachments on the genuine source input are forwarded as descriptors.
 No preview URL is converted into a path and no second attachment store exists.
 Native ask answers require the complete original human words in a single-topic
 dispatch; attached or mixed answers are rejected, never silently changed.
+Ordinary business dispatch uses native `immediate`: when busy, the target receives
+steering in its current run, not a forced restart or independent parallel task.
+Ask answers still use `respondAsk`. Neither operation clears existing queues or
+replays uncertain deliveries. Foreground result reminders remain `enqueue`.
+
+Ordinary reminders wait for source idle (or a settled native error), then for an
+idle foreground. A valid native question bypasses the source-idle wait. Inbox
+reads revalidate questions: stale ones are no longer offered; unavailable
+unloaded questions stay unread without being presented as live. `peek` and
+`hasMore` count currently readable entries, excluding unavailable questions.
+Explicit reads may include accumulated partial replies before idle; do not infer
+business completion from a read or reminder. See [notification semantics](architecture.md#inbox-and-notices).
 
 MCP success means the stated local operation or native acceptance, not successful
 business completion. Transport uncertainty is not permission to repeat a send.

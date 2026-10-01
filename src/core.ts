@@ -52,8 +52,16 @@ const worker = (meta: PublicSessionMeta | null): meta is PublicSessionMeta => !!
   && (Array.isArray(meta.roles) || Array.isArray(meta.appliedRoles))
   && ![...(meta.roles ?? []), ...(meta.appliedRoles ?? [])].some(role =>
     role.moduleId === 'assistant' && role.roleId !== 'worker');
-const primary = (event: NativeChatEvent) => !event.ephemeral && !event.agentId && !event.parentToolCallId
+const rootEvent = (event: NativeChatEvent) => !event.agentId && !event.parentToolCallId
   && !event.data.agentId && !event.data.parentToolCallId;
+const primary = (event: NativeChatEvent) => !event.ephemeral && rootEvent(event);
+const settled = (meta: PublicSessionMeta) => meta.loaded && ['idle', 'error'].includes(meta.status)
+  && !!meta.activity && !meta.activity.hasActiveWork && !meta.activity.processing
+  && meta.activity.queue.pendingCount === 0 && meta.activity.queue.steeringCount === 0
+  && meta.activity.queue.inFlightSteeringCount === 0 && !meta.ask;
+const liveQuestion = (meta: PublicSessionMeta | null | undefined, question: Incoming['question']) =>
+  !!meta?.loaded && worker(meta) && !!meta.ask
+  && fingerprint(questionIdentity(meta.ask)) === fingerprint(questionIdentity(question));
 function historyExcerpt(text: string): string {
   let low = 0, high = Math.min(text.length, 3000);
   while (low < high) {
@@ -88,6 +96,9 @@ export class Assistant {
   private notice: Promise<void> | null = null;
   private noticeAgain = false;
   private creations = new Map<string, Promise<string>>();
+  private observations = new Map<string, Promise<void>>();
+  private awaitingIdle = new Set<string>();
+  private sourceVersions = new Map<string, number>();
   private stopped = false;
   constructor(readonly store: Store, readonly native: Gateway, readonly config: Config,
     readonly report: (error: unknown) => void) {}
@@ -106,8 +117,11 @@ export class Assistant {
       case 'assistant_inbox': {
         requireFact(caller.role === 'coordinator', 'FOREGROUND_REQUIRED', 'Only the Assistant foreground reads the inbox', 403);
         const query = inboxInput.parse(input ?? {});
-        if (query.peek) return { count: this.store.inbox().length };
-        const result = this.store.take(`${caller.sessionId}:${caller.toolCallId}`, query.limit, query.ids);
+        const sources = await this.refreshQuestions();
+        const available = new Set(this.store.inbox().filter(item => item.kind !== 'ask'
+          || liveQuestion(this.currentSample(item.session_id, sources.get(item.session_id)), item.question)).map(item => item.id));
+        if (query.peek) return { count: available.size };
+        const result = this.store.take(`${caller.sessionId}:${caller.toolCallId}`, query.limit, query.ids, available);
         return { ...result, items: result.items.map(item => ({
           id: item.id, sessionId: item.session_id, nativeMessageId: item.native_id, type: item.kind,
           text: item.text, attachments: item.attachments, question: item.question,
@@ -270,7 +284,7 @@ export class Assistant {
           requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before worker prompt', 503);
           row.mode = 'prompt'; this.store.finish(row);
           called = true;
-          const result = await this.native.host.call('prompt', { sessionId, mode: 'enqueue', text: prompt,
+          const result = await this.native.host.call('prompt', { sessionId, mode: 'immediate', text: prompt,
             ...(source.attachments.length ? { attachments: source.attachments } : {}) });
           row.native_message_id = result.messageId ?? null; row.result = result;
           row.state = !result.ok ? 'rejected' : result.messageId ? 'accepted' : 'unknown';
@@ -331,10 +345,23 @@ export class Assistant {
       throw error;
     }
   }
-  async observe(sessionId: string, event?: NativeChatEvent): Promise<void> {
-    if (this.stopped) return;
+  observe(sessionId: string, event?: NativeChatEvent): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     if (event) this.native.observe(sessionId, event);
-    if (!this.store.managed(sessionId)) return;
+    if (!this.store.managed(sessionId)) return Promise.resolve();
+    this.sourceVersions.set(sessionId, (this.sourceVersions.get(sessionId) ?? 0) + 1);
+    // Native callbacks may overlap while metadata is awaited. Drain each source
+    // in event order so an idle wake cannot reserve only the first of its replies.
+    const run = () => this.observeSource(sessionId, event);
+    const previous = this.observations.get(sessionId);
+    const operation = previous ? previous.then(run, run) : run();
+    this.observations.set(sessionId, operation);
+    const finished = () => { if (this.observations.get(sessionId) === operation) this.observations.delete(sessionId); };
+    void operation.then(finished, finished);
+    return operation;
+  }
+  private async observeSource(sessionId: string, event?: NativeChatEvent): Promise<void> {
+    if (this.stopped) return;
     const meta = await this.native.session(sessionId);
     if (!worker(meta)) return;
     if (event && primary(event) && event.type === 'assistant.message'
@@ -342,11 +369,42 @@ export class Assistant {
       const item: Incoming = { session_id: sessionId, native_id: typeof event.data.messageId === 'string' ? event.data.messageId : event.id,
         kind: 'reply', text: typeof event.data.content === 'string' ? event.data.content : '',
         attachments: attachmentsSchema.parse(event.data.attachments ?? []), question: null };
-      this.store.enqueue(item);
+      if (this.store.enqueue(item)) this.awaitingIdle.add(sessionId);
     }
+    if (event && primary(event) && ['abort', 'session.error'].includes(event.type)) {
+      const detail = event.type === 'abort' ? 'Native processing was interrupted.'
+        : `Native processing reported an error: ${typeof event.data.message === 'string' ? event.data.message : 'No error text supplied'}`;
+      if (this.store.enqueue({ session_id: sessionId, native_id: event.id, kind: 'reply',
+        text: `${detail}\nEarlier output may be incomplete; this is not a successful completion receipt.`,
+        attachments: [], question: null })) this.awaitingIdle.add(sessionId);
+    }
+    if (event && rootEvent(event) && event.type === 'session.idle'
+      || meta.status === 'error' && settled(meta)) this.awaitingIdle.delete(sessionId);
     if (meta.ask) this.store.enqueue({ session_id: sessionId, native_id: meta.ask.requestId, kind: 'ask',
       text: meta.ask.question, attachments: [], question: meta.ask });
     await this.notify();
+  }
+  private async sampleSource(sessionId: string) {
+    const version = this.sourceVersions.get(sessionId) ?? 0;
+    return { version, meta: await this.native.session(sessionId) };
+  }
+  private currentSample(sessionId: string, sample?: { version: number; meta: PublicSessionMeta | null }) {
+    return sample && sample.version === (this.sourceVersions.get(sessionId) ?? 0) ? sample.meta : null;
+  }
+  private async refreshQuestions() {
+    const sessions = new Map<string, Awaited<ReturnType<Assistant['sampleSource']>>>();
+    for (const item of this.store.inbox()) {
+      if (item.kind !== 'ask') continue;
+      if (!sessions.has(item.session_id)) sessions.set(item.session_id, await this.sampleSource(item.session_id));
+    }
+    for (const item of this.store.inbox()) {
+      if (item.kind !== 'ask') continue;
+      const meta = this.currentSample(item.session_id, sessions.get(item.session_id));
+      // Keep unavailable questions unread without presenting them as live decisions.
+      if (meta?.loaded && fingerprint(questionIdentity(meta.ask)) !== fingerprint(questionIdentity(item.question)))
+        this.store.discardQuestions([item.id]);
+    }
+    return sessions;
   }
   notify(): Promise<void> {
     if (this.stopped) return Promise.resolve();
@@ -366,11 +424,28 @@ export class Assistant {
     const meta = await this.native.foreground();
     if (this.stopped || !meta?.loaded || meta.status !== 'idle' || !meta.activity || meta.activity.hasActiveWork
       || meta.activity.processing || meta.ask || !activeRole(meta, 'coordinator')) return;
-    const notice = this.store.reserveNotice();
+    const sources = await this.refreshQuestions(), eligible = new Set<string>();
+    for (const item of this.store.inbox()) {
+      if (item.notice_state !== 'pending') continue;
+      if (!sources.has(item.session_id)) sources.set(item.session_id, await this.sampleSource(item.session_id));
+    }
+    // Later source lookups may yield to a decision change or a new native run.
+    // Recheck observations and the live idle latch without another async gap.
+    for (const item of this.store.inbox()) {
+      if (item.notice_state !== 'pending') continue;
+      const source = this.currentSample(item.session_id, sources.get(item.session_id));
+      if (worker(source) && source.loaded
+        && (item.kind === 'ask' ? liveQuestion(source, item.question)
+          : !this.awaitingIdle.has(item.session_id) && settled(source))) eligible.add(item.id);
+    }
+    if (this.stopped) return;
+    const notice = this.store.reserveNotice(eligible);
     if (!notice) return;
     try {
       const result = await this.native.host.call('prompt', { sessionId: meta.sessionId, mode: 'enqueue',
-        text: `New topic results are available. Read assistant_inbox; this is not a new business request.\n${JSON.stringify(
+        text: `Topic updates or a current question are available. Read assistant_inbox; this is not a new business request. `
+          + `Only present new information or real state changes. An empty or wholly repeated result needs no reply. `
+          + `Source idle is not evidence of business success.\n${JSON.stringify(
           notice.items.map(item => ({ id: item.id, sessionId: item.session_id, kind: item.kind })))}` });
       this.store.settleNotice(notice.id, result.messageId ?? null, result.ok);
       requireFact(result.ok && result.messageId, 'NOTICE_UNKNOWN', 'Notification receipt is unavailable; inspect the native session without replay');

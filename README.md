@@ -9,6 +9,10 @@ The service owns topic mappings, native delivery, an unread inbox and lightweigh
 result reminders. Reading returns and consumes inbox entries atomically. Native
 session Chat remains the history source and can be consulted again at any time.
 Worker reports do not authorize additional work or answers on the user's behalf.
+Ordinary updates wait for source idle and an available foreground; current native
+questions bypass the source-idle wait. The Skill presents meaningful new facts
+and state changes naturally, without routine routing reports or duplicate ACKs.
+Business inputs use native `immediate` steering; foreground reminders use `enqueue`.
 
 Select the Assistant role when creating a native session. The role's exclusive
 resource policy connects only its Assistant MCP and enables only its topic Skill.
@@ -51,3 +55,15 @@ and legacy-preset creation through the real Engine, initialized ordinary tools,
 binding, a first harmless prompt/reply and duplicate-send prevention. Only the
 foreground caller evidence is synthetic. It uses temporary homes and an assigned
 free port, has no user credentials, and removes its fixtures after success.
+
+The corresponding notification/steering check uses the same isolation boundary:
+
+```sh
+node --import tsx scripts/native-response-check.mjs /absolute/host-installation
+```
+
+It exercises a real native tool loop, queued A/B without an idle gap, and busy
+`immediate` steering C/D. Source prompts, events, control invalidations and idle
+state use the real Engine; the foreground caller and reminder acceptance are
+synthetic. No real business or production inbox is involved. Both scripts should
+run serially with the resource and timeout limits described above.

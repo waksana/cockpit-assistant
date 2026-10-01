@@ -201,21 +201,28 @@ export class Store {
     });
   }
   inbox(): InboxItem[] { return this.sql.prepare('SELECT * FROM mailbox ORDER BY sequence').all().map(row => inboxRow.parse(row)); }
-  take(callId: string, limit: number, ids?: string[]) {
+  take(callId: string, limit: number, ids?: string[], available?: ReadonlySet<string>) {
     return this.transaction(() => {
       const key = `read:${callId}`, hash = fingerprint({ limit, ids: ids ?? null });
       if (this.seen(key, hash)) {
-        return { items: [], alreadyRead: true, hasMore: this.inbox().length > 0 };
+        return { items: [], alreadyRead: true, hasMore: this.inbox().some(item => !available || available.has(item.id)) };
       }
-      const pending = this.inbox(), selected = pending.filter(item => !ids || ids.includes(item.id)).slice(0, limit);
+      const pending = this.inbox().filter(item => !available || available.has(item.id));
+      const selected = pending.filter(item => !ids || ids.includes(item.id)).slice(0, limit);
       for (const item of selected) this.sql.prepare('DELETE FROM mailbox WHERE id=?').run(item.id);
       this.remember(key, hash);
       return { items: selected, alreadyRead: false, hasMore: pending.length > selected.length };
     });
   }
-  reserveNotice(): { id: string; items: InboxItem[] } | null {
+  discardQuestions(ids: readonly string[]): void {
+    this.transaction(() => {
+      for (const id of ids) this.sql.prepare("DELETE FROM mailbox WHERE id=? AND kind='ask'").run(id);
+    });
+  }
+  reserveNotice(eligible?: ReadonlySet<string>): { id: string; items: InboxItem[] } | null {
     return this.transaction(() => {
-      const items = this.inbox().filter(item => item.notice_state === 'pending').slice(0, 50);
+      const items = this.inbox().filter(item => item.notice_state === 'pending'
+        && (!eligible || eligible.has(item.id))).slice(0, 50);
       if (!items.length) return null;
       const id = randomUUID();
       for (const item of items) this.sql.prepare("UPDATE mailbox SET notice_state='calling',notice_id=? WHERE id=?").run(id, item.id);

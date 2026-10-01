@@ -66,7 +66,8 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
       store.recover(); ready = true;
       await track(() => assistant.notify());
     },
-    events: { types: ['user.message', 'assistant.message'], handle(observation: Parameters<NonNullable<ModuleBackend['events']>['handle']>[0]) {
+    events: { types: ['user.message', 'assistant.message', 'session.idle', 'session.error', 'abort'],
+      handle(observation: Parameters<NonNullable<ModuleBackend['events']>['handle']>[0]) {
       if (ready) return track(() => assistant.observe(observation.sessionId, observation.event));
     } },
     controlEvents: { types: ['session/patch', 'session/invalidated'] as ('session/patch' | 'session/invalidated')[],

@@ -202,6 +202,7 @@ export class Assistant {
           const result = await this.native.host.call('respondAsk', { sessionId, requestId: question.requestId, answer, wasFreeform: !choice });
           row.result = result; row.state = result.ok ? 'accepted' : 'rejected';
         } else {
+          requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before worker prompt', 503);
           row.mode = 'prompt'; this.store.finish(row);
           called = true;
           const result = await this.native.host.call('prompt', { sessionId, mode: 'enqueue', text: prompt,
@@ -281,19 +282,20 @@ export class Assistant {
     await this.notify();
   }
   notify(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     if (this.notice) { this.noticeAgain = true; return this.notice; }
-    this.notice = this.sendNotice().finally(() => {
-      this.notice = null;
-      if (this.noticeAgain && !this.stopped) {
-        this.noticeAgain = false; void this.notify().catch(this.report);
-      }
-    });
+    this.notice = (async () => {
+      do {
+        this.noticeAgain = false;
+        await this.sendNotice();
+      } while (this.noticeAgain && !this.stopped);
+    })().finally(() => { this.notice = null; });
     return this.notice;
   }
   private async sendNotice(): Promise<void> {
     if (this.stopped || !this.store.inbox().some(item => item.notice_state === 'pending')) return;
     const meta = await this.native.foreground();
-    if (!meta?.loaded || meta.status !== 'idle' || !meta.activity || meta.activity.hasActiveWork
+    if (this.stopped || !meta?.loaded || meta.status !== 'idle' || !meta.activity || meta.activity.hasActiveWork
       || meta.activity.processing || meta.ask || !activeRole(meta, 'coordinator')) return;
     const notice = this.store.reserveNotice();
     if (!notice) return;

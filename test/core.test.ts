@@ -224,3 +224,56 @@ test('a notice in flight cannot restore consumed items or lose another result ar
     assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
   } finally { release.resolve(); f.close(); }
 });
+
+test('the original notification promise drains follow-up sends and records their receipts before shutdown', async () => {
+  const f = fixture(), firstEntered = deferred(), firstRelease = deferred(), nextEntered = deferred(), nextRelease = deferred();
+  try {
+    const enqueue = (native_id: string) => f.store.enqueue({
+      session_id: 'a', native_id, kind: 'reply', text: native_id, attachments: [], question: null,
+    });
+    let calls = 0, finished = false;
+    f.onCall(async name => {
+      if (name !== 'prompt') return;
+      if (++calls === 1) { firstEntered.resolve(); await firstRelease.promise; }
+      else { nextEntered.resolve(); await nextRelease.promise; }
+    });
+    enqueue('first');
+    const notification = f.assistant.notify().then(() => { finished = true; });
+    await firstEntered.promise;
+    enqueue('second');
+    const continuation = f.assistant.notify();
+    firstRelease.resolve(); await nextEntered.promise;
+    assert.equal(finished, false);
+    assert.equal(f.store.inbox()[1]!.notice_state, 'calling');
+    f.assistant.stop();
+    nextRelease.resolve();
+    await notification; await continuation;
+    assert.equal(finished, true);
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['notified', 'notified']);
+    assert.deepEqual(f.errors, []);
+  } finally { firstRelease.resolve(); nextRelease.resolve(); f.close(); }
+});
+test('stopping during original worker load prevents a subsequent new business prompt', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    f.topic('topic', 'a'); f.sessions.get('a')!.loaded = false;
+    f.onCall(async name => { if (name === 'session/load') { entered.resolve(); await release.promise; } });
+    const dispatch = f.invoke('assistant_dispatch', { items: [{ topicId: 'topic', prompt: 'Business' }] });
+    await entered.promise; f.assistant.stop(); release.resolve(); await dispatch;
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load']);
+    assert.equal(f.store.deliveries('assistant', 'human-message')[0]!.state, 'rejected');
+  } finally { release.resolve(); f.close(); }
+});
+test('stopping during foreground discovery does not reserve or send a fresh notification', async t => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    f.store.enqueue({ session_id: 'a', native_id: 'new', kind: 'reply', text: 'New', attachments: [], question: null });
+    t.mock.method(f.assistant.native, 'foreground', async () => {
+      entered.resolve(); await release.promise; return f.sessions.get('assistant')!;
+    });
+    const sending = f.assistant.notify();
+    await entered.promise; f.assistant.stop(); release.resolve(); await sending;
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+  } finally { release.resolve(); f.close(); }
+});

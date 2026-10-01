@@ -12,6 +12,8 @@ try {
   assert.equal(manifest.frontend, undefined);
   const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], { encoding: 'utf8' }));
   const files = new Set(pack.files.map(file => file.path));
+  assert.ok(!manifest.roles.some(role => role.id === 'worker'));
+  assert.ok(!files.has('roles/worker.md') && !files.has('dist/roles/worker.md'));
   for (const path of [manifest.backend,
     'cockpit.module.json', 'README.md', 'dist/migrate.js',
     'skills/assistant-topics/SKILL.md', ...manifest.roles.map(role => role.instructions)]) {

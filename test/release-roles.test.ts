@@ -42,7 +42,9 @@ test('shared topic Skill is physically embedded in each role without requiring a
     assert.equal(role('organizer').instructions, 'dist/roles/organizer.md');
     assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_dispatch'));
     assert.ok(!role('organizer').mcpServers.assistant.tools.includes('assistant_dispatch'));
-    assert.equal(role('worker').mcpServers, undefined);
+    assert.equal(role('worker'), undefined);
+    assert.equal(role('coordinator').mcpServers.assistant.tools.length, 6);
+    assert.equal(role('organizer').mcpServers.assistant.tools.length, 3);
     assert.equal(manifest.instructions, undefined, 'The foreground role must not be injected into all native sessions');
     assert.equal(manifest.frontend, undefined);
   } finally { await rm(root, { recursive: true, force: true }); }

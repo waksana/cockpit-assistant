@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { McpInvocationMeta, ModuleHostApi, ModuleHostIntent, ModuleHostIntentBody,
   ModuleHostIntentResult, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
-import { Assistant, configInput } from '../src/core.ts';
+import { Assistant, configInput, type Config } from '../src/core.ts';
 import type { Caller, Gateway, Input } from '../src/gateway.ts';
 import { mcp } from '../src/mcp.ts';
 import { Store, type Delivery, type Topic } from '../src/store.ts';
@@ -20,7 +20,7 @@ function deferred() {
   const promise = new Promise<void>(done => { resolve = done; });
   return { promise, resolve };
 }
-function fixture() {
+function fixture(config: Partial<Config> = {}) {
   const store = new Store(':memory:'), calls: { name: string; body: unknown }[] = [], errors: unknown[] = [];
   const meta = (id: string): PublicSessionMeta => ({
     sessionId: id, title: id, cwd: '/synthetic', loaded: true, status: 'idle', ask: null, lastActivity: 0,
@@ -71,7 +71,7 @@ function fixture() {
     async foreground() { return sessions.get('assistant')!; },
     observe() {},
   };
-  const assistant = new Assistant(store, native, configInput.parse({ defaultCwd: '/synthetic' }), error => errors.push(error));
+  const assistant = new Assistant(store, native, configInput.parse({ defaultCwd: '/synthetic', ...config }), error => errors.push(error));
   const topic = (id: string, sessionId: string | null): Topic => store.saveTopic({ id, title: id, content: '',
     version: 1, archived: false, session_id: sessionId, mapping_state: sessionId ? 'bound' : 'unbound', mapping_error: null, creation_receipt: null });
   return { store, assistant, sessions, calls, errors, topic,
@@ -127,7 +127,7 @@ test('one compound native user input delivers its complete split and attachments
       { code: 'FROZEN_DISPATCH' });
   } finally { f.close(); }
 });
-test('the existing unloaded worker keeps its ID and a new topic uses the actual persistent template', async () => {
+test('existing sessions keep their IDs and new topics create ordinary sessions without injected roles or scope', async () => {
   const f = fixture();
   try {
     f.topic('old', 'a'); f.topic('new', null); f.sessions.get('a')!.loaded = false;
@@ -135,9 +135,12 @@ test('the existing unloaded worker keeps its ID and a new topic uses the actual 
     assert.equal(f.store.topic('old').session_id, 'a');
     assert.deepEqual(f.calls.filter(call => call.name === 'session/load').map(call => call.body), [{ sessionId: 'a' }]);
     const create = f.calls.find(call => call.name === 'session/new')!;
-    assert.deepEqual(create.body, { cwd: '/synthetic', roles: [{ moduleId: 'assistant', roleId: 'worker' }],
-      toolScope: { builtins: ['view', 'grep', 'glob', 'bash', 'apply_patch', 'ask_user', 'skill'], mcpServers: [] } });
+    assert.deepEqual(create.body, { cwd: '/synthetic' });
     assert.equal(f.store.topic('new').session_id, 'worker-1');
+    assert.deepEqual(f.calls.filter(call => call.name === 'prompt').map(call => call.body), [
+      { sessionId: 'a', mode: 'enqueue', text: 'Old target' },
+      { sessionId: 'worker-1', mode: 'enqueue', text: 'New target' },
+    ]);
   } finally { f.close(); }
 });
 test('lost creation or prompt receipts are unknown and never automatically repeated', async () => {
@@ -153,7 +156,116 @@ test('lost creation or prompt receipts are unknown and never automatically repea
       assert.equal(f.calls.length, count);
       assert.equal(f.store.deliveries('assistant', 'human-message')[0]!.state, 'unknown');
       if (create) assert.deepEqual(f.store.topic('topic').creation_receipt,
-        { error: 'Synthetic lost receipt', sessionId: 'partially-created' });
+        { stage: 'creation', promptAttempted: false, error: 'Synthetic lost receipt', sessionId: 'partially-created' });
+    } finally { f.close(); }
+  }
+});
+test('only the exact old built-in worker preset retires its private scope; custom selections survive', async () => {
+  const retired = { moduleId: 'assistant', roleId: 'worker' };
+  const selected = { moduleId: 'example', roleId: 'reader' };
+  const oldScope = { builtins: ['view', 'grep', 'glob', 'bash', 'apply_patch', 'ask_user', 'skill'], mcpServers: [] };
+  const customScope = { builtins: ['view'], mcpServers: [{ name: 'catalog', tools: ['lookup'] }] };
+  const cases = [
+    { worker: { cwd: '/original', roles: [retired], toolScope: oldScope }, body: { cwd: '/original' } },
+    { worker: { roles: [retired] }, body: { cwd: '/synthetic' } },
+    { worker: { roles: [selected] }, body: { cwd: '/synthetic', roles: [selected] } },
+    { worker: { roles: [retired, selected], toolScope: oldScope },
+      body: { cwd: '/synthetic', roles: [selected], toolScope: oldScope } },
+    { worker: { roles: [retired], toolScope: customScope }, body: { cwd: '/synthetic', toolScope: customScope } },
+    { worker: { toolScope: oldScope }, body: { cwd: '/synthetic', toolScope: oldScope } },
+    { worker: { toolScope: { builtins: [], mcpServers: [] } },
+      body: { cwd: '/synthetic', toolScope: { builtins: [], mcpServers: [] } } },
+  ];
+  for (const { worker, body } of cases) {
+    const original = structuredClone(worker), f = fixture({ worker });
+    try {
+      f.topic('new', null);
+      await f.invoke('assistant_dispatch', { items: [{ topicId: 'new', prompt: 'One request' }] });
+      assert.deepEqual(f.calls[0], { name: 'session/new', body });
+      assert.equal(f.store.deliveries('assistant', 'human-message')[0]!.state, 'accepted');
+      assert.deepEqual(f.assistant.config.worker, original, 'Compatibility does not rewrite saved configuration');
+    } finally { f.close(); }
+  }
+  assert.throws(() => configInput.parse({ worker: { model: 'unsupported' } }));
+  assert.throws(() => configInput.parse({ worker: { roles: [{ ...retired, unknown: true }] } }));
+});
+test('custom scope failures retain the created ID and readiness phase without sending or widening history', async () => {
+  const f = fixture({ worker: { toolScope: { builtins: ['view'], mcpServers: [] } } });
+  try {
+    f.topic('new', null);
+    f.onCall(async name => {
+      if (name === 'session/new') throw Object.assign(new Error('Tool scope violation: undeclared native tool bash'),
+        { code: 'SESSION_CREATION_INCOMPLETE', sessionId: 'created-before-readback' });
+    });
+    const query = { items: [{ topicId: 'new', prompt: 'One request' }] };
+    await f.invoke('assistant_dispatch', query);
+    const row = f.store.deliveries('assistant', 'human-message')[0]!;
+    assert.equal(row.state, 'unknown');
+    assert.equal(row.mode, null);
+    assert.equal(row.native_message_id, null);
+    const status = await f.invoke('assistant_status', { topicId: 'new' }) as {
+      topic: { sessionId: string | null; creationReceipt: unknown }; session: unknown;
+    };
+    assert.equal(status.topic.sessionId, null);
+    assert.equal(status.session, null);
+    assert.deepEqual(status.topic.creationReceipt, {
+      stage: 'readiness', promptAttempted: false, error: 'Tool scope violation: undeclared native tool bash',
+      code: 'SESSION_CREATION_INCOMPLETE', sessionId: 'created-before-readback',
+    });
+    await f.invoke('assistant_dispatch', query);
+    f.input({ messageId: 'another-user-input' });
+    await f.invoke('assistant_dispatch', query);
+    await assert.rejects(f.invoke('assistant_history', { sessionId: 'created-before-readback' }), { code: 'HISTORY_SCOPE' });
+    assert.deepEqual(f.calls.map(call => call.name), ['session/new']);
+  } finally { f.close(); }
+});
+test('removed saved worker roles are not silently rewritten, loaded or replaced', async () => {
+  const f = fixture();
+  try {
+    f.topic('old', 'a'); f.sessions.get('a')!.loaded = false;
+    f.sessions.get('a')!.roles = [{ moduleId: 'assistant', roleId: 'worker', name: 'Legacy', moduleName: 'Assistant' }];
+    await f.invoke('assistant_dispatch', { items: [{ topicId: 'old', prompt: 'One request' }] });
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.store.topic('old').session_id, 'a');
+    const row = f.store.deliveries('assistant', 'human-message')[0]!;
+    assert.equal(row.state, 'rejected');
+    assert.match(row.error!, /removed assistant\/worker role/);
+    f.sessions.get('a')!.loaded = true; f.input({ messageId: 'loaded-request' });
+    await f.invoke('assistant_dispatch', { items: [{ topicId: 'old', prompt: 'Existing loaded target' }] });
+    assert.deepEqual(f.calls.map(call => call.name), ['prompt']);
+  } finally { f.close(); }
+});
+test('binding failure retains the successfully created identity without sending a prompt', async t => {
+  const f = fixture();
+  try {
+    f.topic('new', null);
+    const save = f.store.saveTopic.bind(f.store);
+    t.mock.method(f.store, 'saveTopic', (topic: Topic) => {
+      if (topic.mapping_state === 'bound') throw new Error('Synthetic binding write failure');
+      return save(topic);
+    });
+    await f.invoke('assistant_dispatch', { items: [{ topicId: 'new', prompt: 'One request' }] });
+    assert.deepEqual(f.store.topic('new').creation_receipt, {
+      stage: 'binding', promptAttempted: false, error: 'Synthetic binding write failure', sessionId: 'worker-1',
+    });
+    assert.equal(f.store.topic('new').mapping_state, 'unknown');
+    assert.deepEqual(f.calls.map(call => call.name), ['session/new']);
+  } finally { f.close(); }
+});
+test('new session configuration cannot select foreground roles or their communication tools', async () => {
+  for (const worker of [
+    { roles: [{ moduleId: 'assistant', roleId: 'coordinator' }] },
+    { roles: [{ moduleId: 'assistant', roleId: 'organizer' }] },
+    { roles: [{ moduleId: 'assistant', roleId: 'unknown' }] },
+    { toolScope: { builtins: [], mcpServers: [{ name: 'assistant', tools: ['assistant_dispatch'] }] } },
+    { toolScope: { builtins: [], mcpServers: [{ name: 'cockpit', tools: ['cockpit_send_prompt'] }] } },
+  ]) {
+    const f = fixture({ worker });
+    try {
+      f.topic('new', null);
+      await f.invoke('assistant_dispatch', { items: [{ topicId: 'new', prompt: 'One request' }] });
+      assert.equal(f.calls.length, 0);
+      assert.equal(f.store.deliveries('assistant', 'human-message')[0]!.state, 'rejected');
     } finally { f.close(); }
   }
 });

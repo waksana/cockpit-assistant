@@ -17,7 +17,9 @@ export function preservedSchema(version) {
   } finally { db.close(); }
 }
 export const preservedTopics = () => preservedSchema(3).filter(({ table }) => table === 'topics');
-export const schema5Migrations = [3, 4].map(from => ({
+// The deployment contract permits one source-to-target migration per database.
+// Schema 3 remains supported by the explicitly invoked offline utility.
+export const schema5Migrations = [4].map(from => ({
   database: 'assistant.sqlite', from, to: 5, nondestructive: true,
   preflight: { entry: 'dist/migrate.js', args: ['preflight', { path: 'data' }],
     expected: { ok: true, phase: 'preflight', from, to: 5 } },

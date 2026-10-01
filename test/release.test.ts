@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 // @ts-expect-error Release scripts execute directly in Node; they are not part of the TS runtime.
-import { identity, repository, checkEvent, assetNames, hash, verifyAssets, product } from '../scripts/release-contract.mjs';
+import { identity, repository, checkEvent, assetNames, hash, verifyAssets, product, assertMigrationTargets } from '../scripts/release-contract.mjs';
 // @ts-expect-error Release scripts execute directly in Node; they are not part of the TS runtime.
 import { publish, snapshot } from '../scripts/release.mjs';
 // @ts-expect-error Migration declaration helpers run directly in Node.
@@ -131,6 +131,19 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   assert.ok(!actual.requiredIntents.includes('session/resources-prepare'));
   assert.ok(actual.requiredIntents.includes('respondAsk'));
   assert.deepEqual(actual.migrations, schema5Migrations);
+  assert.equal(actual.migrations.length, 1, 'The deployer accepts one automatic source per database');
+  assert.equal(actual.migrations[0].from, 4);
+  assert.equal(actual.migrations[0].to, 5);
+  assert.equal(actual.migrations[0].database, 'assistant.sqlite');
+  assert.throws(() => assertMigrationTargets({
+    ...actual, migrations: [...actual.migrations, { ...actual.migrations[0], from: 3 }],
+  }), /one automatic migration/);
+  assert.throws(() => assertMigrationTargets({
+    ...actual, migrations: [{ ...actual.migrations[0], to: 6 }],
+  }), /declared final schema/);
+  assert.throws(() => assertMigrationTargets({
+    ...actual, migrations: [{ ...actual.migrations[0], database: 'missing.sqlite' }],
+  }), /declared final schema/);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
   assert.equal(actual.databases[0].schema, 5);
   assert.deepEqual(actual.databases[0].preserve, preservedTopics());

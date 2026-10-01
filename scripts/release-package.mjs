@@ -15,6 +15,7 @@ export async function packageRelease(root, sequence, sourceSha, output = 'releas
   assert.match(output, /^[a-z][a-z0-9-]*$/);
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   const manifest = JSON.parse(readFileSync(join(root, 'cockpit.module.json'), 'utf8'));
+  assert.equal(manifest.frontend, undefined, 'Native Chat Assistant has no module frontend');
   const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'));
   for (const version of [pkg.version, manifest.version, lock.version, lock.packages[''].version]) {
     assert.equal(version, '0.0.0-dev', 'Source manifests keep the development version');
@@ -43,9 +44,8 @@ export async function packageRelease(root, sequence, sourceSha, output = 'releas
       writeFileSync(join(directory, `${name}.sha256`), `${hash(readFileSync(join(directory, name)))}  ${name}\n`);
     }
     verifyAssets(directory, expected, descriptor.product);
-    // npm pack:check owns the isolated backend/frontend closure test in CI.
+    // npm pack:check owns the isolated backend and migration closure tests in CI.
     assert.equal(typeof (await import(pathToFileURL(join(stage, manifest.backend)).href)).activate, 'function');
-    assert.equal(typeof (await import(pathToFileURL(join(stage, manifest.frontend.entry)).href)).activate, 'function');
     return descriptor;
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });

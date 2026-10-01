@@ -94,7 +94,7 @@ export function verifyAssets(directory, expected, expectedProduct) {
     assert.equal(value.version, expected.version);
     if (name === 'module-build.json') {
       assert.equal(value.sourceSha, expected.sourceSha);
-      assert.equal(value.sdk, '0.12.0');
+      assert.equal(value.sdk, '0.13.0');
       assert.equal(value.platform, 'linux');
       assert.match(value.node, /^24\./);
     }

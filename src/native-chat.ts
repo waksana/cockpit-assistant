@@ -1,10 +1,9 @@
-import type { McpInvocationMeta, ModuleHostApi, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
+import type { McpInvocationMeta, ModuleHostApi, NativeChatEvent, PublicSessionMeta, PromptAccepted } from '@waksana/cockpit-module-sdk/backend';
 import { attachmentsSchema } from './attachments.ts';
 import { requireFact } from './errors.ts';
 import type { Caller, Gateway } from './gateway.ts';
 import { Store, fingerprint } from './store.ts';
 
-type Accepted = { sessionId: string; messageId: string; origin: 'user' | 'module' | 'api'; acceptedAt: number };
 const primary = (event: NativeChatEvent) => !event.ephemeral && !event.agentId && !event.parentToolCallId
   && !event.data.agentId && !event.data.parentToolCallId;
 const roleOf = (meta: PublicSessionMeta | null): Caller['role'] | null => {
@@ -36,7 +35,7 @@ export class NativeChat implements Gateway {
     if (!events.some(old => old.id === event.id)) events.push(event);
     this.events.set(sessionId, events.slice(-64));
   }
-  async accepted(event: Accepted): Promise<void> {
+  async accepted(event: PromptAccepted): Promise<void> {
     const meta = await this.session(event.sessionId), role = roleOf(meta);
     if (!role) return;
     this.tracked.add(event.sessionId);

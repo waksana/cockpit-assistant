@@ -12,8 +12,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
   requireFact(context.serviceReadyVersion === 1 && host.chatReadVersion === 1 && host.askResponseVersion === 1
     && host.roleAssignmentVersion === 1 && host.sessionLoadVersion === 1
     && host.promptReceiptVersion === 1 && host.toolScopeVersion === 1
-    && 'promptOriginVersion' in host && host.promptOriginVersion === 1
-    && 'roleResourcePolicyVersion' in host && host.roleResourcePolicyVersion === 1,
+    && host.promptOriginVersion === 1 && host.roleResourcePolicyVersion === 1,
   'HOST_CAPABILITY', 'Native Chat Assistant needs prompt-origin observations and exclusive role resources');
   const config = configInput.parse(context.config), release = await acquireLease(context.dataRoot);
   let store: Store;
@@ -45,7 +44,7 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
       protocolVersion: 5, chat: '/intent/session/chat', input: '/intent/prompt',
     } }),
   })));
-  const backend = {
+  const backend: ModuleBackend = {
     publicConfig: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'consume-on-read', frontend: false },
     routes: [
       mcp(assistant),

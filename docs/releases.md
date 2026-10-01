@@ -14,7 +14,7 @@ gaps are normal. Consumers select the greatest compatible sequence, never the
 last completion timestamp or GitHub Latest.
 
 The workflow calls the same reusable CI as PR checks at the exact merge SHA,
-including build, tests, browser checks and isolated pack closure. Publication
+including build, tests and isolated pack closure. Publication
 independently confirms the PR's merged state, main base, merge SHA, checkout and
 main ancestry. It never checks out a contributor head. PR title/body are read
 from event JSON as data, never interpolated into shell commands. Checkout
@@ -35,48 +35,52 @@ Each Release contains exactly four assets:
 - `cockpit-deployment.json.sha256`
 
 The tar archive contains the module at `./`, not a host runtime bundle or an
-extra npm `package/` directory. It includes compiled backend/frontend, roles,
+extra npm `package/` directory. It includes compiled backend, roles,
 documentation, injected manifests and `module-build.json` (source SHA, version,
 Node/platform/architecture and SDK). The descriptor is byte-identical at the
 archive root and as a sidecar. Format 2, channel `rolling`, uses the public
 [host release contract](https://github.com/waksana/cockpit/blob/main/docs/releasing.md).
 Independent checksum files avoid a self-referential archive digest.
 
-The product is module **`assistant`**, backend API 1, requiring public frontend
-API 3, public components/conversation presentation/owner drafts v1, draft submission v2,
-module pages/message presentation/menu/UI/surfaces v1, service readiness, chat reads, ask
-responses, resource preparation, role assignments, session discovery, session
-load and persisted native tool scope v1. Foreground invocation attribution additionally requires
-`promptReceipt.v1` and native MCP `toolCallId` metadata. Earlier hosts without
-these capabilities cannot run the coordinator protocol.
+The product is module **`assistant`**, backend API 1, requiring service readiness,
+chat reads, ask responses, role assignments, session load, native tool scope,
+exclusive role resources and prompt-origin observations. No module frontend/UI
+capabilities are required. Foreground attribution uses actual native acceptance
+and MCP `toolCallId` metadata. Missing capabilities fail before opening data.
 Required intents are extracted from actual backend host calls. Packaging creates
-the target database in memory and checks its declared layout. The new foreground
-schema retains the old three tables and adds only the source/notification,
-managed-worker, inbox and tool-result facts needed by the current protocol.
+the target database in memory and checks its four active tables:
+`topics`, `deliveries`, `mailbox` and `seen`.
 
-The descriptor declares schema 4 and one explicit **nondestructive 3-to-4**
-migration. Its preservation projections are derived from an independently
-pinned Rolling 7 schema-3 fixture, not target-only tables or columns. Every
-previous original, topic mapping and delivery receipt must remain byte-for-byte
-equivalent in those projections. New conversation metadata marks retained
-originals as legacy; it does not execute their old classifier work.
+The descriptor declares schema 5 and explicit **nondestructive 3-to-5 and 4-to-5**
+migrations. Existing topic columns remain the deployment preservation projection.
+The offline migration additionally fingerprints every old table's exact columns,
+row IDs and values before and after its transaction. Published schema-3/4 layouts
+are independently pinned, not inferred from target-only definitions.
+
+Old message mirrors and delivery records stay as inert archive tables in the
+migrated database; fresh stores do not create them. Runtime code neither reads
+nor writes those archives. Schema-4 unread bodies, attachments and questions move
+into the active mailbox without automatic notification or replay. Consumed
+native IDs become bodyless tombstones; absent body hashes are not fabricated.
+No old pending human input or delivery becomes new work.
 
 The packaged `dist/migrate.js` implements the deployment service's existing
 preflight/apply hook contract. The preflight is read-only; apply uses an explicit
-SQLite transaction. It takes the module data directory and returns only the
+SQLite transaction. It takes a checkpointed offline module data directory and returns only the
 declared JSON confirmation on standard output. It never calls Host/session
 APIs or resets data.
 
 There is no migration or reset claim for schema 1, schema 2 or an incompatible
-schema-3 draft. These are rejected unchanged. Only the reviewed schema-3 source
-and its schema-4 successor are supported; migration success is not permission
+schema-3/4 draft. These are rejected unchanged. A nonempty WAL must first be
+captured through the deployment service's SQLite-aware snapshot; preflight must
+not ignore it or create sidecars. Migration success is not permission
 to deploy or restart a running service.
 
 `pack:check` loads the actual packaged backend in isolated data directories.
 It exercises the actual packaged migration entry against retained synthetic
-schema-3 originals, a live-question record, mappings and accepted native receipts.
+schema-3/4 originals, questions, mappings, unread results and native receipts.
 It compares every old field before/after, checks read-only preflight and repeated
-apply, and proves that incompatible schema 1/2/four-table-3 inputs remain
+apply, and proves that incompatible schema 1/2/draft inputs remain
 unchanged. No production database or native session is used.
 
 Publication creates a draft prerelease, uploads each asset once, downloads every

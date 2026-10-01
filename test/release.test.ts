@@ -8,7 +8,7 @@ import { identity, repository, checkEvent, assetNames, hash, verifyAssets, produ
 // @ts-expect-error Release scripts execute directly in Node; they are not part of the TS runtime.
 import { publish, snapshot } from '../scripts/release.mjs';
 // @ts-expect-error Migration declaration helpers run directly in Node.
-import { preservedSchema3, schema4Migration } from '../scripts/migration-contract.mjs';
+import { preservedTopics, schema5Migrations } from '../scripts/migration-contract.mjs';
 
 const sha = 'a'.repeat(40);
 const expected = identity('17', sha);
@@ -32,7 +32,7 @@ function fixture() {
   for (const [name, value] of Object.entries({
     'package.json': { version: expected.version },
     'cockpit.module.json': { version: expected.version },
-    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.12.0', platform: 'linux', node: '24.20.0' },
+    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.13.0', platform: 'linux', node: '24.20.0' },
     'cockpit-deployment.json': descriptor,
   })) writeFileSync(join(stage, name), `${JSON.stringify(value)}\n`);
   writeFileSync(join(directory, 'cockpit-deployment.json'), readFileSync(join(stage, 'cockpit-deployment.json')));
@@ -116,28 +116,26 @@ test('Only actual accepted main merges in the intended repository qualify', () =
   assert.throws(() => checkEvent({ ...event, repository: { full_name: 'someone/fork' } }, sha));
 });
 
-test('descriptor retains schema-3 projections and declares the exact forward migration', async () => {
+test('descriptor declares native-only capabilities and explicit preserved-history upgrades', async () => {
   const actual = await product(resolve('.'));
   assert.equal(actual.id, 'assistant');
-  assert.ok(actual.requiresCapabilities.includes('page.v1'));
-  assert.ok(actual.requiresCapabilities.includes('messagePresentation.v1'));
   for (const capability of ['frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2']) {
-    assert.ok(actual.requiresCapabilities.includes(capability));
+    assert.ok(!actual.requiresCapabilities.includes(capability));
   }
   assert.ok(actual.requiresCapabilities.includes('chatRead.v1'));
   assert.ok(actual.requiresCapabilities.includes('promptReceipt.v1'));
   assert.ok(actual.requiresCapabilities.includes('toolScope.v1'));
+  assert.ok(actual.requiresCapabilities.includes('roleResourcePolicy.v1'));
+  assert.ok(actual.requiresCapabilities.includes('promptOrigin.v1'));
   assert.ok(actual.requiredIntents.includes('session/chat'));
-  assert.ok(actual.requiredIntents.includes('session/resources-prepare'));
+  assert.ok(!actual.requiredIntents.includes('session/resources-prepare'));
   assert.ok(actual.requiredIntents.includes('respondAsk'));
-  assert.deepEqual(actual.migrations, [schema4Migration]);
+  assert.deepEqual(actual.migrations, schema5Migrations);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
-  assert.equal(actual.databases[0].schema, 4);
-  assert.deepEqual(actual.databases[0].preserve, preservedSchema3());
+  assert.equal(actual.databases[0].schema, 5);
+  assert.deepEqual(actual.databases[0].preserve, preservedTopics());
   assert.deepEqual(actual.databases[0].preserve.map((entry: { table: string }) => entry.table),
-    ['messages', 'topic_messages', 'topics']);
-  assert.ok(!actual.databases[0].preserve.find((entry: { table: string }) => entry.table === 'messages')
-    .columns.includes('conversation'), 'New target columns must not be queried on schema 3');
+    ['topics']);
 });
 
 test('Checksums, embedded descriptor and archive identity must all agree', () => {

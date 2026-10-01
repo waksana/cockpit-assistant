@@ -4,35 +4,32 @@
   "name": "Assistant",
   "version": "0.0.0-dev",
   "backend": "dist/index.js",
-  "frontend": {
-    "entry": "dist/web/index.js",
-    "styles": ["dist/web/styles.css"],
-    "assets": ["dist/web"]
-  },
   "roles": [
     {
       "id": "coordinator",
-      "name": "coordinator",
+      "name": "Assistant",
+      "resourcePolicy": "exclusive",
       "instructions": "dist/roles/coordinator.md",
       "skillDirectories": ["skills"],
       "mcpServers": {
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_topic", "assistant_dispatch", "assistant_status", "assistant_inbox", "assistant_history", "assistant_source"]
+          "tools": ["assistant_topics", "assistant_topic", "assistant_dispatch", "assistant_status", "assistant_inbox", "assistant_history"]
         }
       }
     },
     {
       "id": "organizer",
       "name": "Topic organizer",
+      "resourcePolicy": "exclusive",
       "instructions": "dist/roles/organizer.md",
       "skillDirectories": ["skills"],
       "mcpServers": {
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_topic", "assistant_sessions", "assistant_history"]
+          "tools": ["assistant_topics", "assistant_topic", "assistant_history"]
         }
       }
     },

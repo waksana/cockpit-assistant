@@ -285,11 +285,13 @@ export class Assistant {
     if (this.stopped) return Promise.resolve();
     if (this.notice) { this.noticeAgain = true; return this.notice; }
     this.notice = (async () => {
-      do {
-        this.noticeAgain = false;
-        await this.sendNotice();
-      } while (this.noticeAgain && !this.stopped);
-    })().finally(() => { this.notice = null; });
+      try {
+        do {
+          this.noticeAgain = false;
+          await this.sendNotice();
+        } while (this.noticeAgain && !this.stopped);
+      } finally { this.notice = null; }
+    })();
     return this.notice;
   }
   private async sendNotice(): Promise<void> {

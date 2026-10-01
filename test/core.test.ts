@@ -277,3 +277,15 @@ test('stopping during foreground discovery does not reserve or send a fresh noti
     assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
   } finally { release.resolve(); f.close(); }
 });
+test('a result arriving while the empty notification loop exits receives its reminder without another wake', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    const empty = f.assistant.notify();
+    const arrived = f.assistant.observe('a', { id: 'at-loop-exit', type: 'assistant.message',
+      data: { messageId: 'at-loop-exit', content: 'Do not lose this wake' } });
+    await Promise.all([empty, arrived]);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+    assert.equal(f.store.inbox()[0]!.notice_state, 'notified');
+  } finally { f.close(); }
+});

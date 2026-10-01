@@ -23,6 +23,9 @@ test('shared topic Skill is physically embedded in each role without requiring a
     assert.ok(organizer.endsWith(`${shared}\n`));
     assert.match(front, /continuous Assistant conversation/);
     assert.match(organizer, /not the foreground/);
+    assert.match(organizer, /latest three nonempty user\/assistant messages/);
+    assert.match(organizer, /`recent:true`/);
+    assert.match(shared, /Do not automatically\s+read older pages/);
     assert.match(front, /Every business request\s+goes to its background session/);
     assert.match(front, /never authorizes new business\s+dispatch/);
     assert.match(front, /Do not assess business quality or completeness/);

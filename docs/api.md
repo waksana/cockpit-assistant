@@ -60,7 +60,7 @@ does not sandbox same-user code or permit reconstructing removed peer channels.
 | `assistant_topic` | `{topicId?,title?,content?,archived?,sessionId?}` | Edit the register; omit ID for a new topic. |
 | `assistant_dispatch` | `{items:[{topicId,prompt}]}` | Deliver the complete faithful split once for this native human input. |
 | `assistant_inbox` | `{ids?,limit?,peek?}` | Read and consume returned entries; `peek:true` only counts. |
-| `assistant_history` | `{sessionId,cursor?}` | Read one bounded native page, including after consumption. |
+| `assistant_history` | `{sessionId,cursor?,recent?}` | Read recent dialogue for topic preparation, or an original native page. |
 | `assistant_status` | `{topicId}` | Inspect mapping and native activity/question facts. |
 
 Native attachments on the genuine source input are forwarded as descriptors.
@@ -71,6 +71,35 @@ dispatch; attached or mixed answers are rejected, never silently changed.
 MCP success means the stated local operation or native acceptance, not successful
 business completion. Transport uncertainty is not permission to repeat a send.
 Reading a consumed inbox response again uses `assistant_history`, not replay.
+
+### Recent dialogue
+
+`assistant_history({sessionId,recent:true})` returns at most the latest **three**
+nonempty primary `user.message` / `assistant.message` bodies in append order,
+oldest first. The organizer defaults to this view. Tool events, subagent events,
+ephemeral chunks, empty tool-call messages, attachments and opaque model metadata
+are not included. Bodies accompanying a main-agent tool call remain dialogue.
+Native event IDs and message IDs (when present) identify each excerpt.
+
+The service reads persisted history without loading the source or saving a
+transcript. It searches at most 16 native pages of 32 events to find the sample.
+Each body's JSON-encoded UTF-8 text is limited to 3,000 bytes, without splitting
+a surrogate pair; `truncated` and `originalLength` (UTF-16 units) identify
+shortened bodies. The response is capped at 12,000 JSON-encoded UTF-8 bytes.
+An oversized native identity fails explicitly rather than overflowing the tool.
+
+The response has `view:"recent"`, `limit:3`, `order:"oldest-first"`, `messages`,
+`complete`, `scanLimited` and `read:{pages,events}`. `complete` means the latest
+three messages were found or native history ended with fewer messages; it never
+means all historical topics or a business task are complete. `scanLimited:true`
+means the search budget ended first, not that the conversation is empty.
+Native failures, expired cursors and nonadvancing pages fail explicitly without
+claiming a complete sample.
+
+Recent sampling always starts at the latest event and rejects `cursor`.
+`recent:false` preserves the original 16-event native page and its opaque cursor
+for explicitly requested history checks. This remains the foreground default,
+including after inbox consumption; original Chat history is never shortened.
 
 ## Organizer
 

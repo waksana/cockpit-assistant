@@ -33,6 +33,19 @@ export const configInput = z.strictObject({
     toolScope: toolScope.optional() }).default({}),
 });
 export type Config = z.infer<typeof configInput>;
+const retiredWorker = (selection: z.infer<typeof role>) => selection.moduleId === 'assistant' && selection.roleId === 'worker';
+const legacyBuiltins = ['view', 'grep', 'glob', 'bash', 'apply_patch', 'ask_user', 'skill'];
+function sessionOptions(config: Config) {
+  const { cwd, roles, toolScope } = config.worker;
+  // Only the complete former built-in preset identifies a scope we may retire.
+  const legacy = roles?.length === 1 && retiredWorker(roles[0]!) && toolScope
+    && toolScope.mcpServers.length === 0 && toolScope.builtins.length === legacyBuiltins.length
+    && legacyBuiltins.every(name => toolScope.builtins.includes(name));
+  const selectedRoles = roles?.filter(role => !retiredWorker(role));
+  return { cwd: cwd ?? config.defaultCwd,
+    ...(selectedRoles?.length ? { roles: selectedRoles } : {}),
+    ...(toolScope && !legacy ? { toolScope } : {}) };
+}
 const activeRole = (meta: PublicSessionMeta, name: string) =>
   meta.appliedRoles?.some(role => role.moduleId === 'assistant' && role.roleId === name) === true;
 const worker = (meta: PublicSessionMeta | null): meta is PublicSessionMeta => !!meta
@@ -69,7 +82,7 @@ function organizerSources(caller: Caller): string[] {
 }
 const displayTopic = (topic: Topic) => ({ topicId: topic.id, title: topic.title, content: topic.content,
   sessionId: topic.session_id, archived: topic.archived, version: topic.version,
-  mappingState: topic.mapping_state, error: topic.mapping_error });
+  mappingState: topic.mapping_state, error: topic.mapping_error, creationReceipt: topic.creation_receipt });
 
 export class Assistant {
   private notice: Promise<void> | null = null;
@@ -230,6 +243,8 @@ export class Assistant {
         requireFact(worker(meta), 'MAPPING_TARGET', 'Original worker is missing or has an internal role');
         requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before native delivery', 503);
         if (!meta.loaded) {
+          requireFact(!meta.roles?.some(retiredWorker), 'RETIRED_WORKER_ROLE',
+            'The original session retains the removed assistant/worker role. Resolve its saved role through the Host before loading; no replacement or prompt was sent');
           called = true;
           const loaded = await this.native.host.call('session/load', { sessionId });
           requireFact(loaded.ok && loaded.sessionId === sessionId, 'LOAD_UNKNOWN', 'Original worker load was not confirmed');
@@ -284,18 +299,17 @@ export class Assistant {
     let topic = this.store.topic(delivery.topic_id);
     if (topic.session_id) return topic.session_id;
     requireFact(topic.mapping_state === 'unbound', 'UNKNOWN_CREATION', 'Inspect the uncertain worker; do not create a replacement');
-    const worker = this.config.worker;
-    const scope = worker.toolScope ?? { builtins: ['view', 'grep', 'glob', 'bash', 'apply_patch', 'ask_user', 'skill'], mcpServers: [] };
-    requireFact(!scope.mcpServers.some(server => ['assistant', 'cockpit'].includes(server.name)), 'WORKER_SCOPE',
+    const options = sessionOptions(this.config);
+    requireFact(!options.toolScope?.mcpServers.some(server => ['assistant', 'cockpit'].includes(server.name)), 'WORKER_SCOPE',
       'Workers do not receive foreground or generic peer-message tools');
-    requireFact(!worker.roles?.some(role => role.moduleId === 'assistant' && role.roleId !== 'worker'), 'WORKER_ROLE',
+    requireFact(!options.roles?.some(role => role.moduleId === 'assistant'), 'WORKER_ROLE',
       'Worker and foreground roles cannot be combined');
     requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before worker creation', 503);
     topic.mapping_state = 'calling'; this.store.saveTopic(topic);
+    let created: { sessionId: string } | undefined;
     try {
-      const result = await this.native.host.call('session/new', { cwd: worker.cwd ?? this.config.defaultCwd,
-        roles: [...(worker.roles ?? []).filter(role => role.moduleId !== 'assistant'), { moduleId: 'assistant', roleId: 'worker' }],
-        toolScope: scope });
+      const result = await this.native.host.call('session/new', options);
+      created = result;
       topic = this.store.topic(topic.id);
       requireFact(topic.mapping_state === 'calling' && result.sessionId, 'CREATE_UNKNOWN', 'Worker creation changed or has no receipt');
       topic.session_id = result.sessionId; topic.creation_receipt = result; topic.mapping_state = 'bound'; topic.version++;
@@ -304,10 +318,13 @@ export class Assistant {
       topic = this.store.topic(topic.id);
       if (topic.mapping_state === 'calling') {
         topic.mapping_state = 'unknown'; topic.mapping_error = errorText(error);
-        if (error && typeof error === 'object') topic.creation_receipt = {
-          error: errorText(error),
-          ...('sessionId' in error && typeof error.sessionId === 'string' ? { sessionId: error.sessionId } : {}),
-          ...('createdId' in error && typeof error.createdId === 'string' ? { createdId: error.createdId } : {}),
+        const detail = error && typeof error === 'object' ? error : {};
+        const code = 'code' in detail && typeof detail.code === 'string' ? detail.code : undefined;
+        topic.creation_receipt = {
+          stage: created ? 'binding' : code === 'SESSION_CREATION_INCOMPLETE' ? 'readiness' : 'creation',
+          promptAttempted: false, error: errorText(error), ...(code ? { code } : {}),
+          ...(created ?? ('sessionId' in detail && typeof detail.sessionId === 'string' ? { sessionId: detail.sessionId } : {})),
+          ...('createdId' in detail && typeof detail.createdId === 'string' ? { createdId: detail.createdId } : {}),
         };
         this.store.saveTopic(topic);
       }

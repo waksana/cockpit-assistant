@@ -32,22 +32,33 @@ without changing its `enabled`, version or digest:
 ```json
 {
   "defaultCwd": "/absolute/project",
-  "foregroundSessionId": null,
-  "worker": {
-    "cwd": "/absolute/project",
-    "roles": [{"moduleId":"assistant","roleId":"worker"}],
-    "toolScope": {
-      "builtins":["view","grep","glob","bash","apply_patch","ask_user","skill"],
-      "mcpServers":[]
-    }
-  }
+  "foregroundSessionId": null
 }
 ```
 
-Defaults apply to newly created workers, not existing sessions. New workers
-inherit the Host default model. Unsupported resource/model fields are rejected;
-one-time native resource preparation is not a saved template. The built-in scope
-does not sandbox same-user code or permit reconstructing removed peer channels.
+New topics create ordinary native sessions using the Host default model and
+resources. Assistant injects no role, private tool scope, Skill or reporting
+instructions. These sessions are not an Assistant sandbox. The coordinator and
+organizer retain their separate exclusive resource policies.
+
+The existing `worker` configuration key remains compatible; its optional `cwd`,
+`roles` and `toolScope` apply only to new sessions. There is no new template API.
+Explicit selections retain their native semantics and validation: unsupported
+resource/model fields are rejected and custom tool scopes are not widened to
+work around native alias or readiness errors.
+
+The removed `assistant/worker` entry is stripped from new-session roles. Only
+the exact old built-in preset (that role alone, the seven builtins `view`, `grep`,
+`glob`, `bash`, `apply_patch`, `ask_user`, `skill`, and no MCP servers) also drops
+its obsolete scope. A scope without that role, with other selected roles, or
+with different tools remains explicit and unchanged. This compatibility
+interpretation does not write the saved configuration.
+
+Existing topic mappings and saved native roles are never rewritten. Already
+loaded legacy sessions may continue, but an unloaded session retaining the
+removed role is explicitly rejected before load or send; resolve its saved
+role through the Host rather than replacing the topic session. This release
+does not migrate production sessions or repair arbitrary custom scopes.
 
 ## One MCP endpoint
 
@@ -71,6 +82,21 @@ dispatch; attached or mixed answers are rejected, never silently changed.
 MCP success means the stated local operation or native acceptance, not successful
 business completion. Transport uncertainty is not permission to repeat a send.
 Reading a consumed inbox response again uses `assistant_history`, not replay.
+
+### Partial creation
+
+Topic responses include `creationReceipt` alongside the bound `sessionId`.
+A creation failure retains its actual `sessionId`/`createdId` when supplied,
+error code and stage (`creation`, `readiness`, or `binding`), with
+`promptAttempted:false`. The stage describes the operation that failed, not
+an inferred rollback; an unconfirmed native creation stays unknown. Existing
+receipts are returned unchanged, including older receipts without stage fields.
+
+`assistant_status` exposes this receipt even when no session could be bound.
+It does not load that identity or claim the closed empty session is recoverable.
+History authorization is unchanged: a failed creation receipt is not a new
+general-purpose history capability. Unknown creation/delivery is never
+automatically retried, reset or replaced.
 
 ### Recent dialogue
 

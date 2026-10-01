@@ -32,11 +32,6 @@
           "tools": ["assistant_topics", "assistant_topic", "assistant_history"]
         }
       }
-    },
-    {
-      "id": "worker",
-      "name": "Topic worker",
-      "instructions": "roles/worker.md"
     }
   ]
 }

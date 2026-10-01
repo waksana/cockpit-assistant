@@ -23,6 +23,12 @@ their IDs; unloaded workers load and busy workers enqueue. Unknown native outcom
 are retained, not resent or replaced. An accepted send or idle worker does not
 mean the business is complete.
 
+New topic sessions have no dedicated Assistant role or injected reporting
+protocol. The existing optional configuration is interpreted as documented in
+[session setup](api.md#session-setup); default creation delegates resource
+selection to the Host. A partial native creation retains its original identity
+and phase in the public topic receipt, without binding or sending prematurely.
+
 ## Native input, not a second chat
 
 Host `promptAccepted` observations identify actual native receipts and ingress

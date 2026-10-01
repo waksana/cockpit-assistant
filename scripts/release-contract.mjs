@@ -19,6 +19,18 @@ export function identity(sequence, sourceSha) {
 export const assetNames = expected => [expected.archive.name, `${expected.archive.name}.sha256`,
   'cockpit-deployment.json', 'cockpit-deployment.json.sha256'];
 
+export function assertMigrationTargets(product) {
+  const databases = new Map(product.databases.map(database => [database.path, database.schema]));
+  assert.equal(databases.size, product.databases.length, 'Database paths must be unique');
+  const migrated = new Set();
+  for (const migration of product.migrations) {
+    assert.ok(!migrated.has(migration.database), 'Only one automatic migration per database is supported');
+    assert.equal(databases.get(migration.database), migration.to, 'Migration must target the declared final schema');
+    assert.ok(migration.to > migration.from, 'Migration must move forward');
+    migrated.add(migration.database);
+  }
+}
+
 export function checkEvent(event, sourceSha) {
   assert.equal(event.action, 'closed');
   assert.equal(event.repository.full_name, repository);
@@ -56,7 +68,7 @@ export async function product(root) {
     const tables = db.sql.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
       .all().map(({ name }) => name);
     assert.deepEqual(tables, applicationTables, 'The released database must match the declared foreground schema');
-    return {
+    const result = {
       kind: 'module', id: manifest.id, hostApi: { min: 1, max: 1 },
       requiresCapabilities: ['module-api.v1', 'serviceReady.v1', 'chatRead.v1', 'askResponse.v1',
         'roleAssignment.v1', 'sessionLoad.v1', 'promptReceipt.v1', 'toolScope.v1', 'roleResourcePolicy.v1', 'promptOrigin.v1'],
@@ -65,6 +77,8 @@ export async function product(root) {
       databases: [{ path: 'assistant.sqlite', schema, preserve: preservedTopics() }],
       migrations: schema5Migrations,
     };
+    assertMigrationTargets(result);
+    return result;
   } finally { db.close(); }
 }
 
@@ -82,6 +96,7 @@ export function verifyAssets(directory, expected, expectedProduct) {
   for (const key of ['requiresCapabilities', 'requiredIntents', 'databases', 'migrations']) {
     assert.ok(Array.isArray(actualProduct[key]));
   }
+  assertMigrationTargets(actualProduct);
   if (expectedProduct) assert.deepEqual(actualProduct, expectedProduct);
   const archive = join(directory, expected.archive.name);
   const entries = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }).trim().split('\n');

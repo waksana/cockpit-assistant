@@ -51,8 +51,12 @@ Required intents are extracted from actual backend host calls. Packaging creates
 the target database in memory and checks its four active tables:
 `topics`, `deliveries`, `mailbox` and `seen`.
 
-The descriptor declares schema 5 and explicit **nondestructive 3-to-5 and 4-to-5**
-migrations. Existing topic columns remain the deployment preservation projection.
+The descriptor declares schema 5 and one explicit **nondestructive 4-to-5**
+migration for the currently deployed database. The deployment service accepts
+only one source-to-target migration per database, not alternative entries.
+The offline utility separately supports a checkpointed schema-3 upgrade when
+explicitly invoked; that is not an advertised automatic schema-3 path.
+Existing topic columns remain the deployment preservation projection.
 The offline migration additionally fingerprints every old table's exact columns,
 row IDs and values before and after its transaction. Published schema-3/4 layouts
 are independently pinned, not inferred from target-only definitions.

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers/promises';
 import { execFileSync } from 'node:child_process';
-import { retainedRows } from './migration-contract.mjs';
+import { retainedRows, schema5Migrations } from './migration-contract.mjs';
 import { populateLegacy, verifyUnread } from './fixtures/retained-data.mjs';
 
 export const applicationTables = ['deliveries', 'mailbox', 'seen', 'topics'];
@@ -36,7 +36,20 @@ export async function verifySchemaBoundary(activate, directory, migrationEntry) 
     const before = retainedRows(old, version); old.close();
     const bytes = await readFile(path);
     await assert.rejects(() => activate(context(dataRoot, new AbortController().signal)), /explicit preserved-data migration/);
-    const run = phase => JSON.parse(execFileSync(process.execPath, [migrationEntry, phase, dataRoot], { encoding: 'utf8' }));
+    const declared = schema5Migrations.find(migration => migration.from === version);
+    const run = phase => {
+      const hook = declared?.[phase];
+      if (hook) assert.equal(hook.entry, 'dist/migrate.js');
+      const args = hook ? hook.args.map(arg => {
+        if (typeof arg === 'string') return arg;
+        assert.deepEqual(arg, { path: 'data' });
+        return dataRoot;
+      }) : [phase, dataRoot];
+      const result = JSON.parse(execFileSync(process.execPath, [migrationEntry, ...args], { encoding: 'utf8' }));
+      if (hook)
+        for (const [key, value] of Object.entries(hook.expected)) assert.equal(result[key], value, key);
+      return result;
+    };
     assert.deepEqual(run('preflight'), { ok: true, phase: 'preflight', schema: version, from: version, to: 5, changed: false });
     assert.deepEqual(await readFile(path), bytes);
     assert.deepEqual(run('apply'), { ok: true, phase: 'apply', schema: 5, from: version, to: 5, changed: true });

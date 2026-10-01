@@ -32,18 +32,3 @@ export const attachmentSchema = z.discriminatedUnion('type', [
 export const attachmentsSchema = z.array(attachmentSchema).max(MAX_ATTACHMENTS)
   .refine(value => new TextEncoder().encode(JSON.stringify(value)).byteLength <= MAX_ATTACHMENT_BYTES,
     `Attachment descriptions must fit within ${MAX_ATTACHMENT_BYTES} UTF-8 bytes`);
-const inputFields = {
-  requestId: z.string().min(1).max(200),
-  text: z.string().max(100_000),
-  attachments: attachmentsSchema.default([]),
-};
-export const inputSchema = z.strictObject(inputFields).refine(value => value.text.length > 0 || value.attachments.length > 0,
-  'Text or at least one native attachment is required');
-export type NativeInput = z.infer<typeof inputSchema>;
-export const receiptInputSchema = inputSchema;
-export type ReceiptInput = z.infer<typeof receiptInputSchema>;
-
-/** Only absent legacy fields normalize; malformed present data must fail visibly. */
-export function withAttachments<T extends object>(value: T): T & { attachments: NativeAttachment[] } {
-  return { ...value, attachments: attachmentsSchema.parse('attachments' in value ? value.attachments : []) };
-}

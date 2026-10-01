@@ -1,5 +1,5 @@
 import { isAbsolute } from 'node:path';
-import { inspect, migrate } from '../src/migration.ts';
+import { inspect, migrate } from '../src/upgrade.ts';
 
 const [phase, root, ...extra] = process.argv.slice(2);
 if (!['preflight', 'apply'].includes(phase) || !root || !isAbsolute(root) || extra.length) {

@@ -9,20 +9,18 @@ import { verifySchemaBoundary } from './schema-preflight.mjs';
 const temporary = await mkdtemp(join(tmpdir(), 'assistant-pack-'));
 try {
   const manifest = JSON.parse(await readFile('cockpit.module.json', 'utf8'));
-  assert.equal(manifest.frontend.entry, 'dist/web/index.js');
+  assert.equal(manifest.frontend, undefined);
   const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], { encoding: 'utf8' }));
   const files = new Set(pack.files.map(file => file.path));
-  for (const path of [manifest.backend, manifest.frontend.entry, ...manifest.frontend.styles,
-    'cockpit.module.json', 'README.md', 'licenses/lucide.txt', 'dist/migrate.js',
+  for (const path of [manifest.backend,
+    'cockpit.module.json', 'README.md', 'dist/migrate.js',
     'skills/assistant-topics/SKILL.md', ...manifest.roles.map(role => role.instructions)]) {
     assert.ok(files.has(path), `Missing packaged file ${path}`);
   }
-  assert.ok(![...files].some(path => path.startsWith('src/') || path.startsWith('node_modules/') || path.includes('.sqlite')));
+  assert.ok(![...files].some(path => path.startsWith('src/') || path.startsWith('node_modules/') || path.startsWith('dist/web/') || path.includes('.sqlite')));
   execFileSync('tar', ['-xzf', join(temporary, pack.filename), '-C', temporary]);
   const backend = await import(pathToFileURL(join(temporary, 'package', manifest.backend)).href);
   assert.equal(typeof backend.activate, 'function');
-  const frontend = await import(pathToFileURL(join(temporary, 'package', manifest.frontend.entry)).href);
-  assert.equal(typeof frontend.activate, 'function');
   const skill = (await readFile(join(temporary, 'package/skills/assistant-topics/SKILL.md'), 'utf8'))
     .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
   for (const role of manifest.roles.filter(role => role.id === 'coordinator' || role.id === 'organizer')) {
@@ -31,7 +29,7 @@ try {
   }
   await verifySchemaBoundary(backend.activate, temporary, join(temporary, 'package/dist/migrate.js'));
   console.log(`Pack closure verified: ${pack.filename}`);
-  console.log('Packaged schema boundary verified: schema 3 retained through migration; incompatible databases unchanged');
+  console.log('Packaged migration retains schema 3/4 archives and moves unread entries into the minimal schema 5');
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

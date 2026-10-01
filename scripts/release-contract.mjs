@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { applicationTables, schemaVersion } from './schema-preflight.mjs';
-import { preservedSchema3, schema4Migration } from './migration-contract.mjs';
+import { preservedTopics, schema5Migrations } from './migration-contract.mjs';
 
 export const repository = 'waksana/cockpit-assistant';
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -38,34 +38,18 @@ export async function product(root) {
   const manifest = JSON.parse(readFileSync(join(root, 'cockpit.module.json'), 'utf8'));
   assert.equal(manifest.id, 'assistant');
   assert.equal(manifest.apiVersion, 1);
-  const sources = Object.fromEntries(['src/index.ts', 'src/native.ts', 'src/runtime.ts', 'frontend/index.ts']
+  const sources = Object.fromEntries(['src/index.ts']
     .map(name => [name, readFileSync(join(root, name), 'utf8')]));
   const hostSources = readdirSync(join(root, 'src')).filter(name => name.endsWith('.ts'))
     .map(name => readFileSync(join(root, 'src', name), 'utf8'));
   for (const [file, gate] of [
     ['src/index.ts', 'context.serviceReadyVersion === 1'],
-    ['src/native.ts', 'host.chatReadVersion === 1'],
-    ['src/native.ts', 'host.askResponseVersion === 1'],
-    ['src/native.ts', 'host.resourcePreparationVersion === 1'],
-    ['src/native.ts', 'host.roleAssignmentVersion === 1'],
-    ['src/native.ts', 'host.sessionDirectoryVersion === 1'],
-    ['src/native.ts', 'host.sessionLoadVersion === 1'],
-    ['src/native.ts', 'host.promptReceiptVersion === 1'],
-    ['src/native.ts', 'host.toolScopeVersion === 1'],
-    ['frontend/index.ts', 'context.apiVersion !== 3'],
-    ['frontend/index.ts', 'context.publicComponentsVersion !== 1'],
-    ['frontend/index.ts', 'context.conversationPresentationVersion !== 1'],
-    ['frontend/index.ts', 'context.draftOwnerVersion !== 1'],
-    ['frontend/index.ts', 'context.draftSubmissionVersion !== 2'],
-    ['frontend/index.ts', 'context.pageVersion !== 1'],
-    ['frontend/index.ts', 'context.messagePresentationVersion !== 1'],
-    ['frontend/index.ts', 'context.menuVersion !== 1'],
-    ['frontend/index.ts', 'context.uiVersion !== 1'],
-    ['frontend/index.ts', 'context.uiSurfaceVersion !== 1'],
+    ...['chatRead', 'askResponse', 'roleAssignment', 'sessionLoad', 'promptReceipt', 'toolScope',
+      'roleResourcePolicy', 'promptOrigin'].map(name => ['src/index.ts', `host.${name}Version === 1`]),
   ]) assert.ok(sources[file].includes(gate), `Review changed capability gate: ${gate}`);
   assert.ok(sources['src/index.ts'].includes("'assistant.sqlite'"), 'Review changed database path');
-  const { Database } = await import(new URL('../src/database.ts', import.meta.url));
-  const db = new Database(':memory:');
+  const { Store } = await import(new URL('../src/store.ts', import.meta.url));
+  const db = new Store(':memory:');
   try {
     const schema = db.sql.prepare('PRAGMA user_version').get().user_version;
     assert.equal(schema, schemaVersion, 'Review schema changes and the explicit preservation/migration contract');
@@ -75,13 +59,11 @@ export async function product(root) {
     return {
       kind: 'module', id: manifest.id, hostApi: { min: 1, max: 1 },
       requiresCapabilities: ['module-api.v1', 'serviceReady.v1', 'chatRead.v1', 'askResponse.v1',
-        'resourcePreparation.v1', 'roleAssignment.v1', 'sessionDirectory.v1', 'sessionLoad.v1', 'promptReceipt.v1', 'toolScope.v1',
-        'frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2',
-        'page.v1', 'messagePresentation.v1', 'menu.v1', 'ui.v1', 'uiSurface.v1'],
+        'roleAssignment.v1', 'sessionLoad.v1', 'promptReceipt.v1', 'toolScope.v1', 'roleResourcePolicy.v1', 'promptOrigin.v1'],
       requiredIntents: [...new Set(hostSources.flatMap(source =>
         [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1])))].sort(),
-      databases: [{ path: 'assistant.sqlite', schema, preserve: preservedSchema3() }],
-      migrations: [schema4Migration],
+      databases: [{ path: 'assistant.sqlite', schema, preserve: preservedTopics() }],
+      migrations: schema5Migrations,
     };
   } finally { db.close(); }
 }

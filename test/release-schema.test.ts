@@ -7,7 +7,7 @@ import { build } from 'esbuild';
 // @ts-expect-error Packaging helpers run directly in Node outside the TS bundle.
 import { verifySchemaBoundary } from '../scripts/schema-preflight.mjs';
 
-test('packaged migration preserves every schema-3 field and refuses incompatible older layouts', async () => {
+test('packaged migration preserves all schema-3/4 history and unread results while retiring chat mirrors', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'assistant-schema-preflight-'));
   try {
     const migrationEntry = join(directory, 'migrate.mjs');

@@ -18,7 +18,9 @@ export const dispatchInput = z.strictObject({
 export const inboxInput = z.strictObject({
   ids: z.array(id).min(1).max(100).optional(), limit: z.int().min(1).max(100).default(50), peek: z.boolean().default(false),
 });
-export const historyInput = z.strictObject({ sessionId: id, cursor: z.string().min(1).max(16384).optional() });
+export const historyInput = z.strictObject({
+  sessionId: id, cursor: z.string().min(1).max(16384).optional(), recent: z.boolean().optional(),
+});
 export const pageInput = z.strictObject({ after: z.int().nonnegative().default(0), limit: z.int().min(1).max(100).default(50) });
 const role = z.strictObject({ moduleId: id, roleId: id });
 const toolScope = z.strictObject({
@@ -39,6 +41,15 @@ const worker = (meta: PublicSessionMeta | null): meta is PublicSessionMeta => !!
     role.moduleId === 'assistant' && role.roleId !== 'worker');
 const primary = (event: NativeChatEvent) => !event.ephemeral && !event.agentId && !event.parentToolCallId
   && !event.data.agentId && !event.data.parentToolCallId;
+function historyExcerpt(text: string): string {
+  let low = 0, high = Math.min(text.length, 3000);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(JSON.stringify(text.slice(0, middle))) <= 3000) low = middle;
+    else high = middle - 1;
+  }
+  return text.slice(0, low).replace(/[\uD800-\uDBFF]$/u, '');
+}
 const human = (caller: Caller): Input => {
   requireFact(caller.role === 'coordinator' && caller.input?.human, 'HUMAN_REQUIRED',
     'Only a genuine native Chat input can authorize business dispatch or registry changes', 403);
@@ -95,6 +106,10 @@ export class Assistant {
         requireFact(caller.role === 'organizer' ? organizerSources(caller).includes(query.sessionId) : this.store.managed(query.sessionId),
           'HISTORY_SCOPE', 'Read only registered topic sessions or this organizer input selected IDs', 403);
         requireFact(worker(await this.native.session(query.sessionId)), 'INTERNAL_HISTORY', 'Internal sessions are not business history');
+        if (query.recent ?? caller.role === 'organizer') {
+          requireFact(!query.cursor, 'RECENT_HISTORY_CURSOR', 'Recent sampling starts at the latest event; use recent:false for native cursor pages', 400);
+          return this.recentHistory(query.sessionId);
+        }
         return this.native.host.call('session/chat', { sessionId: query.sessionId, source: 'persisted',
           direction: 'backward', max: 16, bootstrap: false, waitMs: 0, ...(query.cursor ? { cursor: query.cursor } : {}) });
       }
@@ -106,6 +121,41 @@ export class Assistant {
       }
       default: throw new BusinessError('UNKNOWN_TOOL', 'Unknown or retired Assistant tool', 400);
     }
+  }
+  private async recentHistory(sessionId: string) {
+    const messages: { eventId: string; messageId: string | null; type: string;
+      content: string; truncated: boolean; originalLength: number }[] = [];
+    let cursor: string | undefined, pages = 0, events = 0, hasMore = true;
+    const cursors = new Set<string>();
+    while (messages.length < 3 && hasMore && pages < 16) {
+      requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before reading another native history page', 503);
+      const page = await this.native.host.call('session/chat', { sessionId, source: 'persisted',
+        direction: 'backward', max: 32, bootstrap: false, waitMs: 0, ...(cursor ? { cursor } : {}) });
+      requireFact(page.sessionId === sessionId && page.source === 'persisted' && page.direction === 'backward',
+        'NATIVE_HISTORY', 'Native history returned a different source or direction');
+      requireFact(page.cursorStatus === 'ok', 'NATIVE_HISTORY', 'Native history cursor expired; no complete recent sample was inferred');
+      requireFact(page.events.length <= 32 && (!page.hasMore || (page.cursor && !cursors.has(page.cursor))),
+        'NATIVE_HISTORY', 'Native history exceeded its page bound or did not advance');
+      pages++; events += page.events.length; hasMore = page.hasMore;
+      // Backward pages remain in append order. Ignore event timestamps and opaque IDs for ordering.
+      for (const event of page.events.toReversed()) {
+        if (!primary(event) || !['user.message', 'assistant.message'].includes(event.type)
+          || typeof event.data.content !== 'string' || !event.data.content.trim()) continue;
+        const content = historyExcerpt(event.data.content);
+        messages.push({ eventId: event.id,
+          messageId: typeof event.data.messageId === 'string' ? event.data.messageId : null,
+          type: event.type, content, truncated: content.length < event.data.content.length,
+          originalLength: event.data.content.length });
+        if (messages.length === 3) break;
+      }
+      cursor = page.cursor; cursors.add(page.cursor);
+    }
+    const complete = messages.length === 3 || !hasMore;
+    const result = { sessionId, source: 'persisted', view: 'recent', limit: 3, order: 'oldest-first',
+      messages: messages.reverse(), complete, scanLimited: !complete, read: { pages, events } };
+    requireFact(Buffer.byteLength(JSON.stringify(result)) <= 12000,
+      'HISTORY_OUTPUT_LIMIT', 'Native message identities exceed the recent history output budget');
+    return result;
   }
   private async editTopic(caller: Caller, value: z.infer<typeof topicInput>) {
     const selected = caller.role === 'organizer' ? organizerSources(caller) : (human(caller), null);

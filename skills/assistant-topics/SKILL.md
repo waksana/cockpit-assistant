@@ -51,3 +51,14 @@ Its native user input must explicitly select sources on a line such as
 `historySessionIds: ["actual-native-session-id"]`. Only those histories may be
 read or registered in that interaction. Do not scan every session or treat the
 Skill as permission to adopt sources.
+
+For topic preparation, use `assistant_history` with `recent:true`: at most the
+latest three nonempty primary user/assistant messages, ordered oldest first.
+This is the organizer default; tool results and internal metadata are excluded.
+Use the returned native event/message IDs as evidence, not session titles alone.
+`truncated` marks shortened bodies and `complete:false` means the bounded search
+could not obtain the full recent sample. Neither proves an empty conversation.
+This discovers current topics, not every historical topic. Do not automatically
+read older pages. If the user requests an original native page explicitly, use
+`recent:false` with its native cursor; the foreground retains this original
+default for history checks after inbox consumption.

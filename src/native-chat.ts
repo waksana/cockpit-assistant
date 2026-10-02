@@ -3,14 +3,10 @@ import { attachmentsSchema } from './attachments.ts';
 import { requireFact } from './errors.ts';
 import type { Caller, Gateway } from './gateway.ts';
 import { Store, fingerprint } from './store.ts';
+import { appliedAssistantRole, assistantRole, roleIdentity, sameRoles } from './roles.ts';
 
 const primary = (event: NativeChatEvent) => !event.ephemeral && !event.agentId && !event.parentToolCallId
   && !event.data.agentId && !event.data.parentToolCallId;
-const roleOf = (meta: PublicSessionMeta | null): Caller['role'] | null => {
-  if (!meta?.loaded || meta.rolesNeedReload || meta.appliedRoles?.length !== 1) return null;
-  const role = meta.appliedRoles[0]!;
-  return role.moduleId === 'assistant' && (role.roleId === 'coordinator' || role.roleId === 'organizer') ? role.roleId : null;
-};
 const receiptId = (sessionId: string, messageId: string) => `input:${fingerprint([sessionId, messageId])}`;
 
 export class NativeChat implements Gateway {
@@ -35,12 +31,35 @@ export class NativeChat implements Gateway {
     requireFact(meta, 'FOREGROUND_MISSING', `The selected foreground ${this.selected} no longer exists; no replacement was created`, 404);
     return meta;
   }
-  async validateForeground(meta: PublicSessionMeta): Promise<void> {
-    requireFact(meta.sessionId === this.selected && roleOf(meta) === 'coordinator',
-      'FOREGROUND_ROLE', 'The original foreground must have only the applied Assistant role with no pending role reload', 403);
-    await this.validateResources(meta.sessionId, 'coordinator');
+  async validateForeground(meta: PublicSessionMeta, state: 'saved' | 'applied' = 'applied'): Promise<void> {
+    requireFact(meta.sessionId === this.selected
+      && (state === 'saved' ? !meta.loaded && assistantRole(meta.roles) === 'coordinator'
+        : appliedAssistantRole(meta) === 'coordinator'),
+    'FOREGROUND_ROLE', 'The original foreground must retain one Assistant coordinator identity and its confirmed role application', 403);
+    await this.validateSelection(meta);
+    if (state === 'applied') await this.validateResources(meta, 'coordinator');
+    await this.unchanged(meta);
   }
-  private async validateResources(sessionId: string, role: Caller['role']): Promise<void> {
+  private async validateSelection(meta: PublicSessionMeta): Promise<void> {
+    requireFact(!this.closed, 'STOPPING', 'Assistant stopped before role compatibility validation', 503);
+    requireFact(this.host.roleAvailabilityVersion === 1, 'HOST_CAPABILITY', 'Host role compatibility checks are required', 503);
+    const roles = meta.roles?.map(({ moduleId, roleId }) => ({ moduleId, roleId }));
+    requireFact(roles && assistantRole(roles), 'CALLER_ROLE', 'Select exactly one Assistant identity', 403);
+    const result = await this.host.call('roles/availability', { sessionId: meta.sessionId, roles });
+    requireFact(result.sessionId === meta.sessionId && result.status === 'available'
+      && Array.isArray(result.reasons) && result.reasons.length === 0
+      && sameRoles(result.roles, roles), 'CALLER_ROLES',
+    'Host did not confirm this exact Assistant role selection as compatible', 403);
+  }
+  private async unchanged(meta: PublicSessionMeta): Promise<void> {
+    const before = roleIdentity(meta), loaded = meta.loaded;
+    requireFact(!this.closed, 'STOPPING', 'Assistant stopped before role readback', 503);
+    const current = await this.session(meta.sessionId);
+    requireFact(current && current.loaded === loaded && roleIdentity(current) === before,
+      'CALLER_ROLE', 'The native role selection or loaded state changed during validation', 403);
+  }
+  private async validateResources(meta: PublicSessionMeta, role: Caller['role']): Promise<void> {
+    const sessionId = meta.sessionId;
     requireFact(!this.closed, 'STOPPING', 'Assistant stopped before resource validation', 503);
     const scope = await this.host.call('session/tool-scope', { sessionId });
     const names = role === 'organizer' ? ['assistant_topics', 'assistant_topic', 'assistant_history'] : this.allowedTools;
@@ -50,7 +69,8 @@ export class NativeChat implements Gateway {
     'CALLER_RESOURCES', 'The native Assistant tool set is not the role-only toolkit', 403);
     requireFact(!this.closed, 'STOPPING', 'Assistant stopped before resource readiness', 503);
     const ready = await this.host.call('roles/readiness', { sessionId });
-    requireFact(ready.sessionId === sessionId && ready.ready && !ready.rolesNeedReload,
+    requireFact(ready.sessionId === sessionId && ready.loaded && ready.ready && ready.rolesNeedReload === false
+      && sameRoles(ready.roles, meta.roles) && sameRoles(ready.appliedRoles, meta.appliedRoles),
       'CALLER_RESOURCES', 'Assistant role resources are not ready', 403);
   }
   observe(sessionId: string, event: NativeChatEvent): void {
@@ -60,8 +80,10 @@ export class NativeChat implements Gateway {
     this.events.set(sessionId, events.slice(-64));
   }
   async accepted(event: PromptAccepted): Promise<void> {
-    const meta = await this.session(event.sessionId), role = roleOf(meta);
+    const meta = await this.session(event.sessionId), role = appliedAssistantRole(meta);
     if (!role) return;
+    // Preserve trusted ingress receipts even while resources are unavailable.
+    // Callers must separately pass current Host compatibility and readiness.
     this.tracked.add(event.sessionId);
     const key = receiptId(event.sessionId, event.messageId), hash = fingerprint(event.origin);
     if (!this.store.seen(key, hash)) this.store.remember(key, hash, event.acceptedAt);
@@ -83,10 +105,12 @@ export class NativeChat implements Gateway {
   async caller(identity: McpInvocationMeta): Promise<Caller> {
     requireFact(identity.sessionId === identity.runtimeSessionId && !identity.subagent && identity.toolCallId,
       'CALLER_IDENTITY', 'A primary native tool-call identity is required', 403);
-    const meta = await this.session(identity.sessionId), role = roleOf(meta);
-    requireFact(role, 'CALLER_ROLE', 'Select and load the distinct Assistant role in native Chat', 403);
+    const meta = await this.session(identity.sessionId), role = appliedAssistantRole(meta);
+    requireFact(meta && role, 'CALLER_ROLE', 'Select and load the distinct Assistant role in native Chat', 403);
+    const roles = roleIdentity(meta);
     this.tracked.add(identity.sessionId);
-    await this.validateResources(identity.sessionId, role);
+    await this.validateSelection(meta);
+    await this.validateResources(meta, role);
     let events = this.events.get(identity.sessionId) ?? [];
     const matches = () => events.filter(event => event.type === 'assistant.message'
       && Array.isArray(event.data.toolRequests) && event.data.toolRequests.some(tool =>
@@ -110,7 +134,10 @@ export class NativeChat implements Gateway {
     const source = sources[0], messageId = source?.data.messageId;
     const proof = typeof messageId === 'string' ? await this.receipt(receiptId(identity.sessionId, messageId)) : null;
     const isHuman = proof?.fingerprint === fingerprint('user') && !source?.data.source && source?.data.isAutopilotContinuation !== true;
-    requireFact(roleOf(await this.session(identity.sessionId)) === role, 'CALLER_ROLE', 'The native role changed during input verification', 403);
+    const current = await this.session(identity.sessionId);
+    requireFact(!this.closed, 'STOPPING', 'Assistant stopped during input verification', 503);
+    requireFact(appliedAssistantRole(current) === role && current && roleIdentity(current) === roles,
+      'CALLER_ROLE', 'The native role changed during input verification', 403);
     if (isHuman && role === 'coordinator') {
       requireFact(!this.selected || this.selected === identity.sessionId, 'FOREGROUND_SELECTED', 'Another foreground session is selected');
       if (!this.selected) {

@@ -50,6 +50,18 @@ human status merely because native history names the event `user.message`.
 The foreground has only the role's MCP tool subset and Skill. The native Host
 enforces resource discovery/connection policy and tool filtering; the module
 checks actual readiness and offered raw identities before using a caller.
+Exactly one coordinator or organizer identity may coexist with neutral
+connection roles. The complete selection is checked through Host
+`roles/availability`; no connector-name allowlist or copied role catalog decides
+compatibility. Returned selections must match the sampled roles, and unknown
+or denied results fail closed. Saved selections are checked before cold loading;
+loaded callers and reminders require matching saved/applied selections and
+native readiness, with role readback after asynchronous validation.
+Input-origin receipts are retained for a confirmed applied Assistant identity
+even while resources are unavailable. They record ingress facts, not permission:
+current compatibility, resources and native provenance must still pass before
+any caller is admitted. Neutral roles never upgrade `module`/`api` origins to
+human authorization.
 
 ## Inbox and notices
 

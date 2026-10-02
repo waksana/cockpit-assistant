@@ -127,8 +127,10 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   assert.ok(actual.requiresCapabilities.includes('promptReceipt.v1'));
   assert.ok(actual.requiresCapabilities.includes('toolScope.v1'));
   assert.ok(actual.requiresCapabilities.includes('roleResourcePolicy.v1'));
+  assert.ok(actual.requiresCapabilities.includes('roleAvailability.v1'));
   assert.ok(actual.requiresCapabilities.includes('promptOrigin.v1'));
   assert.ok(actual.requiredIntents.includes('session/chat'));
+  assert.ok(actual.requiredIntents.includes('roles/availability'));
   assert.ok(!actual.requiredIntents.includes('session/resources-prepare'));
   assert.ok(actual.requiredIntents.includes('respondAsk'));
   assert.deepEqual(actual.migrations, schema5Migrations);

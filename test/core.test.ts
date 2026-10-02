@@ -73,7 +73,7 @@ function fixture(config: Partial<Config> = {}) {
     },
     async session(id) { if (onMeta) await onMeta(id); return sessions.get(id) ?? null; },
     async foreground() { return sessions.get('assistant')!; },
-    async validateForeground() { if (onReady) await onReady(); },
+    async validateForeground(_meta, state) { if (state !== 'saved' && onReady) await onReady(); },
     observe() {},
   };
   const assistant = new Assistant(store, native, configInput.parse({ defaultCwd: '/synthetic', ...config }), error => errors.push(error));

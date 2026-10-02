@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
 import type { ModuleBackend, ModuleBackendContext, ModuleHostApi, ModuleHostIntent,
-  ModuleHostIntentBody, ModuleHostIntentResult, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
+  ModuleHostIntentBody, ModuleHostIntentResult, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
 import { activate } from '../src/index.ts';
 import { coordinatorTools } from '../src/mcp.ts';
 import { Store } from '../src/store.ts';
@@ -43,12 +43,14 @@ function fixture(t: TestContext, seed = true) {
       mcp: { pendingConnectionCount: 0 } },
   });
   const sessions = new Map(['front', 'source'].map(id => [id, meta(id)]));
+  const events = new Map<string, NativeChatEvent[]>();
   const calls: { name: ModuleHostIntent; body: unknown }[] = [], errors: unknown[] = [];
   const backends: ModuleBackend[] = [], releases: (() => void)[] = [];
   let onCall: ((name: ModuleHostIntent) => Promise<void>) | null = null;
+  let onResult: ((name: ModuleHostIntent, result: unknown) => unknown) | null = null;
   let failure: ModuleHostIntent | null = null, missingReceipt = false;
   const host: ModuleHostApi = {
-    chatReadVersion: 1, askResponseVersion: 1, roleAssignmentVersion: 1, sessionLoadVersion: 1,
+    chatReadVersion: 1, askResponseVersion: 1, roleAssignmentVersion: 1, roleAvailabilityVersion: 1, sessionLoadVersion: 1,
     promptReceiptVersion: 1, toolScopeVersion: 1, promptOriginVersion: 1, roleResourcePolicyVersion: 1,
     async call<Name extends ModuleHostIntent>(name: Name, body: ModuleHostIntentBody<Name>): Promise<ModuleHostIntentResult<Name>> {
       assert.equal(context.signal.aborted, false, 'Host capability remains live while draining');
@@ -64,20 +66,26 @@ function fixture(t: TestContext, seed = true) {
       let result: unknown;
       switch (name) {
         case 'session/get': result = { meta: structuredClone(sessions.get(sessionId!) ?? null) }; break;
+        case 'roles/availability': result = { sessionId, roles: sessions.get(sessionId!)!.roles, status: 'available', reasons: [] }; break;
         case 'session/load':
           assert.equal(sessionId, 'front');
           sessions.get('front')!.loaded = true;
+          sessions.get('front')!.appliedRoles = structuredClone(sessions.get('front')!.roles);
           result = { ok: true, sessionId }; break;
         case 'session/tool-scope': result = { sessionId, loaded: true, configured: null,
           applied: { builtins: [], mcpServers: [{ name: 'assistant', tools: coordinatorTools }] },
           tools: coordinatorTools.map(name => ({ name: `assistant-${name}`, mcpServerName: 'assistant', mcpToolName: name })) }; break;
-        case 'roles/readiness': result = { sessionId, ready: true, rolesNeedReload: false }; break;
+        case 'roles/readiness': result = { sessionId, ready: true, loaded: true, rolesNeedReload: false,
+          roles: sessions.get(sessionId!)!.roles, appliedRoles: sessions.get(sessionId!)!.appliedRoles }; break;
         case 'prompt':
-          assert.equal(sessionId, 'front');
+          assert.ok(sessionId === 'front' || sessionId === 'source');
           result = { ok: true, ...(missingReceipt ? {} : { messageId: 'native-notice-receipt' }) }; break;
+        case 'session/chat': result = { sessionId, source: 'source' in body ? body.source : 'live',
+          direction: 'backward', events: events.get(sessionId!) ?? [], cursorStatus: 'ok',
+          cursor: 'synthetic-cursor', hasMore: false, read: { rpc: 1, events: events.get(sessionId!)?.length ?? 0 } }; break;
         default: throw new Error(`Unexpected synthetic Host operation: ${name}`);
       }
-      return result as ModuleHostIntentResult<Name>;
+      return (onResult ? onResult(name, structuredClone(result)) : result) as ModuleHostIntentResult<Name>;
     },
   };
   let stopping = new AbortController(), signal = new AbortController();
@@ -93,7 +101,8 @@ function fixture(t: TestContext, seed = true) {
     rmSync(root, { recursive: true, force: true });
   });
   return {
-    dataRoot, database, calls, errors, sessions,
+    dataRoot, database, calls, errors, sessions, events,
+    respond(value: typeof onResult) { onResult = value; },
     get context() { return context; },
     stop() { stopping.abort(); },
     revoke() { signal.abort(); },
@@ -159,6 +168,124 @@ test('an already stopping activation is rejected before opening data', async t =
   await assert.rejects(f.activate(), { code: 'STOPPING' });
   assert.equal(existsSync(f.dataRoot), false);
   assert.deepEqual(f.calls, []);
+});
+
+test('activation requires public Host availability before opening data', async t => {
+  const f = fixture(t, false);
+  const { roleAvailabilityVersion: _version, ...host } = f.context.host;
+  await assert.rejects(activate({ ...f.context, host }), { code: 'HOST_CAPABILITY' });
+  assert.equal(existsSync(f.dataRoot), false);
+});
+
+const connection = { moduleId: 'connection', roleId: 'binding', moduleName: 'Synthetic', name: 'Binding' };
+function addConnections(meta: PublicSessionMeta, order: string) {
+  const role = meta.roles![0]!;
+  meta.roles = order === 'first' ? [connection, role]
+    : order === 'last' ? [role, connection] : [connection, role, { ...connection, moduleId: 'second' }];
+  meta.appliedRoles = [...meta.roles].reverse();
+}
+async function callTool(backend: ModuleBackend, name: string, toolCallId: string, args: unknown) {
+  const result = await backend.routes.find(route => route.path === '/mcp')!.handler({
+    params: {}, query: {}, headers: {}, signal: new AbortController().signal,
+    body: { jsonrpc: '2.0', id: toolCallId, method: 'tools/call', params: { name, arguments: args,
+      _meta: { 'cockpit/invocation': { sessionId: 'front', runtimeSessionId: 'front', subagent: false, toolCallId } } } },
+  });
+  return result.body as { result: { isError: boolean; content: { text: string }[] } };
+}
+function inputEvents(messageId: string, toolCallId: string): NativeChatEvent[] {
+  return [
+    { id: `event-${messageId}`, type: 'user.message', timestamp: Date.now(),
+      data: { messageId, interactionId: messageId, content: 'Synthetic human instruction' } },
+    { id: `event-${toolCallId}`, type: 'assistant.message',
+      data: { interactionId: messageId, toolRequests: [{ toolCallId }] } },
+  ];
+}
+for (const order of ['first', 'last', 'multiple']) {
+  for (const cold of [false, true]) {
+    test(`neutral ${order} roles retain ${cold ? 'cold' : 'loaded'} notification, receipt, MCP inbox and dispatch chains`, async t => {
+      const f = fixture(t), front = f.sessions.get('front')!;
+      addConnections(front, order);
+      front.loaded = !cold;
+      if (cold) front.appliedRoles = [];
+      const backend = await f.activate();
+      await backend.onReady!();
+      assert.deepEqual(f.errors, []);
+      assert.equal(f.state().inbox[0]!.notice_state, 'notified');
+      assert.equal(f.calls.filter(call => call.name === 'session/load').length, cold ? 1 : 0);
+      const notice = f.calls.find(call => call.name === 'prompt')!;
+      assert.equal((notice.body as { mode: string }).mode, 'enqueue');
+      f.events.set('front', inputEvents('notice', 'read-inbox'));
+      await backend.promptAccepted!({ sessionId: 'front', messageId: 'notice', origin: 'module', acceptedAt: Date.now() });
+      const inbox = await callTool(backend, 'assistant_inbox', 'read-inbox', {});
+      assert.equal(inbox.result.isError, false);
+      assert.match(inbox.result.content[0]!.text, /Synthetic completed reply/);
+      assert.deepEqual(f.state().inbox, []);
+      const duplicate = await callTool(backend, 'assistant_inbox', 'read-inbox', {});
+      assert.equal(duplicate.result.isError, false);
+      assert.doesNotMatch(duplicate.result.content[0]!.text, /Synthetic completed reply/);
+      const blocked = await callTool(backend, 'assistant_dispatch', 'read-inbox',
+        { items: [{ topicId: 'topic', prompt: 'Do not send module input' }] });
+      assert.equal(blocked.result.isError, true);
+      assert.match(blocked.result.content[0]!.text, /HUMAN_REQUIRED/);
+      assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+      f.events.set('front', inputEvents('human', 'dispatch'));
+      await backend.promptAccepted!({ sessionId: 'front', messageId: 'human', origin: 'user', acceptedAt: Date.now() });
+      const sent = await callTool(backend, 'assistant_dispatch', 'dispatch',
+        { items: [{ topicId: 'topic', prompt: 'Synthetic human instruction' }] });
+      assert.equal(sent.result.isError, false);
+      assert.match(sent.result.content[0]!.text, /accepted/);
+      const prompt = f.calls.filter(call => call.name === 'prompt').at(-1)!;
+      assert.deepEqual(prompt.body, { sessionId: 'source', mode: 'immediate', text: 'Synthetic human instruction' });
+      await callTool(backend, 'assistant_dispatch', 'dispatch',
+        { items: [{ topicId: 'topic', prompt: 'Synthetic human instruction' }] });
+      assert.equal(f.calls.filter(call => call.name === 'prompt').length, 2);
+    });
+  }
+}
+test('neutral cold-load compatibility failures and changed saved roles cannot load or consume mail', async t => {
+  for (const state of ['denied', 'unknown', 'changed', 'two-assistants', 'missing-saved']) {
+    await t.test(state, async t => {
+      const f = fixture(t), front = f.sessions.get('front')!;
+      addConnections(front, 'multiple'); front.loaded = false; front.appliedRoles = [];
+      if (state === 'two-assistants') front.roles!.push({ ...front.roles![1]!, roleId: 'organizer' });
+      if (state === 'missing-saved') delete front.roles;
+      f.respond((name, result) => {
+        if (name !== 'roles/availability') return result;
+        if (state === 'changed') { front.roles!.push({ ...connection, moduleId: 'raced' }); return result; }
+        return { ...(result as ModuleHostIntentResult<'roles/availability'>),
+          status: state === 'denied' ? 'unavailable' : 'unknown' };
+      });
+      const backend = await f.activate();
+      await backend.onReady!();
+      assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
+      assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+      assert.equal(f.state().wake, null);
+      assert.equal(f.errors.length, 1);
+    });
+  }
+});
+test('neutral post-load changes and readiness failure retain mail and forbid blind reload', async t => {
+  for (const phase of ['session/load', 'roles/readiness'] as const) {
+    await t.test(phase, async t => {
+      const f = fixture(t), front = f.sessions.get('front')!;
+      addConnections(front, 'first'); front.loaded = false; front.appliedRoles = [];
+      f.respond((name, result) => {
+        if (name === phase) {
+          if (phase === 'session/load') front.rolesNeedReload = true;
+          else return { ...(result as ModuleHostIntentResult<'roles/readiness'>), ready: false };
+        }
+        return result;
+      });
+      const backend = await f.activate();
+      await backend.onReady!();
+      assert.equal(f.state().wake!.state, 'failed');
+      assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+      assert.equal(f.calls.some(call => call.name === 'prompt'), false);
+      front.loaded = false;
+      await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'front' });
+      assert.equal(f.calls.filter(call => call.name === 'session/load').length, 1);
+    });
+  }
 });
 
 test('stopping before readiness prevents all foreground loading and prompts', async t => {
@@ -254,7 +381,7 @@ for (const outcome of ['accepted', 'lost', 'missing'] as const) {
   });
 }
 
-for (const phase of ['session/tool-scope', 'roles/readiness'] as const) {
+for (const phase of ['roles/availability', 'session/tool-scope', 'roles/readiness'] as const) {
   test(`shutdown during ${phase} drains validation without reserving or prompting`, { timeout: 5000 }, async t => {
     const f = fixture(t), gate = f.gate(phase);
     const backend = await f.activate(), ready = backend.onReady!();
@@ -269,9 +396,9 @@ for (const phase of ['session/tool-scope', 'roles/readiness'] as const) {
     assert.equal(f.context.signal.aborted, false);
     assert.equal(f.state().inbox[0]!.notice_state, 'pending');
     assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
-    if (phase === 'session/tool-scope') {
-      assert.equal((f.errors[0] as { code: string }).code, 'STOPPING');
+    assert.equal((f.errors[0] as { code: string }).code, 'STOPPING');
+    if (phase !== 'roles/readiness') {
       assert.equal(f.calls.some(call => call.name === 'roles/readiness'), false);
-    } else assert.deepEqual(f.errors, []);
+    }
   });
 }

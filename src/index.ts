@@ -10,10 +10,10 @@ import { Store } from './store.ts';
 export async function activate(context: ModuleBackendContext): Promise<ModuleBackend> {
   const host = context.host;
   requireFact(context.shutdownVersion === 1 && context.serviceReadyVersion === 1 && host.chatReadVersion === 1 && host.askResponseVersion === 1
-    && host.roleAssignmentVersion === 1 && host.sessionLoadVersion === 1
+    && host.roleAssignmentVersion === 1 && host.roleAvailabilityVersion === 1 && host.sessionLoadVersion === 1
     && host.promptReceiptVersion === 1 && host.toolScopeVersion === 1
     && host.promptOriginVersion === 1 && host.roleResourcePolicyVersion === 1,
-  'HOST_CAPABILITY', 'Native Chat Assistant needs safe shutdown, prompt-origin observations and exclusive role resources');
+  'HOST_CAPABILITY', 'Native Chat Assistant needs safe shutdown, prompt-origin observations, Host role compatibility and exclusive role resources');
   requireFact(!context.stopping.aborted && !context.signal.aborted, 'STOPPING', 'Assistant is stopping', 503);
   const config = configInput.parse(context.config), release = await acquireLease(context.dataRoot);
   if (context.stopping.aborted || context.signal.aborted) { release(); requireFact(false, 'STOPPING', 'Assistant is stopping', 503); }

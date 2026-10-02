@@ -90,12 +90,13 @@ test('schema-4 unread is readable once; consumed and migrated native identities 
       assert.equal(store.reserveNotice(), null, 'Migration must not schedule notifications or business work');
       const expected = store.inbox();
       assert.equal(expected.length, legacyInbox.filter((item: { body: string | null }) => item.body !== null).length);
-      const result = store.take('synthetic-native-read', 100);
-      assert.deepEqual(result.items, expected);
-      assert.equal(result.alreadyRead, false);
-      assert.equal(result.hasMore, false);
-      assert.deepEqual(store.inbox(), [], 'Consumed bodies are deleted, not hidden or cached');
-      assert.deepEqual(store.take('synthetic-native-read', 100), { items: [], alreadyRead: true, hasMore: false });
+      assert.deepEqual(store.inbox(), expected, 'Listing preserved rows does not consume them');
+      store.transaction(() => store.removeResolved(expected.map(item => item.id)));
+      assert.deepEqual(store.inbox(), [], 'Handled legacy rows leave the active inbox');
+      assert.equal(store.sql.prepare('SELECT COUNT(*) AS count FROM mailbox').get()!.count, expected.length,
+        'Original legacy bodies remain in-place as inert history, never copied into a new mirror');
+      store.removeResolved(expected.map(item => item.id));
+      assert.deepEqual(store.inbox(), []);
       for (const item of items) assert.equal(store.enqueue(item), false);
       assert.equal(store.reserveNotice(), null);
       assert.deepEqual(retainedRows(store.sql, 4), archive, 'Active operations never rewrite the old inbox or other archives');

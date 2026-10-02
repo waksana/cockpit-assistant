@@ -42,23 +42,30 @@ archive root and as a sidecar. Format 2, channel `rolling`, uses the public
 [host release contract](https://github.com/waksana/cockpit/blob/main/docs/releasing.md).
 Independent checksum files avoid a self-referential archive digest.
 
-The product is module **`assistant`**, backend API 1, requiring `shutdown.v1`, service readiness,
-chat reads, ask responses, role assignments, role availability, session load, native tool scope,
-exclusive role resources and prompt-origin observations. No module frontend/UI
-capabilities are required. Foreground attribution uses actual native acceptance
-and MCP `toolCallId` metadata. Missing capabilities fail before opening data.
+The product is module **`assistant`**, backend API 1, requiring `shutdown.v1`,
+service readiness, session load and prompt receipts. No module
+frontend/UI, role-availability or prompt-origin capability is required by the
+support service. MCP attribution retains native invocation/session/tool-call
+identity. The agent's separately configured Host MCP tools have their own native
+requirements. Missing service capabilities fail before opening data.
 `shutdown.v1` requires the early stopping signal and awaited `onStop`/`dispose`
 contract; installing a newer SDK alone does not establish Host support.
-Required intents are extracted from actual backend host calls. Packaging creates
+Required intents combine actual backend host calls and the role's direct Host
+MCP dependencies, including `session/chat/text`, creation and ask answers.
+The latter are not service routing wrappers and require no module SDK upgrade.
+An older Host lacking lightweight text support must not accept this release.
+Packaging creates
 the target database in memory and checks its four active tables:
 `topics`, `deliveries`, `mailbox` and `seen`.
 
 The session-directory/evidence change retains these exact schema-5 definitions
 and every existing topic, mapping and history. Its additional values in `seen`
-are namespaced, bodyless source/read/disposition/output receipts, not a new schema
+are namespaced, bodyless source/inbox-range/agent-handling receipts, not a new schema
 or business-status snapshot. New reply rows hold source pointers; old unread
-bodies are not rewritten on startup and are removed only on an explicit evidence
-disposition. No production registry cleanup is part of this release.
+bodies are not rewritten on startup. Explicit handling archives their original
+rows in-place using bodyless receipt markers; no body copy or bulk deletion occurs.
+New pointer rows leave the mailbox when handled. Legacy dispatch/provenance/creation records remain inert, never
+replayed. No production registry cleanup or foreground migration is part of this release.
 The advertised schema-4-to-5 migration below therefore remains necessary and
 unchanged, rather than being replaced by an empty migration list.
 

@@ -7,6 +7,8 @@ import { applicationTables, schemaVersion } from './schema-preflight.mjs';
 import { preservedTopics, schema5Migrations } from './migration-contract.mjs';
 
 export const repository = 'waksana/cockpit-assistant';
+// The role consumes these through the external Host MCP, not module wrappers.
+export const agentRequiredIntents = ['session/chat/text', 'session/new', 'session/get', 'session/load', 'prompt', 'respondAsk'];
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export function identity(sequence, sourceSha) {
   assert.match(String(sequence), /^[1-9]\d*$/);
@@ -57,8 +59,7 @@ export async function product(root) {
   for (const [file, gate] of [
     ['src/index.ts', 'context.shutdownVersion === 1'],
     ['src/index.ts', 'context.serviceReadyVersion === 1'],
-    ...['chatRead', 'askResponse', 'roleAssignment', 'roleAvailability', 'sessionLoad', 'promptReceipt', 'toolScope',
-      'roleResourcePolicy', 'promptOrigin'].map(name => ['src/index.ts', `host.${name}Version === 1`]),
+    ...['sessionLoad', 'promptReceipt'].map(name => ['src/index.ts', `host.${name}Version === 1`]),
   ]) assert.ok(sources[file].includes(gate), `Review changed capability gate: ${gate}`);
   assert.ok(sources['src/index.ts'].includes("'assistant.sqlite'"), 'Review changed database path');
   const { Store } = await import(new URL('../src/store.ts', import.meta.url));
@@ -71,10 +72,9 @@ export async function product(root) {
     assert.deepEqual(tables, applicationTables, 'The released database must match the declared foreground schema');
     const result = {
       kind: 'module', id: manifest.id, hostApi: { min: 1, max: 1 },
-      requiresCapabilities: ['module-api.v1', 'shutdown.v1', 'serviceReady.v1', 'chatRead.v1', 'askResponse.v1',
-        'roleAssignment.v1', 'roleAvailability.v1', 'sessionLoad.v1', 'promptReceipt.v1', 'toolScope.v1', 'roleResourcePolicy.v1', 'promptOrigin.v1'],
-      requiredIntents: [...new Set(hostSources.flatMap(source =>
-        [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1])))].sort(),
+      requiresCapabilities: ['module-api.v1', 'shutdown.v1', 'serviceReady.v1', 'sessionLoad.v1', 'promptReceipt.v1'],
+      requiredIntents: [...new Set([...agentRequiredIntents, ...hostSources.flatMap(source =>
+        [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1]))])].sort(),
       databases: [{ path: 'assistant.sqlite', schema, preserve: preservedTopics() }],
       migrations: schema5Migrations,
     };

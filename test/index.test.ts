@@ -129,7 +129,8 @@ function fixture(t: TestContext, seed = true) {
       try {
         const wake = sql.prepare("SELECT fingerprint FROM seen WHERE id='foreground-wake'").get();
         return {
-          inbox: sql.prepare('SELECT notice_state,notification_receipt,text FROM mailbox ORDER BY sequence').all(),
+          inbox: sql.prepare(`SELECT notice_state,notification_receipt,text FROM mailbox
+            WHERE NOT EXISTS(SELECT 1 FROM seen WHERE seen.id='inbox-archived:'||mailbox.id) ORDER BY sequence`).all(),
           wake: wake ? JSON.parse(String(wake.fingerprint)) as { sessionId: string; state: string } : null,
         };
       } finally { sql.close(); }
@@ -140,7 +141,7 @@ function fixture(t: TestContext, seed = true) {
 async function assertIngressStopped(backend: ModuleBackend, f: ReturnType<typeof fixture>) {
   const before = f.calls.length;
   await backend.onReady!();
-  await backend.promptAccepted!({ sessionId: 'front', messageId: 'late', origin: 'module', acceptedAt: Date.now() });
+  assert.equal(backend.promptAccepted, undefined);
   await backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
     event: { id: 'late-idle', type: 'session.idle', data: {} } });
   await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source' });
@@ -170,11 +171,12 @@ test('an already stopping activation is rejected before opening data', async t =
   assert.deepEqual(f.calls, []);
 });
 
-test('activation requires public Host availability before opening data', async t => {
+test('activation does not require unrelated role availability or prompt origin capabilities', async t => {
   const f = fixture(t, false);
   const { roleAvailabilityVersion: _version, ...host } = f.context.host;
-  await assert.rejects(activate({ ...f.context, host }), { code: 'HOST_CAPABILITY' });
-  assert.equal(existsSync(f.dataRoot), false);
+  const backend = await activate({ ...f.context, host });
+  assert.equal(existsSync(f.dataRoot), true);
+  await backend.dispose!();
 });
 
 const connection = { moduleId: 'connection', roleId: 'binding', moduleName: 'Synthetic', name: 'Binding' };
@@ -202,7 +204,7 @@ function inputEvents(messageId: string, toolCallId: string): NativeChatEvent[] {
 }
 for (const order of ['first', 'last', 'multiple']) {
   for (const cold of [false, true]) {
-    test(`neutral ${order} roles retain ${cold ? 'cold' : 'loaded'} notification, receipt, MCP inbox and dispatch chains`, async t => {
+    test(`unrelated ${order} roles retain ${cold ? 'cold' : 'loaded'} notification and ordinary MCP access without qualification`, async t => {
       const f = fixture(t), front = f.sessions.get('front')!;
       addConnections(front, order);
       front.loaded = !cold;
@@ -215,19 +217,17 @@ for (const order of ['first', 'last', 'multiple']) {
       const notice = f.calls.find(call => call.name === 'prompt')!;
       assert.equal((notice.body as { mode: string }).mode, 'enqueue');
       f.events.set('front', inputEvents('notice', 'read-inbox'));
-      await backend.promptAccepted!({ sessionId: 'front', messageId: 'notice', origin: 'module', acceptedAt: Date.now() });
+      assert.equal(backend.promptAccepted, undefined);
       const inbox = await callTool(backend, 'assistant_inbox', 'read-inbox', {});
       assert.equal(inbox.result.isError, false);
       assert.doesNotMatch(inbox.result.content[0]!.text, /Synthetic completed reply/);
       assert.equal(f.state().inbox.length, 1);
-      const { items } = JSON.parse(inbox.result.content[0]!.text) as { items: { readToken: string }[] };
-      f.events.set('source', [{ id: 'source-event', type: 'assistant.message',
-        data: { messageId: 'reply', content: 'Synthetic completed reply' } }]);
-      f.events.set('front', inputEvents('notice', 'read-evidence'));
-      const evidence = await callTool(backend, 'assistant_read', 'read-evidence', { token: items[0]!.readToken });
-      assert.equal(evidence.result.isError, false);
-      assert.match(evidence.result.content[0]!.text, /Synthetic completed reply/);
-      const { receipt } = JSON.parse(evidence.result.content[0]!.text) as { receipt: { id: string } };
+      const { receipt } = JSON.parse(inbox.result.content[0]!.text) as { receipt: { id: string; inboxIds: string[] } };
+      const checkpoint = await callTool(backend, 'assistant_checkpoint', 'read-checkpoint', {
+        receiptId: receipt.id, sessionId: 'source', readIds: receipt.inboxIds, complete: true,
+        position: { query: { source: 'persisted', direction: 'backward' }, nextQuery: null, boundaryEventId: 'source-event' },
+      });
+      assert.equal(checkpoint.result.isError, false);
       f.events.set('front', inputEvents('notice', 'resolve-evidence'));
       const decision = await callTool(backend, 'assistant_resolve', 'resolve-evidence', { receiptId: receipt.id, disposition: 'silent' });
       assert.equal(decision.result.isError, false);
@@ -238,23 +238,19 @@ for (const order of ['first', 'last', 'multiple']) {
       const blocked = await callTool(backend, 'assistant_dispatch', 'read-inbox',
         { items: [{ topicId: 'topic', prompt: 'Do not send module input' }] });
       assert.equal(blocked.result.isError, true);
-      assert.match(blocked.result.content[0]!.text, /HUMAN_REQUIRED/);
+      assert.match(blocked.result.content[0]!.text, /TOOL_RETIRED/);
       assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
       f.events.set('front', inputEvents('human', 'dispatch'));
-      await backend.promptAccepted!({ sessionId: 'front', messageId: 'human', origin: 'user', acceptedAt: Date.now() });
       const sent = await callTool(backend, 'assistant_dispatch', 'dispatch',
         { items: [{ topicId: 'topic', prompt: 'Synthetic human instruction' }] });
-      assert.equal(sent.result.isError, false);
-      assert.match(sent.result.content[0]!.text, /accepted/);
-      const prompt = f.calls.filter(call => call.name === 'prompt').at(-1)!;
-      assert.deepEqual(prompt.body, { sessionId: 'source', mode: 'immediate', text: 'Synthetic human instruction' });
-      await callTool(backend, 'assistant_dispatch', 'dispatch',
-        { items: [{ topicId: 'topic', prompt: 'Synthetic human instruction' }] });
-      assert.equal(f.calls.filter(call => call.name === 'prompt').length, 2);
+      assert.equal(sent.result.isError, true);
+      assert.match(sent.result.content[0]!.text, /TOOL_RETIRED/);
+      assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+      assert.equal(f.calls.some(call => ['roles/availability', 'roles/readiness', 'session/tool-scope', 'session/chat'].includes(call.name)), false);
     });
   }
 }
-test('neutral cold-load compatibility failures and changed saved roles cannot load or consume mail', async t => {
+test('role preflight denials and missing role labels do not block existing Host-granted Assistant tools', async t => {
   for (const state of ['denied', 'unknown', 'changed', 'two-assistants', 'missing-saved']) {
     await t.test(state, async t => {
       const f = fixture(t), front = f.sessions.get('front')!;
@@ -269,28 +265,27 @@ test('neutral cold-load compatibility failures and changed saved roles cannot lo
       });
       const backend = await f.activate();
       await backend.onReady!();
-      assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
-      assert.equal(f.state().inbox[0]!.notice_state, 'pending');
-      assert.equal(f.state().wake, null);
-      assert.equal(f.errors.length, 1);
+      assert.equal(f.calls.some(call => call.name === 'roles/availability'), false);
+      assert.equal(f.calls.filter(call => call.name === 'session/load').length, 1);
+      assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+      assert.equal(f.state().inbox[0]!.notice_state, 'notified');
+      assert.equal(f.errors.length, 0);
     });
   }
 });
-test('neutral post-load changes and readiness failure retain mail and forbid blind reload', async t => {
-  for (const phase of ['session/load', 'roles/readiness'] as const) {
+test('native load rejection or uncertainty retains mail and forbids blind reload', async t => {
+  for (const phase of ['failed', 'unknown'] as const) {
     await t.test(phase, async t => {
       const f = fixture(t), front = f.sessions.get('front')!;
       addConnections(front, 'first'); front.loaded = false; front.appliedRoles = [];
       f.respond((name, result) => {
-        if (name === phase) {
-          if (phase === 'session/load') front.rolesNeedReload = true;
-          else return { ...(result as ModuleHostIntentResult<'roles/readiness'>), ready: false };
-        }
+        if (name === 'session/load') return phase === 'failed'
+          ? { ok: false, sessionId: 'front' } : { ok: true };
         return result;
       });
       const backend = await f.activate();
       await backend.onReady!();
-      assert.equal(f.state().wake!.state, 'failed');
+      assert.equal(f.state().wake!.state, phase);
       assert.equal(f.state().inbox[0]!.notice_state, 'pending');
       assert.equal(f.calls.some(call => call.name === 'prompt'), false);
       front.loaded = false;
@@ -310,6 +305,52 @@ test('stopping before readiness prevents all foreground loading and prompts', as
   assert.equal(f.context.signal.aborted, false);
   assert.deepEqual(f.calls, []);
   assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+});
+
+test('a foreground switch during final native readback cannot send to the old address', async t => {
+  const f = fixture(t);
+  const backend = await f.activate();
+  let foregroundReads = 0, switched = false;
+  f.respond((name, result) => {
+    if (name !== 'session/get' || (result as ModuleHostIntentResult<'session/get'>).meta?.sessionId !== 'front')
+      return result;
+    if (++foregroundReads !== 2 || switched) return result;
+    switched = true;
+    return (async () => {
+      const selected = await callTool(backend, 'assistant_foreground', 'switch-address', { sessionId: 'source' });
+      assert.equal(selected.result.isError, false);
+      return result;
+    })();
+  });
+
+  await backend.onReady!();
+  assert.equal(switched, true);
+  assert.equal(f.calls.some(call => call.name === 'prompt'), false);
+  assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+  assert.equal((f.errors[0] as { code: string }).code, 'FOREGROUND_CHANGED');
+});
+
+test('disabling reminders during discovery cannot load a deselected foreground', async t => {
+  const f = fixture(t);
+  f.sessions.get('front')!.loaded = false;
+  const backend = await f.activate();
+  let disabled = false;
+  f.respond((name, result) => {
+    if (disabled || name !== 'session/get' || (result as ModuleHostIntentResult<'session/get'>).meta?.sessionId !== 'front')
+      return result;
+    disabled = true;
+    return (async () => {
+      const selected = await callTool(backend, 'assistant_foreground', 'disable-address', { sessionId: null });
+      assert.equal(selected.result.isError, false);
+      return result;
+    })();
+  });
+  await backend.onReady!();
+  assert.equal(disabled, true);
+  assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
+  assert.equal(f.state().wake, null);
+  assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+  assert.equal((f.errors[0] as { code: string }).code, 'FOREGROUND_CHANGED');
 });
 
 for (const lost of [false, true]) {
@@ -356,8 +397,7 @@ for (const outcome of ['accepted', 'lost', 'missing'] as const) {
     const backend = await f.activate(), ready = backend.onReady!();
     await gate.entered;
     assert.equal(f.state().inbox[0]!.notice_state, 'calling');
-    assert.ok(f.calls.some(call => call.name === 'session/tool-scope'));
-    assert.ok(f.calls.some(call => call.name === 'roles/readiness'));
+    assert.equal(f.calls.some(call => call.name === 'session/tool-scope' || call.name === 'roles/readiness'), false);
     assert.equal((f.calls.find(call => call.name === 'prompt')!.body as { mode: string }).mode, 'enqueue');
     f.stop();
     let drained = false, disposed = false;
@@ -393,7 +433,7 @@ for (const outcome of ['accepted', 'lost', 'missing'] as const) {
   });
 }
 
-for (const phase of ['roles/availability', 'session/tool-scope', 'roles/readiness'] as const) {
+for (const phase of ['session/get'] as const) {
   test(`shutdown during ${phase} drains validation without reserving or prompting`, { timeout: 5000 }, async t => {
     const f = fixture(t), gate = f.gate(phase);
     const backend = await f.activate(), ready = backend.onReady!();
@@ -408,9 +448,6 @@ for (const phase of ['roles/availability', 'session/tool-scope', 'roles/readines
     assert.equal(f.context.signal.aborted, false);
     assert.equal(f.state().inbox[0]!.notice_state, 'pending');
     assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
-    assert.equal((f.errors[0] as { code: string }).code, 'STOPPING');
-    if (phase !== 'roles/readiness') {
-      assert.equal(f.calls.some(call => call.name === 'roles/readiness'), false);
-    }
+    assert.equal(f.calls.some(call => call.name === 'roles/readiness'), false);
   });
 }

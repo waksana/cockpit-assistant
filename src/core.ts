@@ -6,6 +6,7 @@ import { BusinessError, errorText, requireFact } from './errors.ts';
 import type { Caller, Gateway, Input } from './gateway.ts';
 import { Store, fingerprint, incomingIdentity, type Delivery, type Incoming, type Topic } from './store.ts';
 import { questionIdentity } from './question.ts';
+import { appliedAssistantRole, assistantRole, roleIdentity } from './roles.ts';
 
 const id = z.string().min(1).max(200);
 export const topicInput = z.strictObject({
@@ -46,8 +47,6 @@ function sessionOptions(config: Config) {
     ...(selectedRoles?.length ? { roles: selectedRoles } : {}),
     ...(toolScope && !legacy ? { toolScope } : {}) };
 }
-const activeRole = (meta: PublicSessionMeta, name: string) =>
-  meta.appliedRoles?.some(role => role.moduleId === 'assistant' && role.roleId === name) === true;
 const worker = (meta: PublicSessionMeta | null): meta is PublicSessionMeta => !!meta
   && (Array.isArray(meta.roles) || Array.isArray(meta.appliedRoles))
   && ![...(meta.roles ?? []), ...(meta.appliedRoles ?? [])].some(role =>
@@ -63,11 +62,7 @@ const liveQuestion = (meta: PublicSessionMeta | null | undefined, question: Inco
   !!meta?.loaded && worker(meta) && !!meta.ask
   && fingerprint(questionIdentity(meta.ask)) === fingerprint(questionIdentity(question));
 const foregroundIdle = (meta: PublicSessionMeta) => meta.status === 'idle' && settled(meta);
-const foregroundRole = (meta: PublicSessionMeta) => !meta.rolesNeedReload
-  && meta.appliedRoles?.length === 1 && activeRole(meta, 'coordinator');
-const roleIdentity = (meta: PublicSessionMeta) => fingerprint({
-  roles: meta.roles, appliedRoles: meta.appliedRoles, rolesNeedReload: meta.rolesNeedReload,
-});
+const foregroundRole = (meta: PublicSessionMeta) => appliedAssistantRole(meta) === 'coordinator';
 function historyExcerpt(text: string): string {
   let low = 0, high = Math.min(text.length, 3000);
   while (low < high) {
@@ -247,8 +242,9 @@ export class Assistant {
       }
     }
     const sender = await this.native.session(source.sessionId);
-    requireFact(sender?.loaded && !sender.rolesNeedReload && activeRole(sender, 'coordinator'),
+    requireFact(sender && foregroundRole(sender),
       'CALLER_ROLE', 'The foreground role changed before dispatch', 403);
+    await this.native.validateForeground(sender);
     requireFact(!this.stopped, 'STOPPING', 'Assistant stopped before dispatch', 503);
     for (const [id, version] of versions) requireFact(this.store.topic(id).version === version,
       'TOPIC_CHANGED', 'Topic mapping changed during dispatch validation; inspect it before sending');
@@ -463,9 +459,10 @@ export class Assistant {
     if (!meta.loaded) {
       const wake = this.store.foregroundWake();
       if (wake?.sessionId === sessionId && wake.state !== 'loaded') return;
-      requireFact(meta.roles?.length === 1 && meta.roles[0]?.moduleId === 'assistant'
-        && meta.roles[0]?.roleId === 'coordinator', 'FOREGROUND_ROLE',
-      'The original foreground must retain only its saved Assistant role before loading', 403);
+      requireFact(assistantRole(meta.roles) === 'coordinator', 'FOREGROUND_ROLE',
+        'The original foreground must retain one saved Assistant coordinator identity before loading', 403);
+      await this.native.validateForeground(meta, 'saved');
+      if (this.stopped) return;
       this.store.saveForegroundWake({ sessionId, state: 'loading', error: null });
       try {
         const result = await this.native.host.call('session/load', { sessionId });

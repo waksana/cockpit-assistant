@@ -76,6 +76,7 @@ try {
   for (const legacy of [false, true]) {
     const store = new Store(':memory:'), calls = [], errors = [];
     const foreground = { sessionId: 'synthetic-foreground', loaded: true, rolesNeedReload: false,
+      roles: [{ moduleId: 'assistant', roleId: 'coordinator' }],
       appliedRoles: [{ moduleId: 'assistant', roleId: 'coordinator' }] };
     const assistant = new Assistant(store, {
       caller: async identity => ({ sessionId: foreground.sessionId, toolCallId: identity.toolCallId,

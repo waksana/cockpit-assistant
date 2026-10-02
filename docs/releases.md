@@ -43,7 +43,7 @@ archive root and as a sidecar. Format 2, channel `rolling`, uses the public
 Independent checksum files avoid a self-referential archive digest.
 
 The product is module **`assistant`**, backend API 1, requiring `shutdown.v1`, service readiness,
-chat reads, ask responses, role assignments, session load, native tool scope,
+chat reads, ask responses, role assignments, role availability, session load, native tool scope,
 exclusive role resources and prompt-origin observations. No module frontend/UI
 capabilities are required. Foreground attribution uses actual native acceptance
 and MCP `toolCallId` metadata. Missing capabilities fail before opening data.

@@ -18,6 +18,8 @@ uncertain identities are never replaced or retried blindly.
 
 Select the Assistant role when creating a native session. The role's exclusive
 resource policy connects only its Assistant MCP and enables only its topic Skill.
+Host-compatible neutral connection roles may coexist without adding model
+instructions, Skills or MCP resources; the Assistant identity remains distinct.
 The first accepted browser Chat input selects that foreground if none was
 configured. New topic sessions use ordinary native defaults, without an
 Assistant worker role or private scope. Existing sessions are never silently

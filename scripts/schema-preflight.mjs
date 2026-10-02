@@ -13,7 +13,7 @@ function context(dataRoot, signal) {
   return { moduleId: 'assistant', apiVersion: 1, serviceReadyVersion: 1, shutdownVersion: 1,
     stopping: new AbortController().signal,
     dataRoot, apiBase: '/_modules/assistant/fixture/api', config: {}, signal,
-    host: { chatReadVersion: 1, askResponseVersion: 1, roleAssignmentVersion: 1, sessionLoadVersion: 1,
+    host: { chatReadVersion: 1, askResponseVersion: 1, roleAssignmentVersion: 1, roleAvailabilityVersion: 1, sessionLoadVersion: 1,
       promptReceiptVersion: 1, toolScopeVersion: 1, promptOriginVersion: 1, roleResourcePolicyVersion: 1,
       async call() { throw new Error('Schema preflight must not call the Host'); } },
     report(error) { throw error; }, publish() {}, invalidate() {},

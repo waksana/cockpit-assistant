@@ -19,10 +19,15 @@ Dashboard and other clients must explicitly move to native `prompt` and
 ## Session setup
 
 Create an ordinary native session with the Assistant role (`assistant/coordinator`)
-and use the native Chat Composer. The role is exclusive: do not combine it with
-unrelated roles. Its instructions include the one shared topic Skill; no Skill
+and use the native Chat Composer. The role is exclusive: Host-compatible neutral
+connection roles may coexist only when they add no model instructions, Skills
+or MCP resources. Other capability roles (including Task Node) and a second
+Assistant identity are not compatible. The coordinator and organizer cannot
+share one session. Its instructions include the one shared topic Skill; no Skill
 reader tool is needed. The Host's public resource-policy and input-origin
-capabilities are required before the service opens its store.
+capabilities, plus `roleAvailabilityVersion:1`, are required before the service
+opens its store. Compatibility is checked through public `roles/availability`,
+not connection-role names or a module-owned catalog.
 
 The first receipt-authenticated browser input selects an unconfigured foreground.
 Alternatively persist its exact existing ID as `foregroundSessionId`. Other
@@ -30,6 +35,11 @@ coordinator-labelled sessions do not take over it. Eligible unread results can
 load this original foreground on demand; unrelated activity never creates a new
 one. Unloaded is not missing. A role update only
 applies to an existing handle after an explicit idle reload.
+Cold loading checks the saved selection before requesting the original ID;
+loaded use checks exact saved/applied roles, offered tools and actual readiness.
+Unknown compatibility, changed selections and incomplete readiness fail closed.
+Adding a connection role does not turn a connector's `module`-origin prompt into
+a `user`-origin input or grant human business authorization.
 
 Persistent defaults use the Assistant `config` value in Host `modules/config.json`
 without changing its `enabled`, version or digest:

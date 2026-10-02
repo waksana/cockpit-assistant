@@ -87,6 +87,7 @@ try {
   const events = [], observations = [], notices = [], errors = [], business = [];
   let human = 'initial';
   const foreground = { sessionId: 'synthetic-foreground', loaded: true, rolesNeedReload: false, status: 'idle', ask: null,
+    roles: [{ moduleId: 'assistant', roleId: 'coordinator' }],
     appliedRoles: [{ moduleId: 'assistant', roleId: 'coordinator' }],
     activity: { processing: false, hasActiveWork: false } };
   store = new Store(':memory:');

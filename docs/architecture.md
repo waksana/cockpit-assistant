@@ -3,7 +3,7 @@
 ```text
 User <-> native Assistant Chat -> Assistant MCP -> service -> topic session
                ^                                 |
-               |          read and consume inbox |
+               |        read Chat, decide receipt |
                +---- lightweight result reminder-+ <- worker reply
 ```
 
@@ -13,10 +13,10 @@ protocol. The service owns only four active tables:
 
 | Table | Responsibility |
 | --- | --- |
-| `topics` | Flat definitions, current native session mapping and actual creation outcome. |
+| `topics` | Directory identity/responsibility/scope, native session mapping and actual creation outcome. Never live progress. |
 | `deliveries` | Source/native IDs, target, split fingerprint and delivery outcome; no prompt/body copy. |
-| `mailbox` | Unread replies/questions and attachment references, deleted when returned by an inbox read. |
-| `seen` | Small native identity, input-origin, read-call receipts and latest foreground load outcome; no transcript bodies. |
+| `mailbox` | Pending source pointers and current question snapshots; legacy unread bodies are retained until resolution. |
+| `seen` | Native identities, input-origin, read positions/tokens, exact range/processing/output receipts and historical foreground load attempt; no transcript bodies. |
 
 One genuine native user input has one frozen topic split. Existing workers retain
 their IDs; unloaded workers load and ordinary business prompts use `immediate`.
@@ -65,7 +65,7 @@ human authorization.
 
 ## Inbox and notices
 
-Only registered topic workers are observed. Unrelated developers, observers and
+Only registered business sources are observed. Unrelated developers, observers and
 internal Assistant/organizer sessions are excluded. Complete main-agent reply
 text, including text accompanying a tool call, is eligible; transient chunks,
 tool results and subagent output are not separate replies. Eligibility for storage
@@ -89,12 +89,15 @@ events and no idle between queued A and B; its declared experimental
 `session.completion_receipt` did not fire. No delay or fabricated completion
 receipt substitutes for that missing guarantee.
 
-An inbox read transaction removes only entries included in its response. Unread
-pages and later arrivals remain. A repeated native read-call ID never consumes a
-second page. Reading does not delete native histories or files. If a response is
-lost or the model stops after reading, use native history; there is deliberately
-no presentation-hash, ACK or replay state machine.
-An explicit read can include accumulated partial progress before source idle.
+An inbox read lists source pointers, without consumption or body copies. A
+successful bounded Chat read creates a bodyless receipt of its exact native
+range. A later semantic disposition removes only those source identities;
+later arrivals remain. The native Chat is the only body store, including for
+recovery after compaction or lost tool responses. Checkpoints, page tokens,
+fragment hashes and output identities live in the existing receipt table, not
+another business-status store. [Evidence API](api.md#evidence-and-disposition)
+defines the bounds and explicit recovery behavior.
+An explicit evidence read can include partial progress before source idle.
 Before reads and reminders, native asks are compared with current loaded session
 state, including request ID, text and choices. Stale asks are removed from the
 unread mailbox, retaining their deduplication identity. Unavailable/unloaded asks
@@ -115,7 +118,7 @@ tool identities and native resource readiness, then samples source eligibility
 and foreground identity/roles/activity again. Source events invalidate stale
 samples across these awaits; foreground events also invalidate earlier resource
 readiness, even when the saved roles are unchanged. If the last eligible ask expires or a reply is
-consumed while loading, no reminder is reserved. Starting a load does not consume
+resolved while loading, no reminder is reserved. Starting a load does not consume
 mail or count as notification.
 
 When the foreground is idle, the service sends a bounded location-only reminder
@@ -132,15 +135,30 @@ drain, and interrupted load receipts recover as unknown rather than replaying.
 
 ## Semantic responsibility
 
-The foreground independently maintains only the register and actual status.
+The foreground independently maintains only the directory. Status/progress
+answers come from native evidence, never a rewritten directory description.
+Relevant sources receive a tail check at query time, so missed live events or
+service restart do not make a stale description appear current. The service
+does not permanently load all sources, poll all sessions or dispatch progress
+queries. A current tail may be reused only with earlier evidence actually
+available in context; cold contexts can explicitly reread it.
 Designing Assistant or the topic system is business and goes to a worker too.
 It may summarize reports while preserving uncertainty and disagreement, but may
 not evaluate quality, invent conclusions, add business follow-ups or answer for
 the user.
 The Skill uses the foreground's existing conversation to present only semantic
 novelty and actual state changes, in topic-oriented language. This is model
-guidance, not guaranteed semantic deduplication or a second presentation ledger.
+guidance, not guaranteed semantic deduplication or a second business-state ledger.
 It must not suppress new user inputs, requested repetition, corrections or failures.
+Explicit attention preferences in the user's native Chat take priority. A
+finish-only request ordinarily suppresses intermediate progress, while important
+decisions, blockers, failures and final outcomes warrant attention. A semantic
+`silent` decision closes those exact source IDs without another wake. A `notify`
+decision records intent and waits for a same-interaction primary native reply.
+Only that real output event supplies the presentation evidence; external transport
+delivery remains outside this receipt. Interrupted intentions remain visible,
+and uncertain sends are not replayed. Passive health checks likewise separate
+current readiness, historical wake attempts and pending source locations.
 
 Native asks require a separate single-topic dispatch matching the complete human
 original. Only outer whitespace is trimmed. Constrained choices match the whole

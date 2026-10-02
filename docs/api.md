@@ -6,10 +6,16 @@ There is no module frontend. Discover the enabled `assistant` ID/digest in Host
 Native role selection and session IDs come from the ordinary Host APIs.
 
 `GET /state` returns
-`{protocolVersion:5,conversation:"native-session-chat",inbox:"consume-on-read",foregroundSessionId,foregroundWake,schemaVersion:5}`.
-`foregroundWake` is null or the last load attempt's `{sessionId,state,error}`;
+`{protocolVersion:5,conversation:"native-session-chat",inbox:"evidence-and-disposition",health,schemaVersion:5}`.
+`health.current` samples foreground role/resource readiness with `checkedAt`,
+`sessionId` and `ready`, `not-ready`, or explicit `unknown`. An unloaded
+foreground is unknown, not a failed or completed business task. The check never
+loads, sends, resets a failure or replays a notice.
+`health.lastWakeAttempt` is null or the historical `{sessionId,state,error,at}`;
 states are `loading`, `loaded`, `failed`, or `unknown`. `failed` also includes
-post-load role/resource failures. `loaded` confirms only
+resource failure during that actual load attempt. Healthy subsequent checks do
+not erase it. `health.pendingUpdates` is the separate number of pending source
+locations, not business tasks. `loaded` confirms only
 the original handle was observed loaded, not notification delivery or business success.
 The old module `/messages`, `/inputs`, `/timeline`, SSE and local-clarification
 flows return **410 NATIVE_CHAT_REQUIRED**, not new content with old semantics.
@@ -85,9 +91,79 @@ does not migrate production sessions or repair arbitrary custom scopes.
 | `assistant_topics` | `{after?,limit?}` | Read the register. |
 | `assistant_topic` | `{topicId?,title?,content?,archived?,sessionId?}` | Edit the register; omit ID for a new topic. |
 | `assistant_dispatch` | `{items:[{topicId,prompt}]}` | Deliver the complete faithful split once for this native human input. |
-| `assistant_inbox` | `{ids?,limit?,peek?}` | Read and consume returned entries; `peek:true` only counts. |
+| `assistant_inbox` | `{ids?,limit?,peek?,decisionsAfter?}` | List locations/read tokens and valid asks with read receipts; no consumption. `peek:true` only counts. |
+| `assistant_read` | `{token,offset?,recover?}` | Read bounded native evidence, yielding a service-issued receipt only after the full range or all its fragments. |
+| `assistant_resolve` | `{receiptId,disposition:"silent"\|"notify"}` | Resolve only that actual read range; `notify` is intent, not a delivery assertion. |
 | `assistant_history` | `{sessionId,cursor?,recent?}` | Read recent dialogue for topic preparation, or an original native page. |
-| `assistant_status` | `{topicId}` | Inspect mapping and native activity/question facts. |
+| `assistant_status` | `{topicId}` | Check the native Chat tail, return freshness/read token, runtime facts and independently sampled health. |
+
+The register's `contentUse` and warning identify descriptions as identity,
+responsibility and scope only. Legacy text is retained, never promoted to current
+progress. Neither registration cardinality nor existing source permissions change.
+Only responsibility/scope changes belong in `assistant_topic`; ordinary progress
+belongs only in native Chat.
+
+### Evidence and disposition
+
+`assistant_status.freshness` includes `checkedAt`, `headEventId`, `changed`,
+`readToken`, and `lastRead` (event ID, receipt ID and read time).
+It returns no business evidence. A check reads one persisted tail event; the
+current Host has no separate byte-bounded tail-metadata endpoint. Only relevant
+registered sources are checked, without loading or scanning all sessions.
+No change permits reuse only when actual earlier evidence remains in context.
+Otherwise `assistant_read({token,recover:true})` obtains evidence again.
+
+Each read uses one persisted backward page of at most 16 native events. It
+returns primary user/assistant content, native errors/aborts and idle markers,
+with original event/message identities and timestamps. Tool results, reasoning,
+subagent events and ephemeral chunks are not business evidence. `nextToken`
+continues a required range; `olderCursor` supports explicitly requested older
+history. A first recent window is not all history. Checkpoints advance only
+after the new range reaches the prior exact event or the known history end;
+partial pagination never skips an unread gap.
+
+Large output uses consecutive JSON text fragments of at most 12,000 UTF-16
+characters with `nextOffset`; no receipt is issued until all fragments have
+been returned. The service re-reads the same native query and checks its complete
+hash, never stores a body cache. The Host RPC itself has an event-count limit,
+not a pre-fetch byte limit; upstream failures remain explicit. `cursor-expired`
+and `range-changed` do not advance the position. Recovery of a completed token
+searches for its exact original IDs using bounded continuation pages. Fresh
+recovery after an expired cursor starts at the tail and declares older coverage
+unknown rather than inventing an offset. There is no private native-store access.
+
+Inbox listings provide original source locations, not copied result bodies.
+Valid native asks include their original question/options and a read receipt;
+they are revalidated again before a presentation decision. A `silent` decision
+cannot consume a currently valid ask. Legacy unread bodies stay intact in
+storage until resolved, but must be recovered from native Chat to count as
+current business evidence. Missing evidence is a visible gap, not a fallback to
+old descriptions or mailbox text.
+
+A read receipt records exact source IDs, owning foreground, native tool call and
+returned range. This proves a tool returned evidence, not model comprehension
+or successful receipt of a lost tool response. `assistant_resolve` accepts only
+those service-issued receipts. It atomically resolves the included source IDs,
+never later arrivals. Silent disposition prevents another wake of those IDs.
+`notify` records `awaiting-output`: only an observed primary non-tool assistant
+message after the decision's actual native tool-call event in the same interaction
+supplies the output event/message ID. Append order, not UUID or timestamp order,
+establishes this boundary; earlier commentary cannot count.
+This establishes output in native Chat, not delivery to an external connector.
+Exact previously handled IDs are returned as such; semantically identical facts
+with different IDs are still the Assistant's judgment, not keyword matching.
+
+Unresolved reads and interrupted output intents are returned in
+`pendingDecisions.items`, with `nextAfter`/`hasMore` for the next
+`assistant_inbox({decisionsAfter})` page. Empty reads cannot displace actionable
+decisions. A passive foreground Chat read (at most four 16-event pages) can recover
+a missed output observation; `outputRecovery` states its sample time, bounds and
+unknown/observed evidence. Absent ordering evidence stays uncertain, never triggers an automatic
+resend. Wake `unknown` is separate and is never retried. These receipts do not
+claim exactly-once external notification. Recover source evidence and inspect
+original foreground Chat before deciding what is still owed to the user.
+The foreground may read its own history to restore explicit attention
+preferences and prior wording, without exposing unrelated internal sessions.
 
 Native attachments on the genuine source input are forwarded as descriptors.
 No preview URL is converted into a path and no second attachment store exists.
@@ -110,7 +186,7 @@ unloaded questions stay unread without being presented as live. `peek` and
 Explicit reads may include accumulated partial replies before idle; do not infer
 business completion from a read or reminder. See [notification semantics](architecture.md#inbox-and-notices).
 
-Load failures retain unread entries and report a service error. `foregroundWake`
+Load failures retain unread entries and report a service error. `health`
 is also included in `assistant_status`; an interrupted or unconfirmed load is
 `unknown`, not permission to retry. After inspecting the failure, use the normal
 Host API to load the **same original ID** and repair its role resources if needed.
@@ -122,7 +198,11 @@ after foreground recovery and are never replayed.
 
 MCP success means the stated local operation or native acceptance, not successful
 business completion. Transport uncertainty is not permission to repeat a send.
-Reading a consumed inbox response again uses `assistant_history`, not replay.
+An accepted reminder, read receipt and output receipt are different facts.
+Progress queries and reminders never authorize business dispatch. The
+receipt-authenticated browser input requirement (`HUMAN_REQUIRED`) remains:
+generic API/module input, including unproven connector ingress, cannot dispatch
+or answer for the human merely because it can read evidence.
 
 ### Partial creation
 
@@ -166,7 +246,7 @@ claiming a complete sample.
 Recent sampling always starts at the latest event and rejects `cursor`.
 `recent:false` preserves the original 16-event native page and its opaque cursor
 for explicitly requested history checks. This remains the foreground default,
-including after inbox consumption; original Chat history is never shortened.
+including after disposition; original Chat history is never shortened.
 
 ## Organizer
 

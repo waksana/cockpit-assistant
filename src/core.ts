@@ -7,6 +7,7 @@ import type { Caller, Gateway, Input } from './gateway.ts';
 import { Store, fingerprint, incomingIdentity, type Delivery, type Incoming, type Topic } from './store.ts';
 import { questionIdentity } from './question.ts';
 import { appliedAssistantRole, assistantRole, roleIdentity } from './roles.ts';
+import { Evidence, readInput, resolveInput } from './evidence.ts';
 
 const id = z.string().min(1).max(200);
 export const topicInput = z.strictObject({
@@ -18,6 +19,7 @@ export const dispatchInput = z.strictObject({
 });
 export const inboxInput = z.strictObject({
   ids: z.array(id).min(1).max(100).optional(), limit: z.int().min(1).max(100).default(50), peek: z.boolean().default(false),
+  decisionsAfter: z.int().nonnegative().default(0),
 });
 export const historyInput = z.strictObject({
   sessionId: id, cursor: z.string().min(1).max(16384).optional(), recent: z.boolean().optional(),
@@ -90,10 +92,13 @@ function organizerSources(caller: Caller): string[] {
   return z.array(id).max(20).parse(parsed);
 }
 const displayTopic = (topic: Topic) => ({ topicId: topic.id, title: topic.title, content: topic.content,
+  contentUse: 'identity-responsibility-scope-only',
+  warning: 'Registry content may contain legacy progress notes. It is background, never current progress or completion evidence.',
   sessionId: topic.session_id, archived: topic.archived, version: topic.version,
   mappingState: topic.mapping_state, error: topic.mapping_error, creationReceipt: topic.creation_receipt });
 
 export class Assistant {
+  readonly evidence: Evidence;
   private notice: Promise<void> | null = null;
   private noticeAgain = false;
   private creations = new Map<string, Promise<string>>();
@@ -103,7 +108,9 @@ export class Assistant {
   private foregroundObservation = { sessionId: '', version: 0 };
   private stopped = false;
   constructor(readonly store: Store, readonly native: Gateway, readonly config: Config,
-    readonly report: (error: unknown) => void) {}
+    readonly report: (error: unknown) => void) {
+    this.evidence = new Evidence(store, native, () => this.stopped);
+  }
   stop(): void { this.stopped = true; }
   async invoke(name: string, input: unknown, identity: McpInvocationMeta): Promise<unknown> {
     requireFact(!this.stopped, 'STOPPING', 'Assistant is stopping', 503);
@@ -116,6 +123,14 @@ export class Assistant {
       }
       case 'assistant_topic': return this.editTopic(caller, topicInput.parse(input));
       case 'assistant_dispatch': return this.deliver(caller, dispatchInput.parse(input).items);
+      case 'assistant_read': {
+        requireFact(caller.role === 'coordinator', 'FOREGROUND_REQUIRED', 'Only the foreground reads update evidence', 403);
+        return this.evidence.read(caller, readInput.parse(input));
+      }
+      case 'assistant_resolve': {
+        requireFact(caller.role === 'coordinator', 'FOREGROUND_REQUIRED', 'Only the foreground decides update presentation', 403);
+        return this.evidence.resolve(caller, resolveInput.parse(input));
+      }
       case 'assistant_inbox': {
         requireFact(caller.role === 'coordinator', 'FOREGROUND_REQUIRED', 'Only the Assistant foreground reads the inbox', 403);
         const query = inboxInput.parse(input ?? {});
@@ -123,18 +138,32 @@ export class Assistant {
         const available = new Set(this.store.inbox().filter(item => item.kind !== 'ask'
           || liveQuestion(this.currentSample(item.session_id, sources.get(item.session_id)), item.question)).map(item => item.id));
         if (query.peek) return { count: available.size };
-        const result = this.store.take(`${caller.sessionId}:${caller.toolCallId}`, query.limit, query.ids, available);
-        return { ...result, items: result.items.map(item => ({
+        const pending = this.store.inbox().filter(item => available.has(item.id) && (!query.ids || query.ids.includes(item.id)));
+        const selected = pending.slice(0, query.limit), tokens = new Map<string, string>();
+        for (const item of selected) if (item.kind !== 'ask' && !tokens.has(item.session_id))
+          tokens.set(item.session_id, this.evidence.locations(item.session_id, caller.sessionId,
+            selected.filter(row => row.kind !== 'ask' && row.session_id === item.session_id)
+              .map(row => this.store.source(row.id)?.eventId ?? row.native_id)));
+        await this.evidence.reconcileOutput(caller.sessionId);
+        return { items: selected.filter(item => item.kind !== 'ask'
+          || liveQuestion(this.currentSample(item.session_id, sources.get(item.session_id)), item.question)).map(item => ({
           id: item.id, sessionId: item.session_id, nativeMessageId: item.native_id, type: item.kind,
-          text: item.text, attachments: item.attachments, question: item.question,
+          source: this.store.source(item.id), wake: { state: item.notice_state === 'notified' ? 'accepted' : item.notice_state,
+            noticeId: item.notice_id, nativeMessageId: item.notification_receipt },
+          ...(item.kind === 'ask' ? { question: item.question,
+            receipt: this.evidence.question(caller, item.id, item.native_id, item.session_id) }
+            : { readToken: tokens.get(item.session_id) }),
           candidateTopicIds: this.store.topics().filter(topic => topic.session_id === item.session_id).map(topic => topic.id),
-        })) };
+        })), hasMore: pending.length > selected.length, pendingDecisions: this.evidence.pendingSummary(caller.sessionId, query.decisionsAfter),
+          consumed: false, warning: 'Locations and wake receipts are not business evidence. Read native Chat, then resolve its exact receipt.' };
       }
       case 'assistant_history': {
         const query = historyInput.parse(input);
-        requireFact(caller.role === 'organizer' ? organizerSources(caller).includes(query.sessionId) : this.store.managed(query.sessionId),
+        requireFact(caller.role === 'organizer' ? organizerSources(caller).includes(query.sessionId)
+          : this.store.managed(query.sessionId) || query.sessionId === caller.sessionId,
           'HISTORY_SCOPE', 'Read only registered topic sessions or this organizer input selected IDs', 403);
-        requireFact(worker(await this.native.session(query.sessionId)), 'INTERNAL_HISTORY', 'Internal sessions are not business history');
+        requireFact(caller.role === 'coordinator' && query.sessionId === caller.sessionId || worker(await this.native.session(query.sessionId)),
+          'INTERNAL_HISTORY', 'Internal sessions are not business history');
         if (query.recent ?? caller.role === 'organizer') {
           requireFact(!query.cursor, 'RECENT_HISTORY_CURSOR', 'Recent sampling starts at the latest event; use recent:false for native cursor pages', 400);
           return this.recentHistory(query.sessionId);
@@ -145,10 +174,31 @@ export class Assistant {
       case 'assistant_status': {
         const { topicId } = z.strictObject({ topicId: id }).parse(input), topic = this.store.topic(topicId);
         const meta = topic.session_id ? await this.native.session(topic.session_id) : null;
+        requireFact(!meta || worker(meta), 'INTERNAL_HISTORY', 'The registered source is no longer a business session');
+        await this.evidence.reconcileOutput(caller.sessionId);
         return { topic: displayTopic(topic), session: meta ? { sessionId: meta.sessionId, loaded: meta.loaded,
-          status: meta.status, activity: meta.activity, ask: meta.ask } : null, foregroundWake: this.store.foregroundWake() };
+          status: meta.status, activity: meta.activity, ask: meta.ask } : null,
+          freshness: meta ? await this.evidence.check(meta.sessionId, caller.sessionId) : null,
+          health: await this.health(), pendingDecisions: this.evidence.pendingSummary(caller.sessionId) };
       }
       default: throw new BusinessError('UNKNOWN_TOOL', 'Unknown or retired Assistant tool', 400);
+    }
+  }
+  async health() {
+    const checkedAt = Date.now(), wake = this.store.foregroundWake();
+    const lastWakeAttempt = wake ? { ...wake, at: this.store.receipt('foreground-wake')?.createdAt ?? null } : null;
+    let sessionId: string | null = null;
+    try {
+      const meta = await this.native.foreground();
+      sessionId = meta?.sessionId ?? null;
+      if (!meta?.loaded) return { current: { sessionId, checkedAt, readiness: 'unknown', loaded: meta?.loaded ?? null },
+        lastWakeAttempt, pendingUpdates: this.store.inbox().length };
+      await this.native.validateForeground(meta);
+      return { current: { sessionId, checkedAt, readiness: 'ready', loaded: true },
+        lastWakeAttempt, pendingUpdates: this.store.inbox().length };
+    } catch (error) {
+      return { current: { sessionId, checkedAt, readiness: error instanceof BusinessError ? 'not-ready' : 'unknown',
+        error: errorText(error) }, lastWakeAttempt, pendingUpdates: this.store.inbox().length };
     }
   }
   private async recentHistory(sessionId: string) {
@@ -352,11 +402,12 @@ export class Assistant {
     if (this.stopped) return Promise.resolve();
     if (sessionId === this.foregroundObservation.sessionId) this.foregroundObservation.version++;
     if (event) this.native.observe(sessionId, event);
-    if (!this.store.managed(sessionId)) return Promise.resolve();
+    const foreground = event ? this.evidence.observeForeground(sessionId, event) : Promise.resolve();
+    if (!this.store.managed(sessionId)) return foreground;
     this.sourceVersions.set(sessionId, (this.sourceVersions.get(sessionId) ?? 0) + 1);
     // Native callbacks may overlap while metadata is awaited. Drain each source
     // in event order so an idle wake cannot reserve only the first of its replies.
-    const run = () => this.observeSource(sessionId, event);
+    const run = async () => { await foreground; await this.observeSource(sessionId, event); };
     const previous = this.observations.get(sessionId);
     const operation = previous ? previous.then(run, run) : run();
     this.observations.set(sessionId, operation);
@@ -373,14 +424,14 @@ export class Assistant {
       const item: Incoming = { session_id: sessionId, native_id: typeof event.data.messageId === 'string' ? event.data.messageId : event.id,
         kind: 'reply', text: typeof event.data.content === 'string' ? event.data.content : '',
         attachments: attachmentsSchema.parse(event.data.attachments ?? []), question: null };
-      if (this.store.enqueue(item)) this.awaitingIdle.add(sessionId);
+      if (this.store.enqueue(item, 'pending', { eventId: event.id, timestamp: event.timestamp ?? null })) this.awaitingIdle.add(sessionId);
     }
     if (event && primary(event) && ['abort', 'session.error'].includes(event.type)) {
       const detail = event.type === 'abort' ? 'Native processing was interrupted.'
         : `Native processing reported an error: ${typeof event.data.message === 'string' ? event.data.message : 'No error text supplied'}`;
       if (this.store.enqueue({ session_id: sessionId, native_id: event.id, kind: 'reply',
         text: `${detail}\nEarlier output may be incomplete; this is not a successful completion receipt.`,
-        attachments: [], question: null })) this.awaitingIdle.add(sessionId);
+        attachments: [], question: null }, 'pending', { eventId: event.id, timestamp: event.timestamp ?? null })) this.awaitingIdle.add(sessionId);
     }
     if (event && rootEvent(event) && event.type === 'session.idle'
       || meta.status === 'error' && settled(meta)) this.awaitingIdle.delete(sessionId);
@@ -406,8 +457,10 @@ export class Assistant {
       if (item.kind !== 'ask') continue;
       const meta = this.currentSample(item.session_id, sessions.get(item.session_id));
       // Keep unavailable questions unread without presenting them as live decisions.
-      if (meta?.loaded && fingerprint(questionIdentity(meta.ask)) !== fingerprint(questionIdentity(item.question)))
+      if (meta?.loaded && fingerprint(questionIdentity(meta.ask)) !== fingerprint(questionIdentity(item.question))) {
+        this.evidence.expireQuestion(item.id);
         this.store.discardQuestions([item.id]);
+      }
     }
     return sessions;
   }
@@ -455,6 +508,7 @@ export class Assistant {
     let meta = await this.native.foreground();
     if (this.stopped || !meta || !this.eligibleNotices(sources).size) return;
     const sessionId = meta.sessionId;
+    let loadedForNotice = false;
     if (this.foregroundObservation.sessionId !== sessionId) this.foregroundObservation = { sessionId, version: 0 };
     if (!meta.loaded) {
       const wake = this.store.foregroundWake();
@@ -477,6 +531,7 @@ export class Assistant {
         requireFact(current?.sessionId === sessionId && current.loaded, 'FOREGROUND_LOAD_UNKNOWN',
           'The original foreground load could not be confirmed; inspect it without automatic replay');
         this.store.saveForegroundWake({ sessionId, state: 'loaded', error: null });
+        loadedForNotice = true;
         meta = current;
       } catch (error) {
         if (this.store.foregroundWake()?.state === 'loading')
@@ -491,8 +546,7 @@ export class Assistant {
       requireFact(foregroundRole(meta), 'FOREGROUND_ROLE', 'The loaded foreground role is not ready for Assistant notifications', 403);
       await this.native.validateForeground(meta);
     } catch (error) {
-      if (this.store.foregroundWake()?.sessionId === sessionId)
-        this.store.saveForegroundWake({ sessionId, state: 'failed', error: errorText(error) });
+      if (loadedForNotice) this.store.saveForegroundWake({ sessionId, state: 'failed', error: errorText(error) });
       throw error;
     }
     if (this.stopped) return;
@@ -505,15 +559,12 @@ export class Assistant {
     requireFact(foregroundRole(current) && roleIdentity(current) === roles, 'FOREGROUND_CHANGED',
       'Foreground roles changed after readiness validation; no message was sent');
     if (this.stopped || this.foregroundObservation.version !== foregroundVersion) return;
-    const wake = this.store.foregroundWake();
-    if (wake?.sessionId === sessionId && wake.state !== 'loaded')
-      this.store.saveForegroundWake({ sessionId, state: 'loaded', error: null });
     const notice = this.store.reserveNotice(this.eligibleNotices(sources));
     if (!notice) return;
     try {
       const result = await this.native.host.call('prompt', { sessionId: meta.sessionId, mode: 'enqueue',
-        text: `Topic updates or a current question are available. Read assistant_inbox; this is not a new business request. `
-          + `Only present new information or real state changes. An empty or wholly repeated result needs no reply. `
+        text: `Registered sessions have updates or a current question. Read assistant_inbox, then assistant_read for native evidence; this is not a new business request. `
+          + `Honor user attention preferences. Decide with assistant_resolve: silent for routine/repeated facts, notify before presenting meaningful news or a current question. `
           + `Source idle is not evidence of business success.\n${JSON.stringify(
           notice.items.map(item => ({ id: item.id, sessionId: item.session_id, kind: item.kind })))}` });
       this.store.settleNotice(notice.id, result.messageId ?? null, result.ok);

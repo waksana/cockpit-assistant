@@ -2,16 +2,20 @@
 
 A normal native Chat with the **Assistant** role, one topic Skill and one MCP
 service. There is no separate Assistant page, transcript, draft or input relay.
-The role independently manages the topic register; all business discussion,
+The role independently manages a session directory; all new business discussion,
 research and execution goes to background sessions through the service.
 
-The service owns topic mappings, native delivery, an unread inbox and lightweight
-result reminders. Reading returns and consumes inbox entries atomically. Native
-session Chat remains the history source and can be consulted again at any time.
+The directory answers **who handles this**, not **how far it has progressed**.
+Progress queries check the relevant native Chat tail and read bounded new evidence.
+The service owns mappings, native delivery, source locations and processing
+receipts, not a second business-status database. Reading evidence and deciding
+whether to notify are separate; old descriptions are explicitly background only.
+Native session Chat remains the source and can be consulted again after context loss.
 Worker reports do not authorize additional work or answers on the user's behalf.
 Ordinary updates wait for source idle and an available foreground; current native
 questions bypass the source-idle wait. The Skill presents meaningful new facts
-and state changes naturally, without routine routing reports or duplicate ACKs.
+and state changes naturally, honoring attention preferences and silently resolving
+routine or repeated updates without losing asks, failures or final outcomes.
 Business inputs use native `immediate` steering; foreground reminders use `enqueue`.
 Eligible pending results can load the original foreground on demand; absent or
 uncertain identities are never replaced or retried blindly.

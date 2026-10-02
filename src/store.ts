@@ -85,6 +85,9 @@ const wakeSchema = z.strictObject({
   error: z.string().nullable(),
 });
 export type ForegroundWake = z.infer<typeof wakeSchema>;
+const sourcePointer = z.strictObject({
+  eventId: z.string().min(1), timestamp: z.union([z.string(), z.number(), z.null()]),
+});
 export function incomingIdentity(item: Incoming) {
   const question = item.question ? { ...item.question, choices: item.question.choices ?? [],
     allowFreeform: item.question.allowFreeform ?? true } : null;
@@ -145,6 +148,15 @@ export class Store {
     const row = this.sql.prepare('SELECT fingerprint,created_at FROM seen WHERE id=?').get(id);
     return row ? { fingerprint: row.fingerprint === null ? null : String(row.fingerprint), createdAt: Number(row.created_at) } : null;
   }
+  state<T>(key: string, schema: z.ZodType<T>): T | null {
+    const value = this.receipt(`evidence:${key}`)?.fingerprint;
+    return value === undefined || value === null ? null : json.pipe(schema).parse(value);
+  }
+  saveState<T>(key: string, value: T, schema: z.ZodType<T>): void {
+    this.sql.prepare(`INSERT INTO seen VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET
+      fingerprint=excluded.fingerprint,created_at=excluded.created_at`)
+      .run(`evidence:${key}`, JSON.stringify(schema.parse(value)), Date.now());
+  }
   observed(id: string): number | null {
     const row = this.sql.prepare('SELECT created_at FROM seen WHERE id=?').get(id);
     return row ? Number(row.created_at) : null;
@@ -197,7 +209,8 @@ export class Store {
     return !!this.sql.prepare('SELECT 1 FROM topics WHERE session_id=? UNION ALL SELECT 1 FROM deliveries WHERE session_id=? LIMIT 1')
       .get(sessionId, sessionId);
   }
-  enqueue(item: Incoming, notice: InboxItem['notice_state'] = 'pending'): boolean {
+  enqueue(item: Incoming, notice: InboxItem['notice_state'] = 'pending',
+    source?: { eventId: string; timestamp: string | number | null }): boolean {
     const identity = incomingIdentity(item);
     return this.transaction(() => {
       const previous = this.sql.prepare('SELECT fingerprint FROM seen WHERE id=?').get(identity.id);
@@ -208,11 +221,20 @@ export class Store {
         return false;
       }
       this.remember(identity.id, identity.fingerprint);
+      if (this.receipt(`handled:${fingerprint([item.session_id, source?.eventId ?? item.native_id])}`)) return false;
       this.sql.prepare(`INSERT INTO mailbox(id,session_id,native_id,kind,text,attachments,question,created_at,notice_state)
         VALUES(?,?,?,?,?,?,?,?,?)`).run(identity.id, item.session_id, item.native_id, item.kind, item.text,
         JSON.stringify(item.attachments), item.question === null ? null : JSON.stringify(item.question), Date.now(), notice);
+      if (source) {
+        this.saveState(`source:${identity.id}`, source, sourcePointer);
+        this.sql.prepare("UPDATE mailbox SET text='',attachments='[]',question=NULL WHERE id=?").run(identity.id);
+      }
       return true;
     });
+  }
+  source(id: string) { return this.state(`source:${id}`, sourcePointer); }
+  removeResolved(ids: readonly string[]): void {
+    for (const id of ids) this.sql.prepare('DELETE FROM mailbox WHERE id=?').run(id);
   }
   inbox(): InboxItem[] { return this.sql.prepare('SELECT * FROM mailbox ORDER BY sequence').all().map(row => inboxRow.parse(row)); }
   take(callId: string, limit: number, ids?: string[], available?: ReadonlySet<string>) {

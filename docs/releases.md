@@ -53,6 +53,15 @@ Required intents are extracted from actual backend host calls. Packaging creates
 the target database in memory and checks its four active tables:
 `topics`, `deliveries`, `mailbox` and `seen`.
 
+The session-directory/evidence change retains these exact schema-5 definitions
+and every existing topic, mapping and history. Its additional values in `seen`
+are namespaced, bodyless source/read/disposition/output receipts, not a new schema
+or business-status snapshot. New reply rows hold source pointers; old unread
+bodies are not rewritten on startup and are removed only on an explicit evidence
+disposition. No production registry cleanup is part of this release.
+The advertised schema-4-to-5 migration below therefore remains necessary and
+unchanged, rather than being replaced by an empty migration list.
+
 The descriptor declares schema 5 and one explicit **nondestructive 4-to-5**
 migration for the currently deployed database. The deployment service accepts
 only one source-to-target migration per database, not alternative entries.

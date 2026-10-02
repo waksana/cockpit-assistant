@@ -15,7 +15,7 @@
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_topic", "assistant_dispatch", "assistant_status", "assistant_inbox", "assistant_history"]
+          "tools": ["assistant_topics", "assistant_topic", "assistant_dispatch", "assistant_status", "assistant_inbox", "assistant_history", "assistant_read", "assistant_resolve"]
         }
       }
     },

@@ -218,7 +218,19 @@ for (const order of ['first', 'last', 'multiple']) {
       await backend.promptAccepted!({ sessionId: 'front', messageId: 'notice', origin: 'module', acceptedAt: Date.now() });
       const inbox = await callTool(backend, 'assistant_inbox', 'read-inbox', {});
       assert.equal(inbox.result.isError, false);
-      assert.match(inbox.result.content[0]!.text, /Synthetic completed reply/);
+      assert.doesNotMatch(inbox.result.content[0]!.text, /Synthetic completed reply/);
+      assert.equal(f.state().inbox.length, 1);
+      const { items } = JSON.parse(inbox.result.content[0]!.text) as { items: { readToken: string }[] };
+      f.events.set('source', [{ id: 'source-event', type: 'assistant.message',
+        data: { messageId: 'reply', content: 'Synthetic completed reply' } }]);
+      f.events.set('front', inputEvents('notice', 'read-evidence'));
+      const evidence = await callTool(backend, 'assistant_read', 'read-evidence', { token: items[0]!.readToken });
+      assert.equal(evidence.result.isError, false);
+      assert.match(evidence.result.content[0]!.text, /Synthetic completed reply/);
+      const { receipt } = JSON.parse(evidence.result.content[0]!.text) as { receipt: { id: string } };
+      f.events.set('front', inputEvents('notice', 'resolve-evidence'));
+      const decision = await callTool(backend, 'assistant_resolve', 'resolve-evidence', { receiptId: receipt.id, disposition: 'silent' });
+      assert.equal(decision.result.isError, false);
       assert.deepEqual(f.state().inbox, []);
       const duplicate = await callTool(backend, 'assistant_inbox', 'read-inbox', {});
       assert.equal(duplicate.result.isError, false);

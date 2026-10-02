@@ -22,6 +22,7 @@ function deferred() {
 }
 function fixture(config: Partial<Config> = {}) {
   const store = new Store(':memory:'), calls: { name: string; body: unknown }[] = [], errors: unknown[] = [];
+  const observed = new Map<string, NativeChatEvent[]>();
   const meta = (id: string): PublicSessionMeta => ({
     sessionId: id, title: id, cwd: '/synthetic', loaded: true, status: 'idle', ask: null, lastActivity: 0,
     roles: id === 'assistant' ? [{ moduleId: 'assistant', roleId: 'coordinator', name: 'Assistant', moduleName: 'Assistant' }] : [],
@@ -74,12 +75,16 @@ function fixture(config: Partial<Config> = {}) {
     async session(id) { if (onMeta) await onMeta(id); return sessions.get(id) ?? null; },
     async foreground() { return sessions.get('assistant')!; },
     async validateForeground(_meta, state) { if (state !== 'saved' && onReady) await onReady(); },
-    observe() {},
+    observe(sessionId, event) {
+      const events = observed.get(sessionId) ?? [];
+      if (!events.some(old => old.id === event.id)) events.push(event);
+      observed.set(sessionId, events);
+    },
   };
   const assistant = new Assistant(store, native, configInput.parse({ defaultCwd: '/synthetic', ...config }), error => errors.push(error));
   const topic = (id: string, sessionId: string | null): Topic => store.saveTopic({ id, title: id, content: '',
     version: 1, archived: false, session_id: sessionId, mapping_state: sessionId ? 'bound' : 'unbound', mapping_error: null, creation_receipt: null });
-  return { store, assistant, native, sessions, calls, errors, topic,
+  return { store, assistant, native, sessions, calls, errors, topic, observed,
     input(value: Partial<Input>) { source = { ...source, ...value }; },
     history(pages: HistoryPage[]) { history = pages; },
     organizer(ids: string[]) { callerRole = 'organizer'; source.text = `historySessionIds: ${JSON.stringify(ids)}`; },
@@ -90,6 +95,24 @@ function fixture(config: Partial<Config> = {}) {
     invoke(name: string, input: unknown = {}, id = `${name}-${calls.length}`) { return assistant.invoke(name, input, identity(id)); },
     close() { assistant.stop(); store.close(); },
   };
+}
+async function resolveInbox(f: ReturnType<typeof fixture>) {
+  const inbox = await f.invoke('assistant_inbox') as {
+    items: { id: string; sessionId: string; readToken?: string; receipt?: { id: string } }[];
+  };
+  const tokens = new Set<string>();
+  for (const item of inbox.items) {
+    if (item.receipt) {
+      await f.invoke('assistant_resolve', { receiptId: item.receipt.id, disposition: 'notify' }, `decide-${item.id}`);
+    } else if (item.readToken && !tokens.has(item.readToken)) {
+      tokens.add(item.readToken);
+      const nativeEvents = f.observed.get(item.sessionId) ?? f.store.inbox().filter(row => row.session_id === item.sessionId)
+        .map(row => ({ id: row.native_id, type: 'assistant.message', data: { messageId: row.native_id, content: row.text } }));
+      f.history([historyPage(nativeEvents, { sessionId: item.sessionId })]);
+      const result = await f.invoke('assistant_read', { token: item.readToken }, `read-${item.id}`) as { receipt: { id: string } };
+      await f.invoke('assistant_resolve', { receiptId: result.receipt.id, disposition: 'silent' }, `decide-${item.id}`);
+    }
+  }
 }
 function pending(f: ReturnType<typeof fixture>, id = 'pending') {
   f.topic('topic', 'a');
@@ -198,7 +221,8 @@ test('load rejection, lost response, wrong identity and unconfirmed loading reta
       f.fail(null); f.sessions.get('assistant')!.loaded = true;
       await f.assistant.notify();
       assert.equal(f.calls.at(-1)!.name, 'prompt', 'A normal public Host load permits readback recovery, not another load');
-      assert.equal(f.store.foregroundWake()!.state, 'loaded');
+      assert.equal(f.store.foregroundWake()!.state, state === 'rejected' ? 'failed' : 'unknown',
+        'Current readiness recovery must not erase the historical failed/unknown load');
     } finally { f.close(); }
   }
 });
@@ -277,7 +301,7 @@ test('failed post-load resources do not form an unload and reload loop', async (
     f.onReady(null); f.sessions.get('assistant')!.loaded = true;
     await f.assistant.notify();
     assert.deepEqual(f.calls.map(call => call.name), ['session/load', 'prompt']);
-    assert.equal(f.store.foregroundWake()!.state, 'loaded');
+    assert.equal(f.store.foregroundWake()!.state, 'failed', 'Current readiness is separate from the failed load attempt');
   } finally { f.close(); }
 });
 test('foreground resource invalidation across source awaits cancels stale readiness without reserving a notice', async () => {
@@ -316,7 +340,7 @@ test('registry creates service-owned IDs and native call replay cannot create a 
     await assert.rejects(f.invoke('assistant_topic', { topicId: 'invented', title: 'New' }), { code: 'TOPIC_NOT_FOUND' });
   } finally { f.close(); }
 });
-test('internal notices can read and consume results but cannot dispatch or mutate the ledger', async () => {
+test('internal notices can read and resolve results but cannot dispatch or mutate the registry', async () => {
   const f = fixture();
   try {
     f.topic('topic', 'a'); f.input({ human: false });
@@ -324,9 +348,9 @@ test('internal notices can read and consume results but cannot dispatch or mutat
     await assert.rejects(f.invoke('assistant_topic', { title: 'Extra' }), { code: 'HUMAN_REQUIRED' });
     f.store.enqueue({ session_id: 'a', native_id: 'result', kind: 'reply', text: 'Worker report', attachments: [], question: null });
     assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 1 });
-    await f.invoke('assistant_inbox');
+    await resolveInbox(f);
     assert.equal(f.store.inbox().length, 0);
-    assert.equal(f.calls.length, 0);
+    assert.deepEqual(f.calls.map(call => call.name), ['session/chat']);
   } finally { f.close(); }
 });
 test('one compound native user input delivers its complete split and attachments without a local chat copy', async () => {
@@ -522,10 +546,11 @@ test('read-only history remains available after inbox consumption and never reen
   try {
     f.topic('topic', 'a');
     f.store.enqueue({ session_id: 'a', native_id: 'reply', kind: 'reply', text: 'Native report', attachments: [], question: null });
-    await f.invoke('assistant_inbox');
+    await resolveInbox(f);
+    f.history([historyPage([message('original')])]);
     await f.invoke('assistant_history', { sessionId: 'a', cursor: 'page' });
     assert.equal(f.store.inbox().length, 0);
-    assert.deepEqual(f.calls[0], { name: 'session/chat', body: {
+    assert.deepEqual(f.calls.at(-1), { name: 'session/chat', body: {
       sessionId: 'a', source: 'persisted', direction: 'backward', max: 16, bootstrap: false, waitMs: 0, cursor: 'page',
     } });
     await assert.rejects(f.invoke('assistant_history', { sessionId: 'observer' }), { code: 'HISTORY_SCOPE' });
@@ -700,7 +725,7 @@ test('only owned main-agent messages enter inbox; complete text accompanying too
     assert.equal((f.calls[0]!.body as { text: string }).text.includes('Progress report'), false);
   } finally { f.close(); }
 });
-test('a notice in flight cannot restore consumed items or lose another result arrival', async () => {
+test('a notice in flight cannot restore resolved items or lose another result arrival', async () => {
   const f = fixture(), entered = deferred(), release = deferred();
   try {
     f.topic('topic', 'a');
@@ -708,7 +733,7 @@ test('a notice in flight cannot restore consumed items or lose another result ar
     const first = f.assistant.observe('a', { id: 'first', type: 'assistant.message', data: { content: 'First' } });
     const idle = f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
     await entered.promise;
-    await f.invoke('assistant_inbox');
+    await resolveInbox(f);
     f.store.enqueue({ session_id: 'a', native_id: 'later', kind: 'reply', text: 'Later', attachments: [], question: null });
     f.sessions.get('assistant')!.status = 'running';
     const again = f.assistant.notify();
@@ -812,9 +837,9 @@ test('source progress and queued replies wait for known idle; frontend remains e
     const notice = f.calls[0]!.body as { mode: string; text: string };
     assert.equal(notice.mode, 'enqueue');
     assert.match(notice.text, /not evidence of business success/);
-    await f.invoke('assistant_inbox');
+    await resolveInbox(f);
     await f.assistant.observe('a', progress);
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
     assert.equal(f.store.inbox().length, 0);
   } finally { f.close(); }
 });
@@ -851,7 +876,8 @@ test('asks are revalidated before reminders, and unloaded questions wait without
     source.loaded = false;
     assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 0 });
     assert.equal(f.store.inbox().length, 1, 'Eligibility refresh removes stale asks even while foreground is busy');
-    assert.deepEqual(await f.invoke('assistant_inbox', {}, 'unavailable'), { items: [], alreadyRead: false, hasMore: false });
+    const unavailable = await f.invoke('assistant_inbox', {}, 'unavailable') as { items: unknown[]; consumed: boolean };
+    assert.deepEqual(unavailable.items, []); assert.equal(unavailable.consumed, false);
     source.loaded = true;
     f.sessions.get('assistant')!.status = 'idle';
     await f.assistant.notify();
@@ -859,8 +885,10 @@ test('asks are revalidated before reminders, and unloaded questions wait without
     assert.deepEqual(f.store.inbox().map(item => item.native_id), ['new']);
     const result = await f.invoke('assistant_inbox', {}, 'available') as { items: { question: unknown }[] };
     assert.deepEqual(result.items.map(item => item.question), [source.ask]);
+    assert.equal(f.store.inbox().length, 1, 'Reading a valid ask does not claim presentation');
+    await resolveInbox(f);
     await f.assistant.observe('a');
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
     assert.equal(f.store.inbox().length, 0);
   } finally { f.close(); }
 });
@@ -872,10 +900,10 @@ test('manual progress consumption before source idle does not leave a new remind
     source.status = 'running'; source.activity!.processing = true;
     await f.assistant.observe('a', message('manual-progress'));
     assert.equal(f.calls.length, 0);
-    await f.invoke('assistant_inbox');
+    await resolveInbox(f);
     source.status = 'idle'; source.activity!.processing = false;
     await f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
-    assert.equal(f.calls.length, 0);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 0);
   } finally { f.close(); }
 });
 test('native cancellation and errors retain explicit incomplete facts, not successful completion', async () => {
@@ -892,10 +920,11 @@ test('native cancellation and errors retain explicit incomplete facts, not succe
       source.status = type === 'abort' ? 'idle' : 'error'; source.activity!.processing = false;
       await f.assistant.observe('a', { id: 'idle', type: 'session.idle', data: {} });
       assert.equal(f.calls.length, 1);
-      assert.match(f.store.inbox()[1]!.text, /incomplete.*not a successful/s);
-      await f.invoke('assistant_inbox');
+      assert.equal(f.store.inbox()[1]!.text, '');
+      assert.equal(f.store.source(f.store.inbox()[1]!.id)?.eventId, type);
+      await resolveInbox(f);
       await f.assistant.observe('a', event);
-      assert.equal(f.calls.length, 1);
+      assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
     } finally { f.close(); }
   }
 });
@@ -930,11 +959,11 @@ test('overlapping native callbacks drain in order even when metadata already rep
     assert.equal(f.calls.length, 0, 'Idle metadata alone must not flush a partial live callback batch');
     await f.assistant.observe('a', { id: 'idle', type: 'session.idle', ephemeral: true, data: {} });
     assert.equal(f.calls.length, 1);
-    assert.deepEqual(f.store.inbox().map(item => [item.text, item.notice_state]),
+    assert.deepEqual(f.store.inbox().map(item => [f.store.source(item.id)?.eventId, item.notice_state]),
       [['slow-progress', 'notified'], ['final', 'notified']]);
-    await f.invoke('assistant_inbox');
+    await resolveInbox(f);
     await f.assistant.observe('a', message('final'));
-    assert.equal(f.calls.length, 1);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
   } finally { release.resolve(); f.close(); }
 });
 test('a question invalidated while another source is sampled stays unread and is not returned as live', async () => {
@@ -957,9 +986,9 @@ test('a question invalidated while another source is sampled stays unread and is
       const result = await read as { items: { sessionId: string }[] };
       await invalidation;
       assert.deepEqual(result.items.map(item => item.sessionId), ['b']);
-      assert.deepEqual(f.store.inbox().map(item => item.session_id), unloaded ? ['a'] : []);
-      assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 0 });
-      assert.equal(f.store.inbox().length, unloaded ? 1 : 0);
+      assert.deepEqual(f.store.inbox().map(item => item.session_id), unloaded ? ['a', 'b'] : ['b']);
+      assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 1 });
+      assert.equal(f.store.inbox().length, unloaded ? 2 : 1);
     } finally { release.resolve(); f.close(); }
   }
 });
@@ -969,6 +998,53 @@ test('source resumption during another source lookup invalidates notice eligibil
     f.topic('one', 'a'); f.topic('two', 'b');
     for (const id of ['a', 'b']) f.store.enqueue({
       session_id: id, native_id: id, kind: 'reply', text: id, attachments: [], question: null,
+    });
+
+    test('status uses native freshness and current readiness without erasing historical wake failure or sending', async () => {
+      const f = fixture();
+      try {
+        f.store.saveTopic({ ...f.topic('topic', 'a'), content: 'Legacy: release is pending' });
+        f.store.saveForegroundWake({ sessionId: 'assistant', state: 'failed', error: 'Old disconnected resources' });
+        f.history([historyPage([message('actual-new-tail')])]);
+        const result = await f.invoke('assistant_status', { topicId: 'topic' }) as {
+          topic: { contentUse: string; warning: string };
+          freshness: { headEventId: string; evidenceInThisResponse: boolean };
+          health: { current: { readiness: string; checkedAt: number }; lastWakeAttempt: { state: string; error: string; at: number } };
+        };
+        assert.equal(result.topic.contentUse, 'identity-responsibility-scope-only');
+        assert.match(result.topic.warning, /never current progress/);
+        assert.equal(result.freshness.headEventId, 'actual-new-tail');
+        assert.equal(result.freshness.evidenceInThisResponse, false);
+        assert.equal(result.health.current.readiness, 'ready');
+        assert.equal(result.health.lastWakeAttempt.state, 'failed');
+        assert.equal(result.health.lastWakeAttempt.error, 'Old disconnected resources');
+        assert.ok(result.health.current.checkedAt >= result.health.lastWakeAttempt.at);
+        assert.deepEqual(f.calls.map(call => call.name), ['session/chat']);
+        assert.equal(f.store.foregroundWake()!.state, 'failed');
+        f.sessions.get('assistant')!.loaded = false;
+        assert.equal((await f.assistant.health()).current.readiness, 'unknown');
+        assert.deepEqual(f.calls.map(call => call.name), ['session/chat']);
+      } finally { f.close(); }
+    });
+
+    test('valid ask reads remain distinct from presentation, and expired asks do not leave unresolvable read decisions', async () => {
+      const f = fixture();
+      try {
+        f.topic('topic', 'a'); f.sessions.get('assistant')!.status = 'running';
+        f.sessions.get('a')!.ask = { requestId: 'ask', question: 'Choose', choices: ['Yes', 'No'] };
+        await f.assistant.observe('a');
+        const response = await f.invoke('assistant_inbox', {}, 'ask-reader') as {
+          items: { receipt: { id: string; disposition: string } }[];
+        };
+        const receiptId = response.items[0]!.receipt.id;
+        assert.equal(response.items[0]!.receipt.disposition, 'unresolved');
+        await assert.rejects(f.invoke('assistant_resolve', { receiptId, disposition: 'silent' }), { code: 'ASK_PRESENTATION' });
+        f.sessions.get('a')!.ask = null;
+        await f.invoke('assistant_inbox');
+        assert.deepEqual(f.assistant.evidence.pendingSummary('assistant').items, []);
+        await assert.rejects(f.invoke('assistant_resolve', { receiptId, disposition: 'notify' }), { code: 'DECISION_CONFLICT' });
+        assert.equal(f.calls.length, 0);
+      } finally { f.close(); }
     });
     let paused = false;
     f.onMeta(async id => { if (id === 'b' && !paused) { paused = true; entered.resolve(); await release.promise; } });

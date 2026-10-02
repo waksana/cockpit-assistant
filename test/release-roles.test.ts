@@ -26,12 +26,16 @@ test('shared topic Skill is physically embedded in each role without requiring a
     assert.match(organizer, /latest three nonempty user\/assistant messages/);
     assert.match(organizer, /`recent:true`/);
     assert.match(shared, /Do not automatically\s+read older pages/);
-    assert.match(front, /Every business request\s+goes to its background session/);
-    assert.match(front, /never authorizes new business\s+dispatch/);
+    assert.match(front, /Every new business request\s+goes to its background session/);
+    assert.match(front, /never business authorization/);
     assert.match(front, /Do not assess business quality or completeness/);
     assert.match(front, /user's complete\s+original answer unchanged/);
     assert.match(shared, /How should the topic system be\s+designed/);
-    assert.match(shared, /consumed\s+immediately/);
+    assert.match(shared, /Inbox\s+listing does not consume replies/);
+    assert.match(shared, /never as current evidence/);
+    assert.match(shared, /recover:true/);
+    assert.match(shared, /attention preferences take priority/);
+    assert.match(shared, /assistant_resolve/);
     assert.match(shared, /omit `topicId`/);
     assert.match(shared, /Never invent an\s+ID for dispatch/);
     const manifest = JSON.parse(await readFile('cockpit.module.json', 'utf8'));
@@ -43,7 +47,7 @@ test('shared topic Skill is physically embedded in each role without requiring a
     assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_dispatch'));
     assert.ok(!role('organizer').mcpServers.assistant.tools.includes('assistant_dispatch'));
     assert.equal(role('worker'), undefined);
-    assert.equal(role('coordinator').mcpServers.assistant.tools.length, 6);
+    assert.equal(role('coordinator').mcpServers.assistant.tools.length, 8);
     assert.equal(role('organizer').mcpServers.assistant.tools.length, 3);
     assert.equal(manifest.instructions, undefined, 'The foreground role must not be injected into all native sessions');
     assert.equal(manifest.frontend, undefined);

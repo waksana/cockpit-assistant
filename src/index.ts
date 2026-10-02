@@ -53,13 +53,12 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
     } }),
   })));
   const backend: ModuleBackend = {
-    publicConfig: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'consume-on-read', frontend: false },
+    publicConfig: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'evidence-and-disposition', frontend: false },
     routes: [
       mcp(assistant),
       { method: 'GET' as const, path: '/state', async handler() {
-        const meta = await native.foreground();
-        return { body: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'consume-on-read',
-          foregroundSessionId: meta?.sessionId ?? null, foregroundWake: store.foregroundWake(), schemaVersion: 5 } };
+        return { body: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'evidence-and-disposition',
+          health: await assistant.health(), schemaVersion: 5 } };
       } },
       ...retired,
     ].map(route => ({ ...route, handler(request: Parameters<ModuleRoute['handler']>[0]) {

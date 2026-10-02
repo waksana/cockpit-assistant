@@ -9,6 +9,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // The provider chooses synthetic actions; every advertised tool, MCP connection,
 // tool result, Chat event and ask callback below belongs to the real native Host.
 export async function runNativeCheck(mode = 'evidence') {
+  if (mode === 'restart') {
+    const { runNativeRestartCheck } = await import('./native-restart-check.mjs');
+    return runNativeRestartCheck();
+  }
   assert.ok(['evidence', 'response', 'session', 'connection'].includes(mode), 'Unknown native probe mode');
   assert.ok(process.argv[2], 'Supply an explicitly selected built Host root (never a running service URL)');
   const hostRoot = await realpath(resolve(process.argv[2]));

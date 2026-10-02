@@ -155,25 +155,35 @@ On interruption or Host restart, recover the exact stored query/continuation or
 completed Host checkpoint and submit it unchanged. Restart by itself does not
 authorize `gap`, `reset` or replacing unread history with a recent window.
 The Host's version-2 caller-owned position format removes the process-local
-signing dependency. The Host validates position compatibility and native history;
+signing dependency and requires Host Rolling 37 or a later compatible Host.
+The Host validates position compatibility and native history;
 Assistant neither decodes tokens nor reconstructs native locations. These are
 positions, not authorization credentials, and Host identity/scope still apply.
 
 If a native partial continuation expires or its page changes, explicitly retry
 the incremental interval with the **same saved `since`**, without `cursor`.
-Deduplicate already read fragments by `eventId` and offset. Preserve bounded
+Merge duplicate or overlapping fragments by `eventId` and UTF-16 offset;
+fragment sizes may change between attempts, so do not blindly concatenate them.
+If the actual body changed, discard the previous assembly and reread it.
+Preserve bounded
 Host calls and all unread pointers until the interval is complete, then advance
 the checkpoint by CAS. If a `gap` was recorded locally, `reset:true` explicitly
 replaces that failed attempt with the same interval; it does not require or
 authorize a new recent-only baseline. Missing or changed anchors and incompatible
 positions remain actual gaps, not successful empty updates.
+For an interrupted initial history traversal with no completed checkpoint,
+explicitly reselect that history traversal and deduplicate; do not silently
+replace its intended range with the newest few messages.
 
 Legacy Host Rolling 36 positions were signed with a process-local key. The
 corrected Host can accept the strictly parsed legacy payload as a caller-owned
 location assertion and revalidate its native anchor/page, then return its new
 format. This does not verify a lost legacy signature or guarantee recovery of
 changed/deleted history. Submit the original token unchanged; do not decode,
-rewrite or resign it in Assistant. Failed migration retains unresolved pointers.
+rewrite or resign it in Assistant. Retain the original legacy `since` throughout
+the range, even when intermediate responses use the new format. Save the new
+checkpoint only after the entire range has been processed.
+Failed migration retains unresolved pointers.
 Any explicitly chosen replacement baseline must disclose incomplete old coverage;
 it cannot silently acknowledge all outstanding pointers.
 Completed reports advance the per-caller/source checkpoint only if their original

@@ -3,24 +3,22 @@ import type { ModuleBackend, ModuleBackendContext, ModuleRoute } from '@waksana/
 import { Assistant, configInput } from './core.ts';
 import { acquireLease } from './lease.ts';
 import { requireFact } from './errors.ts';
-import { mcp, coordinatorTools } from './mcp.ts';
+import { mcp } from './mcp.ts';
 import { NativeChat } from './native-chat.ts';
 import { Store } from './store.ts';
 
 export async function activate(context: ModuleBackendContext): Promise<ModuleBackend> {
   const host = context.host;
-  requireFact(context.shutdownVersion === 1 && context.serviceReadyVersion === 1 && host.chatReadVersion === 1 && host.askResponseVersion === 1
-    && host.roleAssignmentVersion === 1 && host.roleAvailabilityVersion === 1 && host.sessionLoadVersion === 1
-    && host.promptReceiptVersion === 1 && host.toolScopeVersion === 1
-    && host.promptOriginVersion === 1 && host.roleResourcePolicyVersion === 1,
-  'HOST_CAPABILITY', 'Native Chat Assistant needs safe shutdown, prompt-origin observations, Host role compatibility and exclusive role resources');
+  requireFact(context.shutdownVersion === 1 && context.serviceReadyVersion === 1
+    && host.sessionLoadVersion === 1 && host.promptReceiptVersion === 1,
+  'HOST_CAPABILITY', 'Assistant support needs safe shutdown, exact session load and prompt receipts');
   requireFact(!context.stopping.aborted && !context.signal.aborted, 'STOPPING', 'Assistant is stopping', 503);
   const config = configInput.parse(context.config), release = await acquireLease(context.dataRoot);
   if (context.stopping.aborted || context.signal.aborted) { release(); requireFact(false, 'STOPPING', 'Assistant is stopping', 503); }
   let store: Store;
   try { store = new Store(join(context.dataRoot, 'assistant.sqlite')); }
   catch (error) { release(); throw error; }
-  const native = new NativeChat(host, store, config.foregroundSessionId, coordinatorTools);
+  const native = new NativeChat(host, store, config.foregroundSessionId);
   const assistant = new Assistant(store, native, config, error => context.report(error));
   let ready = false, stopped = false, disposed = false;
   const operations = new Set<Promise<unknown>>();
@@ -53,22 +51,18 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
     } }),
   })));
   const backend: ModuleBackend = {
-    publicConfig: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'consume-on-read', frontend: false },
+    publicConfig: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'locations-and-handling', frontend: false },
     routes: [
       mcp(assistant),
       { method: 'GET' as const, path: '/state', async handler() {
-        const meta = await native.foreground();
-        return { body: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'consume-on-read',
-          foregroundSessionId: meta?.sessionId ?? null, foregroundWake: store.foregroundWake(), schemaVersion: 5 } };
+        return { body: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'locations-and-handling',
+          health: await assistant.health(), schemaVersion: 5 } };
       } },
       ...retired,
     ].map(route => ({ ...route, handler(request: Parameters<ModuleRoute['handler']>[0]) {
       requireFact(ready, 'NOT_READY', 'Assistant is not ready', 503);
       return track(() => route.handler(request));
     } })),
-    async promptAccepted(event: Parameters<NativeChat['accepted']>[0]) {
-      if (ready) await track(() => native.accepted(event));
-    },
     async onReady() {
       if (stopped) return;
       store.recover(); ready = true;

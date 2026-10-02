@@ -122,17 +122,16 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   for (const capability of ['frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2']) {
     assert.ok(!actual.requiresCapabilities.includes(capability));
   }
-  assert.ok(actual.requiresCapabilities.includes('chatRead.v1'));
+  assert.ok(!actual.requiresCapabilities.includes('chatRead.v1'));
   assert.ok(actual.requiresCapabilities.includes('shutdown.v1'));
   assert.ok(actual.requiresCapabilities.includes('promptReceipt.v1'));
-  assert.ok(actual.requiresCapabilities.includes('toolScope.v1'));
-  assert.ok(actual.requiresCapabilities.includes('roleResourcePolicy.v1'));
-  assert.ok(actual.requiresCapabilities.includes('roleAvailability.v1'));
-  assert.ok(actual.requiresCapabilities.includes('promptOrigin.v1'));
-  assert.ok(actual.requiredIntents.includes('session/chat'));
-  assert.ok(actual.requiredIntents.includes('roles/availability'));
+  for (const retired of ['toolScope.v1', 'roleResourcePolicy.v1', 'roleAvailability.v1', 'promptOrigin.v1'])
+    assert.ok(!actual.requiresCapabilities.includes(retired));
+  assert.ok(!actual.requiredIntents.includes('session/chat'));
+  assert.ok(!actual.requiredIntents.includes('roles/availability'));
   assert.ok(!actual.requiredIntents.includes('session/resources-prepare'));
-  assert.ok(actual.requiredIntents.includes('respondAsk'));
+  for (const agentDependency of ['session/chat/text', 'respondAsk', 'session/new'])
+    assert.ok(actual.requiredIntents.includes(agentDependency), 'Direct agent Host tools are explicit installation dependencies');
   assert.deepEqual(actual.migrations, schema5Migrations);
   assert.equal(actual.migrations.length, 1, 'The deployer accepts one automatic source per database');
   assert.equal(actual.migrations[0].from, 4);

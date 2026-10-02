@@ -1,15 +1,16 @@
 import { z } from 'zod';
 import type { ModuleRequest, ModuleResponse, ModuleRoute } from '@waksana/cockpit-module-sdk/backend';
-import { Assistant, dispatchInput, historyInput, inboxInput, pageInput, topicInput } from './core.ts';
+import { Assistant, foregroundInput, inboxInput, pageInput, topicInput } from './core.ts';
 import { BusinessError } from './errors.ts';
+import { checkpointInput, resolveInput } from './inbox.ts';
 
 export const tools = [
-  { name: 'assistant_topics', schema: pageInput, description: 'Read the current flat topic register. This does not dispatch or read session history.' },
-  { name: 'assistant_topic', schema: topicInput, description: 'Manage a topic or register its existing worker. For a new topic omit topicId and retain the actual returned ID. Only a genuine user request permits changes; a result reminder does not.' },
-  { name: 'assistant_dispatch', schema: dispatchInput, description: 'Deliver the whole faithful split of the current genuine user request to topic sessions. The service owns creation/load/immediate steering/native answers. Successful routing needs no fixed acknowledgement or destination report; acceptance is not completion. Never dispatch from a result reminder or add business follow-ups. A native ask answer must be one complete original user message, not a model paraphrase or extracted choice.' },
-  { name: 'assistant_inbox', schema: inboxInput, description: 'Read and atomically consume unread replies and currently valid native questions. Optional ids select entries; limit bounds the read. peek:true counts currently readable entries. Explicit reads can include partial progress before source idle. Present only new information or real state changes; repeated or empty reminders need no reply. Reading clears returned temporary copies immediately; source histories remain available. Do not use a presentation declaration or ACK.' },
-  { name: 'assistant_history', schema: historyInput, description: 'Passively read native history without loading or changing the source. Organizer defaults to recent:true: the latest three nonempty primary user/assistant bodies, bounded text with explicit truncation and sample completeness, no tools or internal metadata. Use this for topic preparation, not full-history coverage. recent:false preserves native cursor pages; the foreground defaults to that original view. Recent sampling does not accept a cursor. Does not enroll, resend or copy history into the inbox.' },
-  { name: 'assistant_status', schema: z.strictObject({ topicId: z.string().min(1).max(200) }), description: 'Inspect the topic and actual native worker state. Acceptance, a reply and idle do not establish business completion.' },
+  { name: 'assistant_topics', schema: pageInput, description: 'Find responsible sessions by identity, responsibility and scope. Registry text is background (including legacy progress notes), never current status. For progress use Host session status and lightweight Chat directly.' },
+  { name: 'assistant_topic', schema: topicInput, description: 'Manage responsibility/scope metadata or register an existing session ID. No automatic session creation. For a new topic omit topicId and retain the returned ID. Keep routine progress out of the registry.' },
+  { name: 'assistant_foreground', schema: foregroundInput, description: 'Query or explicitly set the sole foreground notification session ID. Omit sessionId to query, use null to disable reminders. A selected ID must already exist; this tool never creates or loads sessions and does not restrict other Host-authorized callers.' },
+  { name: 'assistant_inbox', schema: inboxInput, description: 'List a bounded page of pending source pointers and current ask request IDs, never bodies. peek only counts. One receipt captures exact inbox IDs and prior read checkpoints; listing does not consume or prove Chat was read. Read with cockpit_read_session_text/get_session, record assistant_checkpoint, then resolve. after/nextAfter paginate locations; decisionsAfter paginates interrupted handling. Unknown wakes are not replayed.' },
+  { name: 'assistant_checkpoint', schema: checkpointInput, description: 'Save an agent-reported read position for one source in an inbox receipt. Preserve actual Host query and nextQuery cursor/since/source/direction, and returned checkpoint as position.hostCheckpoint; event IDs are NEVER cursors or checkpoint tokens. complete:false stores interrupted paging without acknowledging IDs. Only after the intended interval/fragments are fully read report complete:true and exact readIds. gap preserves uncertainty; reset:true explicitly rebuilds a gapped/source-changed position. position:null is only for asks read through get_session. Local checkpoint.version is only a concurrency token; pass it as expectedCheckpointVersion for repeated advancement. Does not handle or notify.' },
+  { name: 'assistant_resolve', schema: resolveInput, description: 'After recording completed read checkpoints, report handling of this exact inbox receipt: silent or notified. This is an agent report, not proof Chat was read or the user saw a response. Removes only matching inbox IDs, never concurrent arrivals. User preferences and current asks/decisions/blockers guide attention. Does not send or answer asks.' },
 ];
 export const coordinatorTools = tools.map(tool => tool.name);
 const meta = z.record(z.string(), z.unknown());
@@ -42,7 +43,7 @@ export function mcp(assistant: Assistant): ModuleRoute {
             clientInfo: z.object({ name: z.string(), version: z.string() }) }).parse(rpc.params);
           return ok({ protocolVersion: protocols.includes(input.protocolVersion) ? input.protocolVersion : protocols[0],
             capabilities: { tools: {} }, serverInfo: { name: 'cockpit-assistant', version: '5' },
-            instructions: 'Use native Chat. Manage topics, faithfully dispatch genuine user requests, consume unread results, and consult native history. Notices are not business requests; do not add work or answer for the user.' });
+            instructions: 'Use the directory to locate responsibility and Host lightweight Chat/status tools for current facts. Inbox returns pointers only. Record actual read checkpoints before silent/notified handling; these are agent reports, not user-delivery proof. Reminders do not authorize new business work or answering for the user.' });
         }
         if (rpc.method === 'ping' || rpc.method === 'tools/list') {
           z.strictObject({ _meta: meta.optional() }).parse(rpc.params ?? {});

@@ -1,36 +1,34 @@
 # Cockpit Assistant
 
-A normal native Chat with the **Assistant** role, one topic Skill and one MCP
-service. There is no separate Assistant page, transcript, draft or input relay.
-The role independently manages the topic register; all business discussion,
-research and execution goes to background sessions through the service.
+A native Assistant conversation backed by a small **support-only service**:
+session directory, inbox, shared Skill and reminders
+to one explicitly selected foreground. There is no separate frontend, transcript
+mirror or input relay.
 
-The service owns topic mappings, native delivery, an unread inbox and lightweight
-result reminders. Reading returns and consumes inbox entries atomically. Native
-session Chat remains the history source and can be consulted again at any time.
-Worker reports do not authorize additional work or answers on the user's behalf.
-Ordinary updates wait for source idle and an available foreground; current native
-questions bypass the source-idle wait. The Skill presents meaningful new facts
-and state changes naturally, without routine routing reports or duplicate ACKs.
-Business inputs use native `immediate` steering; foreground reminders use `enqueue`.
-Eligible pending results can load the original foreground on demand; absent or
-uncertain identities are never replaced or retried blindly.
+The agent uses the Host's tools directly to read lightweight native Chat/status,
+create/load sessions, send or steer prompts and answer native asks. The service does not dispatch business, create
+workers, freeze routing splits or certify browser/user provenance. Host identity,
+access controls and tool filtering remain unchanged.
 
-Select the Assistant role when creating a native session. The role's exclusive
-resource policy connects only its Assistant MCP and enables only its topic Skill.
-Host-compatible neutral connection roles may coexist without adding model
-instructions, Skills or MCP resources; the Assistant identity remains distinct.
-The first accepted browser Chat input selects that foreground if none was
-configured. New topic sessions use ordinary native defaults, without an
-Assistant worker role or private scope. Existing sessions are never silently
-reconfigured; compatibility for the former defaults is described in setup.
-See [API and setup](docs/api.md), [the small service model](docs/architecture.md)
+Directory descriptions answer **who handles this**, never **current progress**.
+Progress comes from the Host's lightweight native Chat, including rereading after
+context loss. Inbox listing and explicit handling reports are separate; neither
+a returned-location receipt nor an agent's `notified` report proves physical user delivery.
+Attention preferences guide meaningful updates versus silent routine progress.
+Ordinary reminders wait for source idle; current asks need not. Wakes use
+`enqueue`, may load only the selected original foreground, and never blindly
+retry unknown outcomes.
+
+The ordinary, non-exclusive Assistant role supplies its own MCP tools and shared
+Skill. **The minimal Host MCP connection and immutable creation-time tool scope
+must be configured separately.** Installing a role alone does not supply those
+Host tools. See [API and setup](docs/api.md), [service architecture](docs/architecture.md)
 and [release/data preservation](docs/releases.md).
 
 ## Development
 
-Linux and Node.js 24 are required. The public module SDK is pinned exactly;
-authenticate to GitHub Packages using `NODE_AUTH_TOKEN`, never a committed token.
+Linux and Node.js 24 are required. The public SDK is pinned exactly; authenticate
+to GitHub Packages using `NODE_AUTH_TOKEN`, never a committed token.
 
 ```sh
 npm ci --ignore-scripts
@@ -40,34 +38,9 @@ npm test
 npm run pack:check
 ```
 
-Tests use synthetic native adapters and temporary SQLite files. The separate
-Host repository owns native Chat browser tests; this module no longer bundles
-React, Playwright or a copy of the Host UI. Actual native integration must use
-isolated homes, directories and ports. Publication does not authorize a database
-reset or production restart.
-
-With an already-built compatible Host, run the optional native creation check
-under a resource-limited process group and an outer timeout:
-
-```sh
-node --import tsx scripts/native-session-check.mjs /absolute/host-installation
-```
-
-This starts its own isolated runtime and loopback-only synthetic model provider,
-not a connection to the supplied Host's running service. It exercises default
-and legacy-preset creation through the real Engine, initialized ordinary tools,
-binding, a first harmless prompt/reply and duplicate-send prevention. Only the
-foreground caller evidence is synthetic. It uses temporary homes and an assigned
-free port, has no user credentials, and removes its fixtures after success.
-
-The corresponding notification/steering check uses the same isolation boundary:
-
-```sh
-node --import tsx scripts/native-response-check.mjs /absolute/host-installation
-```
-
-It exercises a real native tool loop, queued A/B without an idle gap, and busy
-`immediate` steering C/D. Source prompts, events, control invalidations and idle
-state use the real Engine; the foreground caller and reminder acceptance are
-synthetic. No real business or production inbox is involved. Both scripts should
-run serially with the resource and timeout limits described above.
+Unit tests use synthetic adapters and temporary SQLite files. Native probes
+must use isolated `HOME`, `COPILOT_HOME`, `COCKPIT_HOME`, a free port and a
+loopback-only model provider; never production addresses, data or credentials.
+Run native probes serially with an outer timeout and resource limits. Publication
+does not authorize production session creation, database cleanup, foreground
+switching or a Host restart.

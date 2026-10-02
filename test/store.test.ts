@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -29,65 +28,59 @@ test('opening old or incompatible data fails read-only without creating a replac
     assert.deepEqual(readFileSync(path), before);
   } finally { rmSync(root, { recursive: true }); }
 });
-test('one native input freezes its whole split without persisting user or dispatched prompt bodies', t => {
+test('legacy delivery rows remain inert and do not register an unrelated session', t => {
   const store = new Store(':memory:'); t.after(() => store.close());
-  store.saveTopic(topic()); store.saveTopic(topic('second'));
-  const items = [{ topicId: 'topic', prompt: 'Sensitive original prompt that is not a mirror' }];
-  const first = store.begin('assistant', 'native-user', items);
-  assert.equal(first.fresh, true);
-  assert.equal(first.deliveries.length, 1);
-  const row = first.deliveries[0]!;
-  store.finish({ ...row, state: 'accepted', mode: 'prompt', native_message_id: 'real-receipt', result: { ok: true } });
-  assert.equal(store.begin('assistant', 'native-user', items).fresh, false);
-  assert.throws(() => store.begin('assistant', 'native-user', [{ topicId: 'second', prompt: 'Extra business' }]),
-    { code: 'FROZEN_DISPATCH' });
-  assert.equal(JSON.stringify(store.deliveries('assistant', 'native-user')).includes(items[0]!.prompt), false);
-  assert.throws(() => store.finish({ ...row, state: 'rejected' }), { code: 'SETTLED_DELIVERY' });
+  store.saveTopic(topic());
+  store.sql.exec(`INSERT INTO deliveries VALUES('old','front','input','topic','hash','old-target','calling',NULL,NULL,NULL,NULL,NULL,1)`);
+  const before = store.sql.prepare('SELECT * FROM deliveries').all();
+  store.recover();
+  assert.deepEqual(store.sql.prepare('SELECT * FROM deliveries').all(), before);
+  assert.equal(store.managed('old-target'), false);
   assert.equal(store.managed('worker'), true);
 });
-test('invalid multi-topic splits roll back every proposed row', t => {
-  const store = new Store(':memory:'); t.after(() => store.close()); store.saveTopic(topic());
-  assert.throws(() => store.begin('assistant', 'native-user', [
-    { topicId: 'topic', prompt: 'One' }, { topicId: 'missing', prompt: 'Two' },
-  ]), { code: 'TOPIC_NOT_FOUND' });
-  assert.deepEqual(store.deliveries('assistant', 'native-user'), []);
-});
-test('read consumes only returned entries and leaves later arrivals and unread pages intact', t => {
+test('listing does not consume and exact resolution leaves later arrivals intact', t => {
   const store = new Store(':memory:'); t.after(() => store.close());
   for (const id of ['a', 'b']) store.enqueue(incoming(id));
-  const first = store.take('assistant:read1', 1);
-  assert.deepEqual(first.items.map(row => row.native_id), ['a']);
-  assert.equal(first.hasMore, true);
+  const first = store.inbox().slice(0, 1);
+  assert.deepEqual(first.map(row => row.native_id), ['a']);
+  assert.equal(store.inbox().length, 2);
   store.enqueue(incoming('c'));
-  const replay = store.take('assistant:read1', 1);
-  assert.equal(replay.alreadyRead, true);
-  assert.deepEqual(replay.items, []);
+  store.removeResolved(first.map(row => row.id));
+  store.removeResolved(first.map(row => row.id));
   assert.deepEqual(store.inbox().map(row => row.native_id), ['b', 'c']);
-  const second = store.take('assistant:read2', 100);
-  assert.deepEqual(second.items.map(row => row.native_id), ['b', 'c']);
-  assert.equal(second.hasMore, false);
+  const second = store.inbox();
+  assert.deepEqual(second.map(row => row.native_id), ['b', 'c']);
+  store.removeResolved(second.map(row => row.id));
   assert.deepEqual(store.inbox(), []);
   assert.equal(store.enqueue(incoming('a')), false);
   assert.equal(JSON.stringify(store.sql.prepare('SELECT * FROM seen').all()).includes('Result a'), false);
 });
 test('specific IDs do not consume another pending entry and failed reads roll back', t => {
   const store = new Store(':memory:'); t.after(() => store.close());
-  store.enqueue(incoming('a')); store.enqueue(incoming('b'));
+  store.enqueuePointer('worker', 'a', 'reply'); store.enqueuePointer('worker', 'b', 'reply');
   const id = store.inbox()[0]!.id;
   store.sql.exec("CREATE TRIGGER refuse_consume BEFORE DELETE ON mailbox BEGIN SELECT RAISE(ABORT,'keep unread'); END");
-  assert.throws(() => store.take('failed-read', 100, [id]), /keep unread/);
+  assert.throws(() => store.transaction(() => store.removeResolved([id])), /keep unread/);
   assert.equal(store.inbox().length, 2);
   store.sql.exec('DROP TRIGGER refuse_consume');
-  const read = store.take('failed-read', 100, [id]);
-  assert.equal(read.items.length, 1);
+  store.transaction(() => store.removeResolved([id]));
   assert.deepEqual(store.inbox().map(row => row.native_id), ['b']);
-  assert.throws(() => store.take('failed-read', 1), { code: 'IDEMPOTENCY_CONFLICT' });
+});
+test('explicit handling retains old mailbox bodies as inert history without a new body copy', t => {
+  const store = new Store(':memory:'); t.after(() => store.close());
+  store.enqueue(incoming('legacy'));
+  const before = store.sql.prepare('SELECT * FROM mailbox').all(), id = store.inbox()[0]!.id;
+  store.removeResolved([id]);
+  assert.deepEqual(store.inbox(), []);
+  assert.deepEqual(store.sql.prepare('SELECT * FROM mailbox').all(), before);
+  assert.equal(store.reserveNotice(), null);
+  assert.equal(store.enqueuePointer('worker', 'legacy', 'reply'), false);
 });
 test('duplicate native events never restore consumed replies; changed originals fail explicitly', t => {
   const store = new Store(':memory:'); t.after(() => store.close());
   assert.equal(store.enqueue(incoming('one')), true);
   assert.equal(store.enqueue(incoming('one')), false);
-  store.take('read', 50);
+  store.removeResolved(store.inbox().map(row => row.id));
   assert.equal(store.enqueue(incoming('one')), false);
   assert.throws(() => store.enqueue({ ...incoming('one'), text: 'Changed native original' }), { code: 'NATIVE_ID_CONFLICT' });
 });
@@ -101,7 +94,7 @@ test('pending native asks normalize omitted options without treating a real chan
 test('reading during a notification send cannot restore an inbox row and late arrivals remain unnotified', t => {
   const store = new Store(':memory:'); t.after(() => store.close()); store.enqueue(incoming('one'));
   const notification = store.reserveNotice()!;
-  store.take('read', 100);
+  store.removeResolved(store.inbox().map(row => row.id));
   store.enqueue(incoming('two'));
   store.settleNotice(notification.id, 'notice-receipt', true);
   const remaining = store.inbox();
@@ -112,13 +105,15 @@ test('restart preserves pending bodies and records interrupted effects as unknow
   const directory = mkdtempSync(join(tmpdir(), 'assistant-store-')), path = join(directory, 'assistant.sqlite');
   let store = new Store(path);
   try {
-    store.saveTopic(topic()); store.begin('assistant', randomUUID(), [{ topicId: 'topic', prompt: 'Work' }]);
+    store.saveTopic(topic());
+    store.sql.exec(`INSERT INTO deliveries VALUES('old','front','input','topic','hash','worker','unknown',NULL,NULL,NULL,NULL,'original uncertainty',1)`);
     store.enqueue(incoming('one')); store.reserveNotice();
     store.saveForegroundWake({ sessionId: 'original', state: 'loading', error: null });
     store.close(); store = new Store(path); store.recover();
     assert.equal(store.inbox()[0]!.text, 'Result one');
     assert.equal(store.inbox()[0]!.notice_state, 'unknown');
     assert.equal(store.sql.prepare('SELECT state FROM deliveries').get()!.state, 'unknown');
+    assert.equal(store.sql.prepare('SELECT error FROM deliveries').get()!.error, 'original uncertainty');
     assert.equal(store.reserveNotice(), null);
     assert.deepEqual(store.foregroundWake(), { sessionId: 'original', state: 'unknown',
       error: 'Interrupted foreground load; inspect or load the original session through the Host, without automatic replay' });

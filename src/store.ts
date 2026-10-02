@@ -64,13 +64,6 @@ const topicRow = z.object({
   mapping_error: z.string().nullable(), creation_receipt: json.nullable(),
 });
 export type Topic = z.infer<typeof topicRow>;
-const deliveryRow = z.object({
-  id: z.string(), source_session: z.string(), source_message: z.string(), topic_id: z.string(), fingerprint: z.string(),
-  session_id: z.string().nullable(), state: z.enum(['calling', 'accepted', 'rejected', 'unknown']),
-  mode: z.enum(['prompt', 'ask']).nullable(), request_id: z.string().nullable(), native_message_id: z.string().nullable(),
-  result: json.nullable(), error: z.string().nullable(), created_at: z.number(),
-});
-export type Delivery = z.infer<typeof deliveryRow>;
 const inboxRow = z.object({
   sequence: z.number(), id: z.string(), session_id: z.string(), native_id: z.string(),
   kind: z.enum(['reply', 'ask']), text: z.string(), attachments: json.pipe(attachmentsSchema),
@@ -85,6 +78,10 @@ const wakeSchema = z.strictObject({
   error: z.string().nullable(),
 });
 export type ForegroundWake = z.infer<typeof wakeSchema>;
+const sourcePointer = z.strictObject({
+  eventId: z.string().min(1), timestamp: z.union([z.string(), z.number(), z.null()]),
+  type: z.string().min(1).max(200).optional(),
+});
 export function incomingIdentity(item: Incoming) {
   const question = item.question ? { ...item.question, choices: item.question.choices ?? [],
     allowFreeform: item.question.allowFreeform ?? true } : null;
@@ -145,6 +142,15 @@ export class Store {
     const row = this.sql.prepare('SELECT fingerprint,created_at FROM seen WHERE id=?').get(id);
     return row ? { fingerprint: row.fingerprint === null ? null : String(row.fingerprint), createdAt: Number(row.created_at) } : null;
   }
+  state<T>(key: string, schema: z.ZodType<T>): T | null {
+    const value = this.receipt(`evidence:${key}`)?.fingerprint;
+    return value === undefined || value === null ? null : json.pipe(schema).parse(value);
+  }
+  saveState<T>(key: string, value: T, schema: z.ZodType<T>): void {
+    this.sql.prepare(`INSERT INTO seen VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET
+      fingerprint=excluded.fingerprint,created_at=excluded.created_at`)
+      .run(`evidence:${key}`, JSON.stringify(schema.parse(value)), Date.now());
+  }
   observed(id: string): number | null {
     const row = this.sql.prepare('SELECT created_at FROM seen WHERE id=?').get(id);
     return row ? Number(row.created_at) : null;
@@ -158,46 +164,23 @@ export class Store {
       fingerprint=excluded.fingerprint,created_at=excluded.created_at`)
       .run('foreground-wake', JSON.stringify(wakeSchema.parse(wake)), Date.now());
   }
-  deliveries(sessionId: string, messageId: string): Delivery[] {
-    return this.sql.prepare('SELECT * FROM deliveries WHERE source_session=? AND source_message=? ORDER BY rowid')
-      .all(sessionId, messageId).map(row => deliveryRow.parse(row));
-  }
-  begin(sessionId: string, messageId: string, items: { topicId: string; prompt: string }[]) {
-    const hash = fingerprint(items);
-    return this.transaction(() => {
-      const previous = this.deliveries(sessionId, messageId);
-      if (previous.length) {
-        requireFact(previous.every(row => row.fingerprint === hash), 'FROZEN_DISPATCH', 'This native input already has its one complete split');
-        return { fresh: false, deliveries: previous };
-      }
-      requireFact(new Set(items.map(item => item.topicId)).size === items.length, 'DUPLICATE_TOPIC', 'Use each topic only once');
-      const rows = items.map(item => {
-        const topic = this.topic(item.topicId);
-        requireFact(!topic.archived, 'ARCHIVED_TOPIC', 'Archived topics cannot receive work');
-        const row: Delivery = { id: randomUUID(), source_session: sessionId, source_message: messageId, topic_id: topic.id,
-          fingerprint: hash, session_id: topic.session_id, state: 'calling', mode: null,
-          request_id: null, native_message_id: null, result: null, error: null, created_at: Date.now() };
-        this.sql.prepare('INSERT INTO deliveries VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id, sessionId, messageId,
-          topic.id, hash, row.session_id, row.state, null, null, null, null, null, row.created_at);
-        return row;
-      });
-      return { fresh: true, deliveries: rows };
-    });
-  }
-  delivery(id: string): Delivery { return deliveryRow.parse(this.sql.prepare('SELECT * FROM deliveries WHERE id=?').get(id)); }
-  finish(row: Delivery): void {
-    const current = this.delivery(row.id);
-    requireFact(current.state === 'calling', 'SETTLED_DELIVERY', 'Do not overwrite a settled or uncertain delivery');
-    requireFact(!current.session_id || current.session_id === row.session_id, 'FROZEN_TARGET', 'A delivery retains its actual target');
-    this.sql.prepare(`UPDATE deliveries SET session_id=?,state=?,mode=?,request_id=?,native_message_id=?,result=?,error=? WHERE id=?`)
-      .run(row.session_id, row.state, row.mode, row.request_id, row.native_message_id,
-        row.result === null ? null : JSON.stringify(row.result), row.error, row.id);
-  }
   managed(sessionId: string): boolean {
-    return !!this.sql.prepare('SELECT 1 FROM topics WHERE session_id=? UNION ALL SELECT 1 FROM deliveries WHERE session_id=? LIMIT 1')
-      .get(sessionId, sessionId);
+    return !!this.sql.prepare('SELECT 1 FROM topics WHERE session_id=? LIMIT 1').get(sessionId);
   }
-  enqueue(item: Incoming, notice: InboxItem['notice_state'] = 'pending'): boolean {
+  enqueuePointer(sessionId: string, nativeId: string, kind: Incoming['kind'],
+    source?: { eventId: string; timestamp: string | number | null; type?: string }): boolean {
+    const item: Incoming = { session_id: sessionId, native_id: nativeId, kind, text: '', attachments: [], question: null };
+    const identity = incomingIdentity(item);
+    if (this.receipt(identity.id)) {
+      const previous = this.source(identity.id);
+      requireFact(!previous || !source || previous.eventId === source.eventId, 'NATIVE_ID_CONFLICT',
+        'A native message identity changed its source event');
+      return false;
+    }
+    return this.enqueue(item, 'pending', source);
+  }
+  enqueue(item: Incoming, notice: InboxItem['notice_state'] = 'pending',
+    source?: { eventId: string; timestamp: string | number | null; type?: string }): boolean {
     const identity = incomingIdentity(item);
     return this.transaction(() => {
       const previous = this.sql.prepare('SELECT fingerprint FROM seen WHERE id=?').get(identity.id);
@@ -208,29 +191,37 @@ export class Store {
         return false;
       }
       this.remember(identity.id, identity.fingerprint);
+      if (this.receipt(`handled:${fingerprint([item.session_id, source?.eventId ?? item.native_id])}`)) return false;
       this.sql.prepare(`INSERT INTO mailbox(id,session_id,native_id,kind,text,attachments,question,created_at,notice_state)
         VALUES(?,?,?,?,?,?,?,?,?)`).run(identity.id, item.session_id, item.native_id, item.kind, item.text,
         JSON.stringify(item.attachments), item.question === null ? null : JSON.stringify(item.question), Date.now(), notice);
+      if (source) {
+        this.saveState(`source:${identity.id}`, source, sourcePointer);
+        this.sql.prepare("UPDATE mailbox SET text='',attachments='[]',question=NULL WHERE id=?").run(identity.id);
+      }
       return true;
     });
   }
-  inbox(): InboxItem[] { return this.sql.prepare('SELECT * FROM mailbox ORDER BY sequence').all().map(row => inboxRow.parse(row)); }
-  take(callId: string, limit: number, ids?: string[], available?: ReadonlySet<string>) {
-    return this.transaction(() => {
-      const key = `read:${callId}`, hash = fingerprint({ limit, ids: ids ?? null });
-      if (this.seen(key, hash)) {
-        return { items: [], alreadyRead: true, hasMore: this.inbox().some(item => !available || available.has(item.id)) };
-      }
-      const pending = this.inbox().filter(item => !available || available.has(item.id));
-      const selected = pending.filter(item => !ids || ids.includes(item.id)).slice(0, limit);
-      for (const item of selected) this.sql.prepare('DELETE FROM mailbox WHERE id=?').run(item.id);
-      this.remember(key, hash);
-      return { items: selected, alreadyRead: false, hasMore: pending.length > selected.length };
-    });
+  source(id: string) { return this.state(`source:${id}`, sourcePointer); }
+  removeResolved(ids: readonly string[]): void {
+    for (const id of ids) {
+      const row = this.sql.prepare('SELECT text,attachments,question FROM mailbox WHERE id=?').get(id);
+      if (!row) continue;
+      if (row.text !== '' || row.attachments !== '[]' || row.question !== null) {
+        this.sql.prepare('INSERT OR IGNORE INTO seen VALUES(?,?,?)')
+          .run(`inbox-archived:${id}`, 'handled-legacy-row', Date.now());
+      } else this.sql.prepare('DELETE FROM mailbox WHERE id=?').run(id);
+    }
+  }
+  inbox(): InboxItem[] {
+    return this.sql.prepare(`SELECT mailbox.* FROM mailbox WHERE NOT EXISTS
+      (SELECT 1 FROM seen WHERE seen.id='inbox-archived:'||mailbox.id) ORDER BY sequence`).all()
+      .map(row => inboxRow.parse(row));
   }
   discardQuestions(ids: readonly string[]): void {
     this.transaction(() => {
-      for (const id of ids) this.sql.prepare("DELETE FROM mailbox WHERE id=? AND kind='ask'").run(id);
+      for (const id of ids) if (this.sql.prepare("SELECT 1 FROM mailbox WHERE id=? AND kind='ask'").get(id))
+        this.removeResolved([id]);
     });
   }
   reserveNotice(eligible?: ReadonlySet<string>): { id: string; items: InboxItem[] } | null {
@@ -252,9 +243,7 @@ export class Store {
       const wake = this.foregroundWake();
       if (wake?.state === 'loading') this.saveForegroundWake({ ...wake, state: 'unknown',
         error: 'Interrupted foreground load; inspect or load the original session through the Host, without automatic replay' });
-      this.sql.exec(`UPDATE deliveries SET state='unknown',error='Interrupted native delivery; inspect the original session' WHERE state='calling';
-        UPDATE topics SET mapping_state='unknown',mapping_error='Interrupted native creation; do not create a replacement' WHERE mapping_state='calling';
-        UPDATE mailbox SET notice_state='unknown' WHERE notice_state='calling'`);
+      this.sql.exec("UPDATE mailbox SET notice_state='unknown' WHERE notice_state='calling'");
     });
   }
   close(): void { this.sql.close(); }

@@ -115,9 +115,30 @@ A filtered empty page or `scanLimited` is not end of history; follow genuine
 Host continuations within the relevant range/budget. On expiration, rewind,
 missing boundary or deletion record a `gap`, not a successful read. Explicit
 `reset:true` rebuilds the position; do not silently advance away from lost data.
-Host process restart expires these tokens and requires an explicit new recent
-baseline with the coverage gap disclosed. Source unload/native child restart
-alone does not expire persisted tokens while the Host signer remains alive.
+After interruption or Host restart, recover the stored query/continuation or
+completed Host checkpoint from Assistant and submit it to the Host unchanged.
+Do not mark a gap or replace the baseline merely because the process restarted.
+Version-2 positions require Host Rolling 37 or a later compatible Host.
+They are caller-owned location descriptions, not authorization
+credentials; Host identity/scope and native history validation still apply.
+If a partial native cursor expires or its page changes, explicitly reread the
+same incremental interval using the original `since` without `cursor`, deduplicating
+fragments by `eventId` and UTF-16 offset. Merge overlapping ranges, not just exact
+duplicate fragments: sizes can change on replay. If the body changed, discard
+the old assembly and reread it. An initial history traversal without a completed
+checkpoint needs explicit reselection of its intended history range and deduplication,
+not an automatic recent-only reset. A local recorded `gap` needs explicit `reset:true`
+to replace the failed attempt, but keep the original `since`: reset does not mean
+discarding the old interval for the latest few messages. Advance only after the
+whole interval is delivered and read. Actual missing/changed anchors, incompatible
+positions or a still-unlocatable interval remain gaps with pointers unresolved.
+Legacy Host Rolling 36 positions can be submitted unchanged to the corrected
+Host for strict payload/native-location validation and new-format output. That
+does not restore a lost signature or missing history. Never decode or rewrite
+positions here. Preserve the original legacy `since` throughout pagination and
+only save the new-format checkpoint after processing the entire range.
+If migration fails, disclose its coverage gap and keep old pointers;
+do not treat a replacement recent window as complete coverage of old unread work.
 The service keeps read position distinct from `silent`/`notified` handling.
 Checkpoint updates compare an immutable version. For another completed report
 on the same receipt, pass its returned `checkpoint.version` as

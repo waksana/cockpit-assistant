@@ -123,11 +123,20 @@ node --import tsx --test test/release*.test.ts
 
 ### Native Host consumer probes
 
-The pointer-inbox integration was exercised against the sealed
+The original pointer-inbox integration was exercised against the sealed
 [Host Rolling 36](https://github.com/waksana/cockpit/releases/tag/v0.0.0-rolling.36)
 runtime, source `5d9191a9aa5f5e7fded65154982e99773066bc09`.
 Its `runtime.tar.gz` is 55,944,190 bytes, SHA256
 `ebd157eb65b42c913323be6345b7469b06c9b5d515e3dcb9abca4eb6fb0a7fd1`.
+That artifact's process-key positions do not establish restart-safe consumption.
+Stable caller-owned positions require the corrected
+[Host Rolling 37](https://github.com/waksana/cockpit/releases/tag/v0.0.0-rolling.37)
+or a later compatible Host. Rolling 37 source is
+`af5bad83ec9ba421483ea0660d2b46a49e0df146`; its `runtime.tar.gz` is
+55,946,044 bytes, SHA256
+`f236ffcfec32926a12de70160bc7573cfca3f5723e28d3bddb1674761d503476`.
+The deployment descriptor's required-intent presence alone cannot distinguish
+these text-position formats; use the stated Host dependency for restart recovery.
 Select and verify the published artifact before extracting it; these scripts
 take an extracted runtime directory, never a production service URL:
 
@@ -154,8 +163,48 @@ treated as successful delivery; unrelated errors fail the run.
 
 These are consumer integration probes, not a proof of model judgment or human
 delivery. The Host owns pagination and token-expiry behavior; see its
-[text contract](https://github.com/waksana/cockpit/blob/v0.0.0-rolling.36/docs/native-chat.md#bounded-text-view).
+[text contract](https://github.com/waksana/cockpit/blob/v0.0.0-rolling.37/docs/native-chat.md#bounded-text-view).
 Production foreground creation/selection and deployment remain separate actions.
+
+### Complete Host process restart
+
+The stable-position consumer probe uses a controller/provider process and a
+separate Host OS process. It waits for that Host to exit, then starts another
+Host against the same isolated native persistence and Assistant database. This
+is not a reader reconstruction or a native-child-only restart:
+
+```sh
+npm run build
+taskset -c 0,1 prlimit --as=17179869184 -- node \
+  --max-old-space-size=2048 --disable-wasm-trap-handler \
+  scripts/native-restart-check.mjs /absolute/path/to/verified-host-rolling37
+taskset -c 0,1 prlimit --as=17179869184 -- node \
+  --max-old-space-size=2048 --disable-wasm-trap-handler \
+  scripts/native-restart-check.mjs /absolute/path/to/verified-host-rolling37 \
+  --legacy-host /absolute/path/to/verified-host-rolling36 --change-partial-page
+```
+
+`--keep-evidence` retains the isolated synthetic fixture for explicit local
+inspection; without it successful fixtures are removed. Never commit native
+transcripts or fixture directories.
+
+The two runs against the exact artifacts above completed with 81/91 provider
+requests and 56/63 genuine MCP calls respectively. All six Host processes exited
+cleanly. The consumer recovered Assistant-owned positions and partial progress,
+read ten-page incremental ranges across shutdown/restart, retained unread
+concurrent arrivals after older handling, and reassembled a 25,016-byte Unicode
+body while the source remained unloaded. A real append forced
+`TEXT_PAGE_CHANGED`; explicit replay retained the original `since` and pending
+receipt. A real public rewind produced a history gap without advancing or
+acknowledging unread positions. Original Rolling 36 positions were consumed
+unchanged by Rolling 37 and migrated only after the complete range.
+
+The runs reported 14/18 expected lifecycle-transition diagnostics; those are not
+business completion signals. Actual native `TEXT_CURSOR_EXPIRED` and initial
+history recovery without a checkpoint were not induced by these runs. Their
+recovery contract remains explicit in the [API](api.md#read-positions); they are
+not claimed as native execution evidence. No Host read-state table, Assistant
+body mirror, new tool permission or production migration was introduced.
 
 ### Packaging and publication
 

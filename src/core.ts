@@ -62,6 +62,12 @@ const settled = (meta: PublicSessionMeta) => meta.loaded && ['idle', 'error'].in
 const liveQuestion = (meta: PublicSessionMeta | null | undefined, question: Incoming['question']) =>
   !!meta?.loaded && worker(meta) && !!meta.ask
   && fingerprint(questionIdentity(meta.ask)) === fingerprint(questionIdentity(question));
+const foregroundIdle = (meta: PublicSessionMeta) => meta.status === 'idle' && settled(meta);
+const foregroundRole = (meta: PublicSessionMeta) => !meta.rolesNeedReload
+  && meta.appliedRoles?.length === 1 && activeRole(meta, 'coordinator');
+const roleIdentity = (meta: PublicSessionMeta) => fingerprint({
+  roles: meta.roles, appliedRoles: meta.appliedRoles, rolesNeedReload: meta.rolesNeedReload,
+});
 function historyExcerpt(text: string): string {
   let low = 0, high = Math.min(text.length, 3000);
   while (low < high) {
@@ -99,6 +105,7 @@ export class Assistant {
   private observations = new Map<string, Promise<void>>();
   private awaitingIdle = new Set<string>();
   private sourceVersions = new Map<string, number>();
+  private foregroundObservation = { sessionId: '', version: 0 };
   private stopped = false;
   constructor(readonly store: Store, readonly native: Gateway, readonly config: Config,
     readonly report: (error: unknown) => void) {}
@@ -144,7 +151,7 @@ export class Assistant {
         const { topicId } = z.strictObject({ topicId: id }).parse(input), topic = this.store.topic(topicId);
         const meta = topic.session_id ? await this.native.session(topic.session_id) : null;
         return { topic: displayTopic(topic), session: meta ? { sessionId: meta.sessionId, loaded: meta.loaded,
-          status: meta.status, activity: meta.activity, ask: meta.ask } : null };
+          status: meta.status, activity: meta.activity, ask: meta.ask } : null, foregroundWake: this.store.foregroundWake() };
       }
       default: throw new BusinessError('UNKNOWN_TOOL', 'Unknown or retired Assistant tool', 400);
     }
@@ -347,6 +354,7 @@ export class Assistant {
   }
   observe(sessionId: string, event?: NativeChatEvent): Promise<void> {
     if (this.stopped) return Promise.resolve();
+    if (sessionId === this.foregroundObservation.sessionId) this.foregroundObservation.version++;
     if (event) this.native.observe(sessionId, event);
     if (!this.store.managed(sessionId)) return Promise.resolve();
     this.sourceVersions.set(sessionId, (this.sourceVersions.get(sessionId) ?? 0) + 1);
@@ -395,6 +403,7 @@ export class Assistant {
     const sessions = new Map<string, Awaited<ReturnType<Assistant['sampleSource']>>>();
     for (const item of this.store.inbox()) {
       if (item.kind !== 'ask') continue;
+      if (!this.store.managed(item.session_id)) continue;
       if (!sessions.has(item.session_id)) sessions.set(item.session_id, await this.sampleSource(item.session_id));
     }
     for (const item of this.store.inbox()) {
@@ -413,33 +422,96 @@ export class Assistant {
       try {
         do {
           this.noticeAgain = false;
-          await this.sendNotice();
+          try { await this.sendNotice(); }
+          catch (error) { this.report(error); }
         } while (this.noticeAgain && !this.stopped);
       } finally { this.notice = null; }
     })();
     return this.notice;
   }
-  private async sendNotice(): Promise<void> {
-    if (this.stopped || !this.store.inbox().some(item => item.notice_state === 'pending')) return;
-    const meta = await this.native.foreground();
-    if (this.stopped || !meta?.loaded || meta.status !== 'idle' || !meta.activity || meta.activity.hasActiveWork
-      || meta.activity.processing || meta.ask || !activeRole(meta, 'coordinator')) return;
-    const sources = await this.refreshQuestions(), eligible = new Set<string>();
+  private async noticeSources() {
+    const sources = await this.refreshQuestions();
     for (const item of this.store.inbox()) {
       if (item.notice_state !== 'pending') continue;
+      if (!this.store.managed(item.session_id)) continue;
       if (!sources.has(item.session_id)) sources.set(item.session_id, await this.sampleSource(item.session_id));
     }
+    return sources;
+  }
+  private eligibleNotices(sources: Awaited<ReturnType<Assistant['noticeSources']>>) {
+    const eligible = new Set<string>();
     // Later source lookups may yield to a decision change or a new native run.
     // Recheck observations and the live idle latch without another async gap.
     for (const item of this.store.inbox()) {
       if (item.notice_state !== 'pending') continue;
+      if (!this.store.managed(item.session_id)) continue;
       const source = this.currentSample(item.session_id, sources.get(item.session_id));
       if (worker(source) && source.loaded
         && (item.kind === 'ask' ? liveQuestion(source, item.question)
           : !this.awaitingIdle.has(item.session_id) && settled(source))) eligible.add(item.id);
     }
+    return eligible;
+  }
+  private async sendNotice(): Promise<void> {
+    if (this.stopped || !this.store.inbox().some(item => item.notice_state === 'pending')) return;
+    let sources = await this.noticeSources();
+    if (this.stopped || !this.eligibleNotices(sources).size) return;
+    let meta = await this.native.foreground();
+    if (this.stopped || !meta || !this.eligibleNotices(sources).size) return;
+    const sessionId = meta.sessionId;
+    if (this.foregroundObservation.sessionId !== sessionId) this.foregroundObservation = { sessionId, version: 0 };
+    if (!meta.loaded) {
+      const wake = this.store.foregroundWake();
+      if (wake?.sessionId === sessionId && wake.state !== 'loaded') return;
+      requireFact(meta.roles?.length === 1 && meta.roles[0]?.moduleId === 'assistant'
+        && meta.roles[0]?.roleId === 'coordinator', 'FOREGROUND_ROLE',
+      'The original foreground must retain only its saved Assistant role before loading', 403);
+      this.store.saveForegroundWake({ sessionId, state: 'loading', error: null });
+      try {
+        const result = await this.native.host.call('session/load', { sessionId });
+        requireFact(typeof result.ok === 'boolean' && result.sessionId === sessionId, 'FOREGROUND_LOAD_UNKNOWN',
+          'Foreground load returned an incomplete receipt or different identity; do not retry automatically');
+        if (result.ok !== true) {
+          this.store.saveForegroundWake({ sessionId, state: 'failed', error: 'Host rejected the original foreground load' });
+          throw new BusinessError('FOREGROUND_LOAD_FAILED', 'Host rejected the original foreground load');
+        }
+        // Acknowledgement is not proof of loaded state or readiness.
+        const current = await this.native.foreground();
+        requireFact(current?.sessionId === sessionId && current.loaded, 'FOREGROUND_LOAD_UNKNOWN',
+          'The original foreground load could not be confirmed; inspect it without automatic replay');
+        this.store.saveForegroundWake({ sessionId, state: 'loaded', error: null });
+        meta = current;
+      } catch (error) {
+        if (this.store.foregroundWake()?.state === 'loading')
+          this.store.saveForegroundWake({ sessionId, state: 'unknown', error: errorText(error) });
+        throw error;
+      }
+    }
+    if (this.stopped || !foregroundIdle(meta)) return;
+    const foregroundVersion = this.foregroundObservation.version;
+    const roles = roleIdentity(meta);
+    try {
+      requireFact(foregroundRole(meta), 'FOREGROUND_ROLE', 'The loaded foreground role is not ready for Assistant notifications', 403);
+      await this.native.validateForeground(meta);
+    } catch (error) {
+      if (this.store.foregroundWake()?.sessionId === sessionId)
+        this.store.saveForegroundWake({ sessionId, state: 'failed', error: errorText(error) });
+      throw error;
+    }
     if (this.stopped) return;
-    const notice = this.store.reserveNotice(eligible);
+    sources = await this.noticeSources();
+    if (this.stopped) return;
+    const current = await this.native.foreground();
+    requireFact(current?.sessionId === sessionId, 'FOREGROUND_CHANGED',
+      'Foreground selection changed while preparing a notification; no message was sent');
+    if (this.stopped || !foregroundIdle(current)) return;
+    requireFact(foregroundRole(current) && roleIdentity(current) === roles, 'FOREGROUND_CHANGED',
+      'Foreground roles changed after readiness validation; no message was sent');
+    if (this.stopped || this.foregroundObservation.version !== foregroundVersion) return;
+    const wake = this.store.foregroundWake();
+    if (wake?.sessionId === sessionId && wake.state !== 'loaded')
+      this.store.saveForegroundWake({ sessionId, state: 'loaded', error: null });
+    const notice = this.store.reserveNotice(this.eligibleNotices(sources));
     if (!notice) return;
     try {
       const result = await this.native.host.call('prompt', { sessionId: meta.sessionId, mode: 'enqueue',

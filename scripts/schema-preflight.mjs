@@ -10,7 +10,8 @@ import { populateLegacy, verifyUnread } from './fixtures/retained-data.mjs';
 export const applicationTables = ['deliveries', 'mailbox', 'seen', 'topics'];
 export const schemaVersion = 5;
 function context(dataRoot, signal) {
-  return { moduleId: 'assistant', apiVersion: 1, serviceReadyVersion: 1,
+  return { moduleId: 'assistant', apiVersion: 1, serviceReadyVersion: 1, shutdownVersion: 1,
+    stopping: new AbortController().signal,
     dataRoot, apiBase: '/_modules/assistant/fixture/api', config: {}, signal,
     host: { chatReadVersion: 1, askResponseVersion: 1, roleAssignmentVersion: 1, sessionLoadVersion: 1,
       promptReceiptVersion: 1, toolScopeVersion: 1, promptOriginVersion: 1, roleResourcePolicyVersion: 1,
@@ -22,7 +23,7 @@ export async function verifySchemaBoundary(activate, directory, migrationEntry) 
   const fresh = join(directory, 'fresh');
   await mkdir(fresh);
   const controller = new AbortController(), backend = await activate(context(fresh, controller.signal));
-  controller.abort(); backend.dispose?.(); await setImmediate();
+  await backend.onStop(); controller.abort(); await backend.dispose?.(); await setImmediate();
   const sql = new DatabaseSync(join(fresh, 'assistant.sqlite'), { readOnly: true });
   try {
     assert.equal(sql.prepare('PRAGMA user_version').get().user_version, schemaVersion);

@@ -13,6 +13,8 @@ Ordinary updates wait for source idle and an available foreground; current nativ
 questions bypass the source-idle wait. The Skill presents meaningful new facts
 and state changes naturally, without routine routing reports or duplicate ACKs.
 Business inputs use native `immediate` steering; foreground reminders use `enqueue`.
+Eligible pending results can load the original foreground on demand; absent or
+uncertain identities are never replaced or retried blindly.
 
 Select the Assistant role when creating a native session. The role's exclusive
 resource policy connects only its Assistant MCP and enables only its topic Skill.

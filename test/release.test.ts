@@ -32,7 +32,7 @@ function fixture() {
   for (const [name, value] of Object.entries({
     'package.json': { version: expected.version },
     'cockpit.module.json': { version: expected.version },
-    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.13.0', platform: 'linux', node: '24.20.0' },
+    'module-build.json': { version: expected.version, sourceSha: sha, sdk: '0.15.0', platform: 'linux', node: '24.20.0' },
     'cockpit-deployment.json': descriptor,
   })) writeFileSync(join(stage, name), `${JSON.stringify(value)}\n`);
   writeFileSync(join(directory, 'cockpit-deployment.json'), readFileSync(join(stage, 'cockpit-deployment.json')));
@@ -123,6 +123,7 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
     assert.ok(!actual.requiresCapabilities.includes(capability));
   }
   assert.ok(actual.requiresCapabilities.includes('chatRead.v1'));
+  assert.ok(actual.requiresCapabilities.includes('shutdown.v1'));
   assert.ok(actual.requiresCapabilities.includes('promptReceipt.v1'));
   assert.ok(actual.requiresCapabilities.includes('toolScope.v1'));
   assert.ok(actual.requiresCapabilities.includes('roleResourcePolicy.v1'));

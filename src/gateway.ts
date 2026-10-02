@@ -22,5 +22,6 @@ export interface Gateway {
   caller(identity: McpInvocationMeta): Promise<Caller>;
   session(id: string): Promise<PublicSessionMeta | null>;
   foreground(): Promise<PublicSessionMeta | null>;
+  validateForeground(meta: PublicSessionMeta): Promise<void>;
   observe(sessionId: string, event: NativeChatEvent): void;
 }

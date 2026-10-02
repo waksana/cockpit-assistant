@@ -60,6 +60,30 @@ test('real accepted client receipt joins native content, not an event envelope o
     assert.equal(data.includes('native-event'), false);
   } finally { f.close(); }
 });
+test('foreground lookup distinguishes an absent selection from a missing identity and native read errors', async t => {
+  const empty = fixture(), selected = fixture(true);
+  try {
+    assert.equal(await empty.chat.foreground(), null);
+    assert.equal((await selected.chat.foreground())!.sessionId, 'front');
+    const call = t.mock.method(selected.host, 'call', async () => ({ meta: null }));
+    await assert.rejects(selected.chat.foreground(), { code: 'FOREGROUND_MISSING' });
+    call.mock.mockImplementation(async () => { throw new Error('Synthetic native read failure'); });
+    await assert.rejects(selected.chat.foreground(), /Synthetic native read failure/);
+  } finally { empty.close(); selected.close(); }
+});
+test('foreground notification readiness reuses exact coordinator scope and actual role resources', async () => {
+  const f = fixture(true);
+  try {
+    await f.chat.validateForeground(f.meta);
+    await assert.rejects(f.chat.validateForeground({ ...f.meta, sessionId: 'replacement' }), { code: 'FOREGROUND_ROLE' });
+    await assert.rejects(f.chat.validateForeground({ ...f.meta, loaded: false }), { code: 'FOREGROUND_ROLE' });
+    await assert.rejects(f.chat.validateForeground({ ...f.meta, rolesNeedReload: true }), { code: 'FOREGROUND_ROLE' });
+    f.tools.push({ name: 'extra', mcpServerName: 'cockpit', mcpToolName: 'prompt' });
+    await assert.rejects(f.chat.validateForeground(f.meta), { code: 'CALLER_RESOURCES' });
+    f.tools.pop(); f.notReady();
+    await assert.rejects(f.chat.validateForeground(f.meta), { code: 'CALLER_RESOURCES' });
+  } finally { f.close(); }
+});
 test('module and generic API receipts never authorize human work even if text claims to be a user', async () => {
   for (const origin of ['module', 'api'] as const) {
     const f = fixture(true);

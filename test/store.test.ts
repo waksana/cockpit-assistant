@@ -114,10 +114,15 @@ test('restart preserves pending bodies and records interrupted effects as unknow
   try {
     store.saveTopic(topic()); store.begin('assistant', randomUUID(), [{ topicId: 'topic', prompt: 'Work' }]);
     store.enqueue(incoming('one')); store.reserveNotice();
+    store.saveForegroundWake({ sessionId: 'original', state: 'loading', error: null });
     store.close(); store = new Store(path); store.recover();
     assert.equal(store.inbox()[0]!.text, 'Result one');
     assert.equal(store.inbox()[0]!.notice_state, 'unknown');
     assert.equal(store.sql.prepare('SELECT state FROM deliveries').get()!.state, 'unknown');
     assert.equal(store.reserveNotice(), null);
+    assert.deepEqual(store.foregroundWake(), { sessionId: 'original', state: 'unknown',
+      error: 'Interrupted foreground load; inspect or load the original session through the Host, without automatic replay' });
+    store.recover();
+    assert.equal(store.foregroundWake()!.state, 'unknown');
   } finally { store.close(); rmSync(directory, { recursive: true }); }
 });

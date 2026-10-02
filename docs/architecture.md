@@ -16,7 +16,7 @@ protocol. The service owns only four active tables:
 | `topics` | Flat definitions, current native session mapping and actual creation outcome. |
 | `deliveries` | Source/native IDs, target, split fingerprint and delivery outcome; no prompt/body copy. |
 | `mailbox` | Unread replies/questions and attachment references, deleted when returned by an inbox read. |
-| `seen` | Small native identity, input-origin and read-call receipts; no transcript bodies. |
+| `seen` | Small native identity, input-origin, read-call receipts and latest foreground load outcome; no transcript bodies. |
 
 One genuine native user input has one frozen topic split. Existing workers retain
 their IDs; unloaded workers load and ordinary business prompts use `immediate`.
@@ -89,11 +89,34 @@ unread mailbox, retaining their deduplication identity. Unavailable/unloaded ask
 remain unread but are not presented as current; no session is loaded to inspect
 them. A valid question may notify while its source is busy, avoiding a deadlock.
 
+Eligibility is checked before foreground discovery. Only eligible pending mail
+can load the already-selected original foreground. Concurrent callbacks share
+one notification drain and load attempt. The load intent is recorded before the
+Host call, then its acknowledgement and original identity are read back. Missing
+identities are not replaced, loaded handles are not reloaded, and no polling or
+permanent keepalive is introduced. A failed/unknown attempt is not repeated
+after a later event or restart; a normal public Host load of the original session
+allows readback recovery. See [API recovery](api.md#one-mcp-endpoint).
+
+Before sending, the service checks exclusive applied roles, exact offered
+tool identities and native resource readiness, then samples source eligibility
+and foreground identity/roles/activity again. Source events invalidate stale
+samples across these awaits; foreground events also invalidate earlier resource
+readiness, even when the saved roles are unchanged. If the last eligible ask expires or a reply is
+consumed while loading, no reminder is reserved. Starting a load does not consume
+mail or count as notification.
+
 When the foreground is idle, the service sends a bounded location-only reminder
 for eligible entries using `enqueue`, never business dispatch's `immediate`.
 The current SDK has no public system-notification sender, so the reminder is a
 visible ordinary native message. It is not a user business request. The service
 does not re-notify an uncertain send or inject all worker bodies into context.
+
+The service opts into Host `shutdown.v1`. The early `stopping` signal stops new
+producers; `onStop` joins already-started operations and records accepted or
+unknown results while storage remains open. Only final `dispose` closes the
+store and releases its lease. No new foreground load or prompt starts during
+drain, and interrupted load receipts recover as unknown rather than replaying.
 
 ## Semantic responsibility
 

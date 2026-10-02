@@ -42,11 +42,13 @@ archive root and as a sidecar. Format 2, channel `rolling`, uses the public
 [host release contract](https://github.com/waksana/cockpit/blob/main/docs/releasing.md).
 Independent checksum files avoid a self-referential archive digest.
 
-The product is module **`assistant`**, backend API 1, requiring service readiness,
+The product is module **`assistant`**, backend API 1, requiring `shutdown.v1`, service readiness,
 chat reads, ask responses, role assignments, session load, native tool scope,
 exclusive role resources and prompt-origin observations. No module frontend/UI
 capabilities are required. Foreground attribution uses actual native acceptance
 and MCP `toolCallId` metadata. Missing capabilities fail before opening data.
+`shutdown.v1` requires the early stopping signal and awaited `onStop`/`dispose`
+contract; installing a newer SDK alone does not establish Host support.
 Required intents are extracted from actual backend host calls. Packaging creates
 the target database in memory and checks its four active tables:
 `topics`, `deliveries`, `mailbox` and `seen`.

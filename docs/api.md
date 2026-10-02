@@ -6,7 +6,11 @@ There is no module frontend. Discover the enabled `assistant` ID/digest in Host
 Native role selection and session IDs come from the ordinary Host APIs.
 
 `GET /state` returns
-`{protocolVersion:5,conversation:"native-session-chat",inbox:"consume-on-read",foregroundSessionId,schemaVersion:5}`.
+`{protocolVersion:5,conversation:"native-session-chat",inbox:"consume-on-read",foregroundSessionId,foregroundWake,schemaVersion:5}`.
+`foregroundWake` is null or the last load attempt's `{sessionId,state,error}`;
+states are `loading`, `loaded`, `failed`, or `unknown`. `failed` also includes
+post-load role/resource failures. `loaded` confirms only
+the original handle was observed loaded, not notification delivery or business success.
 The old module `/messages`, `/inputs`, `/timeline`, SSE and local-clarification
 flows return **410 NATIVE_CHAT_REQUIRED**, not new content with old semantics.
 Dashboard and other clients must explicitly move to native `prompt` and
@@ -22,8 +26,9 @@ capabilities are required before the service opens its store.
 
 The first receipt-authenticated browser input selects an unconfigured foreground.
 Alternatively persist its exact existing ID as `foregroundSessionId`. Other
-coordinator-labelled sessions do not take over it. Unloaded is not missing; use
-normal Host load/reload without creating a replacement. A role update only
+coordinator-labelled sessions do not take over it. Eligible unread results can
+load this original foreground on demand; unrelated activity never creates a new
+one. Unloaded is not missing. A role update only
 applies to an existing handle after an explicit idle reload.
 
 Persistent defaults use the Assistant `config` value in Host `modules/config.json`
@@ -84,12 +89,26 @@ Ask answers still use `respondAsk`. Neither operation clears existing queues or
 replays uncertain deliveries. Foreground result reminders remain `enqueue`.
 
 Ordinary reminders wait for source idle (or a settled native error), then for an
-idle foreground. A valid native question bypasses the source-idle wait. Inbox
+idle foreground. When eligible pending entries exist and the original foreground
+is unloaded, the service requests `session/load` once, checks its identity and
+actual role resources, and revalidates eligibility before `enqueue`. It never
+reloads an already-loaded foreground or interrupts its work/ask/queue.
+A valid native question bypasses the source-idle wait. Inbox
 reads revalidate questions: stale ones are no longer offered; unavailable
 unloaded questions stay unread without being presented as live. `peek` and
 `hasMore` count currently readable entries, excluding unavailable questions.
 Explicit reads may include accumulated partial replies before idle; do not infer
 business completion from a read or reminder. See [notification semantics](architecture.md#inbox-and-notices).
+
+Load failures retain unread entries and report a service error. `foregroundWake`
+is also included in `assistant_status`; an interrupted or unconfirmed load is
+`unknown`, not permission to retry. After inspecting the failure, use the normal
+Host API to load the **same original ID** and repair its role resources if needed.
+A subsequent native change can resume notification after readback; there is no
+retry timer, replacement session or wake-reset endpoint. A deleted selected ID
+returns `FOREGROUND_MISSING`; a failed native read retains its original error
+instead of being called deletion. Uncertain prompt receipts remain unknown even
+after foreground recovery and are never replayed.
 
 MCP success means the stated local operation or native acceptance, not successful
 business completion. Transport uncertainty is not permission to repeat a send.

@@ -18,6 +18,7 @@ export class NativeChat implements Gateway {
   private tracked = new Set<string>();
   private waiting = new Map<string, Set<() => void>>();
   private selected: string | null;
+  private closed = false;
   constructor(readonly host: ModuleHostApi, readonly store: Store, foreground: string | null,
     readonly allowedTools: readonly string[]) {
     this.selected = foreground ?? store.receipt('foreground')?.fingerprint ?? null;
@@ -28,7 +29,30 @@ export class NativeChat implements Gateway {
     requireFact(!meta || meta.sessionId === sessionId, 'SESSION_MISMATCH', 'Native session identity differs');
     return meta;
   }
-  async foreground() { return this.selected ? this.session(this.selected) : null; }
+  async foreground() {
+    if (!this.selected) return null;
+    const meta = await this.session(this.selected);
+    requireFact(meta, 'FOREGROUND_MISSING', `The selected foreground ${this.selected} no longer exists; no replacement was created`, 404);
+    return meta;
+  }
+  async validateForeground(meta: PublicSessionMeta): Promise<void> {
+    requireFact(meta.sessionId === this.selected && roleOf(meta) === 'coordinator',
+      'FOREGROUND_ROLE', 'The original foreground must have only the applied Assistant role with no pending role reload', 403);
+    await this.validateResources(meta.sessionId, 'coordinator');
+  }
+  private async validateResources(sessionId: string, role: Caller['role']): Promise<void> {
+    requireFact(!this.closed, 'STOPPING', 'Assistant stopped before resource validation', 503);
+    const scope = await this.host.call('session/tool-scope', { sessionId });
+    const names = role === 'organizer' ? ['assistant_topics', 'assistant_topic', 'assistant_history'] : this.allowedTools;
+    requireFact(scope.sessionId === sessionId && scope.loaded && scope.tools?.length === names.length
+      && new Set(scope.tools.map(tool => tool.mcpToolName)).size === names.length
+      && scope.tools.every(tool => tool.mcpServerName === 'assistant' && names.includes(tool.mcpToolName ?? '')),
+    'CALLER_RESOURCES', 'The native Assistant tool set is not the role-only toolkit', 403);
+    requireFact(!this.closed, 'STOPPING', 'Assistant stopped before resource readiness', 503);
+    const ready = await this.host.call('roles/readiness', { sessionId });
+    requireFact(ready.sessionId === sessionId && ready.ready && !ready.rolesNeedReload,
+      'CALLER_RESOURCES', 'Assistant role resources are not ready', 403);
+  }
   observe(sessionId: string, event: NativeChatEvent): void {
     if (!this.tracked.has(sessionId) || !primary(event) || !['user.message', 'assistant.message'].includes(event.type)) return;
     const events = this.events.get(sessionId) ?? [];
@@ -62,14 +86,7 @@ export class NativeChat implements Gateway {
     const meta = await this.session(identity.sessionId), role = roleOf(meta);
     requireFact(role, 'CALLER_ROLE', 'Select and load the distinct Assistant role in native Chat', 403);
     this.tracked.add(identity.sessionId);
-    const scope = await this.host.call('session/tool-scope', { sessionId: identity.sessionId });
-    const names = role === 'organizer' ? ['assistant_topics', 'assistant_topic', 'assistant_history'] : this.allowedTools;
-    requireFact(scope.loaded && scope.tools?.length === names.length
-      && new Set(scope.tools.map(tool => tool.mcpToolName)).size === names.length
-      && scope.tools.every(tool => tool.mcpServerName === 'assistant' && names.includes(tool.mcpToolName ?? '')),
-    'CALLER_RESOURCES', 'The native Assistant tool set is not the role-only toolkit', 403);
-    const ready = await this.host.call('roles/readiness', { sessionId: identity.sessionId });
-    requireFact(ready.ready && !ready.rolesNeedReload, 'CALLER_RESOURCES', 'Assistant role resources are not ready', 403);
+    await this.validateResources(identity.sessionId, role);
     let events = this.events.get(identity.sessionId) ?? [];
     const matches = () => events.filter(event => event.type === 'assistant.message'
       && Array.isArray(event.data.toolRequests) && event.data.toolRequests.some(tool =>
@@ -113,6 +130,7 @@ export class NativeChat implements Gateway {
       } : null };
   }
   close(): void {
+    this.closed = true;
     for (const waiting of this.waiting.values()) for (const finish of waiting) finish();
     this.waiting.clear(); this.events.clear(); this.tracked.clear();
   }

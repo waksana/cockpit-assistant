@@ -83,7 +83,7 @@ try {
           interactionId: 'synthetic-interaction', human: true, createdAt: Date.now(),
           text: 'Synthetic no-tool request', attachments: [] } }),
       session: id => id === foreground.sessionId ? Promise.resolve(foreground) : engine.getMeta(id),
-      foreground: async () => foreground, observe() {},
+      foreground: async () => foreground, validateForeground: async () => {}, observe() {},
       host: { async call(name, body) {
         calls.push({ name, body });
         if (name === 'session/new') {

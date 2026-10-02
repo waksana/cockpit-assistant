@@ -95,7 +95,7 @@ try {
       input: { sessionId: foreground.sessionId, messageId: human, interactionId: human, human: true,
         text: human, attachments: [], createdAt: Date.now() } }),
     session: id => id === foreground.sessionId ? Promise.resolve(foreground) : engine.getMeta(id),
-    foreground: async () => foreground, observe() {},
+    foreground: async () => foreground, validateForeground: async () => {}, observe() {},
     host: { async call(name, body) {
       assert.equal(name, 'prompt');
       if (body.sessionId === foreground.sessionId) {

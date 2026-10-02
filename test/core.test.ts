@@ -37,13 +37,15 @@ function fixture(config: Partial<Config> = {}) {
     text: 'Do exactly this work', attachments: [], human: true, createdAt: Date.now() + 1000 };
   let onCall: ((name: string, sessionId: string) => Promise<void>) | null = null;
   let onMeta: ((id: string) => Promise<void>) | null = null;
+  let onReady: (() => Promise<void>) | null = null;
   let history: HistoryPage[] | null = null, callerRole: Caller['role'] = 'coordinator';
   let failure: string | null = null, missingReceipt = false, created = 0;
+  let loadResult: unknown = null, loadChangesState = true;
   const host: ModuleHostApi = {
     toolScopeVersion: 1, chatReadVersion: 1, promptReceiptVersion: 1, askResponseVersion: 1,
     async call<Name extends ModuleHostIntent>(name: Name, body: ModuleHostIntentBody<Name>): Promise<ModuleHostIntentResult<Name>> {
       calls.push({ name, body });
-      const target = 'sessionId' in body ? body.sessionId : '';
+      const target = 'sessionId' in body ? body.sessionId ?? '' : '';
       if (onCall) await onCall(name, target);
       if (failure === name) throw Object.assign(new Error('Synthetic lost receipt'), { sessionId: 'partially-created' });
       let result: unknown;
@@ -51,7 +53,9 @@ function fixture(config: Partial<Config> = {}) {
         case 'session/new': {
           const id = `worker-${++created}`; sessions.set(id, meta(id)); result = { sessionId: id }; break;
         }
-        case 'session/load': sessions.get(target)!.loaded = true; result = { ok: true, sessionId: target }; break;
+        case 'session/load':
+          if (loadChangesState) sessions.get(target)!.loaded = true;
+          result = loadResult ?? { ok: true, sessionId: target }; break;
         case 'prompt': result = { ok: true, ...(missingReceipt ? {} : { messageId: `receipt-${calls.length}` }) }; break;
         case 'respondAsk': sessions.get(target)!.ask = null; result = { ok: true }; break;
         case 'session/chat':
@@ -69,21 +73,236 @@ function fixture(config: Partial<Config> = {}) {
     },
     async session(id) { if (onMeta) await onMeta(id); return sessions.get(id) ?? null; },
     async foreground() { return sessions.get('assistant')!; },
+    async validateForeground() { if (onReady) await onReady(); },
     observe() {},
   };
   const assistant = new Assistant(store, native, configInput.parse({ defaultCwd: '/synthetic', ...config }), error => errors.push(error));
   const topic = (id: string, sessionId: string | null): Topic => store.saveTopic({ id, title: id, content: '',
     version: 1, archived: false, session_id: sessionId, mapping_state: sessionId ? 'bound' : 'unbound', mapping_error: null, creation_receipt: null });
-  return { store, assistant, sessions, calls, errors, topic,
+  return { store, assistant, native, sessions, calls, errors, topic,
     input(value: Partial<Input>) { source = { ...source, ...value }; },
     history(pages: HistoryPage[]) { history = pages; },
     organizer(ids: string[]) { callerRole = 'organizer'; source.text = `historySessionIds: ${JSON.stringify(ids)}`; },
     onCall(value: typeof onCall) { onCall = value; }, onMeta(value: typeof onMeta) { onMeta = value; },
+    onReady(value: typeof onReady) { onReady = value; },
+    load(value: typeof loadResult, changesState = true) { loadResult = value; loadChangesState = changesState; },
     fail(value: string | null) { failure = value; }, missingReceipt() { missingReceipt = true; },
     invoke(name: string, input: unknown = {}, id = `${name}-${calls.length}`) { return assistant.invoke(name, input, identity(id)); },
     close() { assistant.stop(); store.close(); },
   };
 }
+function pending(f: ReturnType<typeof fixture>, id = 'pending') {
+  f.topic('topic', 'a');
+  f.store.enqueue({ session_id: 'a', native_id: id, kind: 'reply', text: id, attachments: [], question: null });
+}
+
+test('eligible recovered replies load only the original foreground, coalesce notifications, and retain inbox bodies', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    pending(f); f.sessions.get('assistant')!.loaded = false;
+    f.onCall(async name => { if (name === 'session/load') { entered.resolve(); await release.promise; } });
+    const first = f.assistant.notify();
+    await entered.promise;
+    assert.equal(f.store.foregroundWake()!.state, 'loading');
+    pending(f, 'second');
+    const second = f.assistant.notify();
+    assert.equal(first, second);
+    release.resolve(); await Promise.all([first, second]);
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load', 'prompt']);
+    assert.deepEqual(f.calls[0]!.body, { sessionId: 'assistant' });
+    assert.equal((f.calls[1]!.body as { mode: string }).mode, 'enqueue');
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['notified', 'notified']);
+    assert.equal(f.store.foregroundWake()!.state, 'loaded');
+    await f.assistant.notify();
+    assert.equal(f.calls.length, 2);
+    f.sessions.get('assistant')!.loaded = false; pending(f, 'third');
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load', 'prompt', 'session/load', 'prompt']);
+  } finally { release.resolve(); f.close(); }
+});
+test('empty, unrelated, duplicate, uncertain and active-source mail never loads the foreground', async () => {
+  for (const state of ['empty', 'unrelated', 'duplicate', 'unknown', 'running', 'unloaded', 'activity-unknown', 'stale-ask']) {
+    const f = fixture();
+    try {
+      f.sessions.get('assistant')!.loaded = false;
+      if (state !== 'empty') pending(f);
+      if (state === 'unrelated') f.store.saveTopic({ ...f.store.topic('topic')!, session_id: null, mapping_state: 'unbound' });
+      if (state === 'duplicate' || state === 'unknown') {
+        const notice = f.store.reserveNotice(new Set(f.store.inbox().map(item => item.id)))!;
+        f.store.settleNotice(notice.id, state === 'duplicate' ? 'receipt' : null, state === 'duplicate');
+      }
+      if (state === 'running') f.sessions.get('a')!.activity!.processing = true;
+      if (state === 'unloaded') f.sessions.get('a')!.loaded = false;
+      if (state === 'activity-unknown') f.sessions.get('a')!.activity = null;
+      if (state === 'stale-ask') {
+        f.store.take('synthetic-read', 100);
+        f.store.enqueue({ session_id: 'a', native_id: 'old', kind: 'ask', text: 'Old?', attachments: [],
+          question: { requestId: 'old', question: 'Old?' } });
+      }
+      let foregroundReads = 0;
+      f.native.foreground = async () => { foregroundReads++; return f.sessions.get('assistant')!; };
+      await f.assistant.notify();
+      assert.equal(f.calls.length, 0, state);
+      assert.equal(foregroundReads, 0, state);
+    } finally { f.close(); }
+  }
+});
+test('a live source ask can wake the foreground without requiring idle or carrying unfinished progress', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a'); f.sessions.get('assistant')!.loaded = false;
+    const source = f.sessions.get('a')!;
+    source.status = 'running'; source.activity!.processing = true;
+    source.ask = { requestId: 'ask', question: 'Choose', choices: ['A'] };
+    await f.assistant.observe('a', message('progress'));
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load', 'prompt']);
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['pending', 'notified']);
+  } finally { f.close(); }
+});
+test('loaded busy, queued or asking foregrounds are neither reloaded nor interrupted', async () => {
+  for (const state of ['running', 'queued', 'steering', 'asking', 'unknown']) {
+    const f = fixture();
+    try {
+      pending(f);
+      const front = f.sessions.get('assistant')!;
+      if (state === 'running') front.status = 'running';
+      if (state === 'queued') front.activity!.queue.pendingCount = 1;
+      if (state === 'steering') front.activity!.queue.inFlightSteeringCount = 1;
+      if (state === 'asking') front.ask = { requestId: 'front-ask', question: 'Busy?' };
+      if (state === 'unknown') front.activity = null;
+      await f.assistant.notify();
+      assert.equal(f.calls.length, 0, state);
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+    } finally { f.close(); }
+  }
+});
+test('load rejection, lost response, wrong identity and unconfirmed loading retain pending and never replay', async () => {
+  for (const state of ['rejected', 'lost', 'wrong-id', 'not-loaded', 'incomplete', 'interrupted']) {
+    const f = fixture();
+    try {
+      pending(f); f.sessions.get('assistant')!.loaded = false;
+      if (state === 'rejected') f.load({ ok: false, sessionId: 'assistant' }, false);
+      if (state === 'lost') f.fail('session/load');
+      if (state === 'wrong-id') f.load({ ok: true, sessionId: 'another' }, false);
+      if (state === 'incomplete') f.load({ sessionId: 'assistant' }, false);
+      if (state === 'not-loaded') f.load(null, false);
+      if (state === 'interrupted') f.store.saveForegroundWake({ sessionId: 'assistant', state: 'loading', error: null });
+      f.store.recover();
+      await f.assistant.notify();
+      assert.equal(f.store.foregroundWake()!.state, state === 'rejected' ? 'failed' : 'unknown', state);
+      const count = f.calls.length;
+      await f.assistant.notify(); f.store.recover(); await f.assistant.notify();
+      assert.equal(f.calls.length, count, state);
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+      assert.equal(f.calls.some(call => call.name === 'prompt'), false);
+      f.fail(null); f.sessions.get('assistant')!.loaded = true;
+      await f.assistant.notify();
+      assert.equal(f.calls.at(-1)!.name, 'prompt', 'A normal public Host load permits readback recovery, not another load');
+      assert.equal(f.store.foregroundWake()!.state, 'loaded');
+    } finally { f.close(); }
+  }
+});
+test('missing and unreadable foregrounds report errors without replacing the identity or changing notice receipts', async () => {
+  for (const code of ['FOREGROUND_MISSING', 'NATIVE_READ_FAILED']) {
+    const f = fixture();
+    try {
+      pending(f);
+      f.native.foreground = async () => { throw Object.assign(new Error(code), { code }); };
+      await f.assistant.notify();
+      assert.equal(f.calls.length, 0);
+      assert.equal((f.errors[0] as { code: string }).code, code);
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+      assert.equal(f.store.foregroundWake(), null);
+    } finally { f.close(); }
+  }
+});
+test('frontend discovery, load and readiness awaits cannot reserve mail after eligibility, identity or roles change', async () => {
+  for (const phase of ['discovery', 'load', 'readiness', 'identity', 'roles', 'not-ready', 'stop']) {
+    const f = fixture();
+    try {
+      pending(f); f.sessions.get('assistant')!.loaded = false;
+      const invalidate = () => { f.sessions.get('a')!.activity!.processing = true; };
+      if (phase === 'discovery') f.native.foreground = async () => { invalidate(); return f.sessions.get('assistant')!; };
+      if (phase === 'load') f.onCall(async name => { if (name === 'session/load') invalidate(); });
+      f.onReady(async () => {
+        if (phase === 'readiness') invalidate();
+        if (phase === 'identity') f.native.foreground = async () => f.sessions.get('b')!;
+        if (phase === 'roles') f.sessions.get('assistant')!.rolesNeedReload = true;
+        if (phase === 'not-ready') throw new Error('Synthetic resources not ready');
+        if (phase === 'stop') f.assistant.stop();
+      });
+      await f.assistant.notify();
+      assert.deepEqual(f.calls.map(call => call.name), phase === 'discovery' ? [] : ['session/load'], phase);
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending', phase);
+      if (phase === 'identity' || phase === 'roles' || phase === 'not-ready') assert.equal(f.errors.length, 1, phase);
+    } finally { f.close(); }
+  }
+});
+test('an ask invalidated during loading is never reminded or consumed as current', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a'); f.sessions.get('assistant')!.loaded = false;
+    f.sessions.get('a')!.ask = { requestId: 'ask', question: 'Choose' };
+    f.onCall(async name => { if (name === 'session/load') f.sessions.get('a')!.ask = null; });
+    await f.assistant.observe('a');
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load']);
+    assert.equal(f.store.inbox().length, 0);
+  } finally { f.close(); }
+});
+test('consumption during foreground loading neither sends an empty reminder nor restores the body', async () => {
+  const f = fixture();
+  try {
+    pending(f); f.sessions.get('assistant')!.loaded = false;
+    f.onCall(async name => { if (name === 'session/load') f.store.take('read-during-load', 100); });
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load']);
+    assert.equal(f.store.inbox().length, 0);
+    pending(f);
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load']);
+    assert.equal(f.store.inbox().length, 0);
+  } finally { f.close(); }
+});
+test('failed post-load resources do not form an unload and reload loop', async () => {
+  const f = fixture();
+  try {
+    pending(f); f.sessions.get('assistant')!.loaded = false;
+    f.onReady(async () => { throw new Error('Synthetic disconnected role resources'); });
+    await f.assistant.notify();
+    assert.equal(f.store.foregroundWake()!.state, 'failed');
+    assert.match(f.store.foregroundWake()!.error!, /disconnected/);
+    f.sessions.get('assistant')!.loaded = false;
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load']);
+    f.onReady(null); f.sessions.get('assistant')!.loaded = true;
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load', 'prompt']);
+    assert.equal(f.store.foregroundWake()!.state, 'loaded');
+  } finally { f.close(); }
+});
+test('foreground resource invalidation across source awaits cancels stale readiness without reserving a notice', async () => {
+  const f = fixture();
+  try {
+    pending(f); f.sessions.get('assistant')!.loaded = false;
+    let ready = true, samples = 0;
+    f.onReady(async () => { if (!ready) throw new Error('Synthetic toolkit disconnected'); });
+    f.onMeta(async id => {
+      if (id === 'a' && ++samples === 2) {
+        ready = false;
+        await f.assistant.observe('assistant');
+      }
+    });
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load']);
+    assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load']);
+    assert.match(String(f.errors[0]), /disconnected/);
+    ready = true;
+    await f.assistant.notify();
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load', 'prompt']);
+  } finally { f.close(); }
+});
 
 test('registry creates service-owned IDs and native call replay cannot create a duplicate topic', async () => {
   const f = fixture();
@@ -502,6 +721,7 @@ test('a notice in flight cannot restore consumed items or lose another result ar
 test('the original notification promise drains follow-up sends and records their receipts before shutdown', async () => {
   const f = fixture(), firstEntered = deferred(), firstRelease = deferred(), nextEntered = deferred(), nextRelease = deferred();
   try {
+    f.topic('topic', 'a');
     const enqueue = (native_id: string) => f.store.enqueue({
       session_id: 'a', native_id, kind: 'reply', text: native_id, attachments: [], question: null,
     });
@@ -541,6 +761,7 @@ test('stopping during original worker load prevents a subsequent new business pr
 test('stopping during foreground discovery does not reserve or send a fresh notification', async t => {
   const f = fixture(), entered = deferred(), release = deferred();
   try {
+    f.topic('topic', 'a');
     f.store.enqueue({ session_id: 'a', native_id: 'new', kind: 'reply', text: 'New', attachments: [], question: null });
     t.mock.method(f.assistant.native, 'foreground', async () => {
       entered.resolve(); await release.promise; return f.sessions.get('assistant')!;
@@ -629,7 +850,7 @@ test('asks are revalidated before reminders, and unloaded questions wait without
     await f.assistant.observe('a');
     source.loaded = false;
     assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 0 });
-    assert.equal(f.store.inbox().length, 2);
+    assert.equal(f.store.inbox().length, 1, 'Eligibility refresh removes stale asks even while foreground is busy');
     assert.deepEqual(await f.invoke('assistant_inbox', {}, 'unavailable'), { items: [], alreadyRead: false, hasMore: false });
     source.loaded = true;
     f.sessions.get('assistant')!.status = 'idle';
@@ -736,7 +957,7 @@ test('a question invalidated while another source is sampled stays unread and is
       const result = await read as { items: { sessionId: string }[] };
       await invalidation;
       assert.deepEqual(result.items.map(item => item.sessionId), ['b']);
-      assert.deepEqual(f.store.inbox().map(item => item.session_id), ['a']);
+      assert.deepEqual(f.store.inbox().map(item => item.session_id), unloaded ? ['a'] : []);
       assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 0 });
       assert.equal(f.store.inbox().length, unloaded ? 1 : 0);
     } finally { release.resolve(); f.close(); }

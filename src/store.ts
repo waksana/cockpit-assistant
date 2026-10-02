@@ -80,6 +80,11 @@ const inboxRow = z.object({
 });
 export type InboxItem = z.infer<typeof inboxRow>;
 export type Incoming = Pick<InboxItem, 'session_id' | 'native_id' | 'kind' | 'text' | 'attachments' | 'question'>;
+const wakeSchema = z.strictObject({
+  sessionId: z.string().min(1), state: z.enum(['loading', 'loaded', 'failed', 'unknown']),
+  error: z.string().nullable(),
+});
+export type ForegroundWake = z.infer<typeof wakeSchema>;
 export function incomingIdentity(item: Incoming) {
   const question = item.question ? { ...item.question, choices: item.question.choices ?? [],
     allowFreeform: item.question.allowFreeform ?? true } : null;
@@ -143,6 +148,15 @@ export class Store {
   observed(id: string): number | null {
     const row = this.sql.prepare('SELECT created_at FROM seen WHERE id=?').get(id);
     return row ? Number(row.created_at) : null;
+  }
+  foregroundWake(): ForegroundWake | null {
+    const value = this.receipt('foreground-wake')?.fingerprint;
+    return value ? json.pipe(wakeSchema).parse(value) : null;
+  }
+  saveForegroundWake(wake: ForegroundWake): void {
+    this.sql.prepare(`INSERT INTO seen VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET
+      fingerprint=excluded.fingerprint,created_at=excluded.created_at`)
+      .run('foreground-wake', JSON.stringify(wakeSchema.parse(wake)), Date.now());
   }
   deliveries(sessionId: string, messageId: string): Delivery[] {
     return this.sql.prepare('SELECT * FROM deliveries WHERE source_session=? AND source_message=? ORDER BY rowid')
@@ -235,6 +249,9 @@ export class Store {
   }
   recover(): void {
     this.transaction(() => {
+      const wake = this.foregroundWake();
+      if (wake?.state === 'loading') this.saveForegroundWake({ ...wake, state: 'unknown',
+        error: 'Interrupted foreground load; inspect or load the original session through the Host, without automatic replay' });
       this.sql.exec(`UPDATE deliveries SET state='unknown',error='Interrupted native delivery; inspect the original session' WHERE state='calling';
         UPDATE topics SET mapping_state='unknown',mapping_error='Interrupted native creation; do not create a replacement' WHERE mapping_state='calling';
         UPDATE mailbox SET notice_state='unknown' WHERE notice_state='calling'`);

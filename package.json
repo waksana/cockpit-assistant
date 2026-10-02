@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "24.10.1",
-    "@waksana/cockpit-module-sdk": "0.13.0",
+    "@waksana/cockpit-module-sdk": "0.15.0",
     "esbuild": "0.25.12",
     "tsx": "4.21.0",
     "typescript": "5.9.3"

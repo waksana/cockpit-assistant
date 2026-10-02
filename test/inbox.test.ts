@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Store } from '../src/store.ts';
 import { Inbox, checkpointInput, resolveInput } from '../src/inbox.ts';
 
 const caller = { sessionId: 'front', toolCallId: 'tool' };
-function fixture() {
-  const store = new Store(':memory:'), inbox = new Inbox(store, () => false);
+function fixture(path = ':memory:') {
+  const store = new Store(path), inbox = new Inbox(store, () => false);
   const pointer = (id: string, sessionId = 'source', kind: 'ask' | 'reply' = 'reply') => {
     store.enqueuePointer(sessionId, id, kind, kind === 'reply' ? { eventId: `event-${id}`, timestamp: 1 } : undefined);
     return store.inbox().find(item => item.native_id === id)!;
@@ -180,6 +183,105 @@ test('Host since tokens cannot become forward cursors or change across a continu
       nextQuery: { source: 'persisted', direction: 'backward', since: 'different-token', cursor: 'cursor' } },
   ]) assert.throws(() => f.report(receipt.id, [a.id], { position: { ...position, boundaryEventId: 'event-a' } }),
     { code: 'CHECKPOINT_QUERY' });
+});
+
+test('reopening the Assistant database preserves partial positions, CAS and pending handling', t => {
+  const root = mkdtempSync(join(tmpdir(), 'assistant-position-reopen-'));
+  const path = join(root, 'assistant.sqlite');
+  let f = fixture(path);
+  t.after(() => { f.close(); rmSync(root, { recursive: true }); });
+  const a = f.pointer('a'), baseline = f.read();
+  const saved = f.report(baseline.id, [a.id], { position: {
+    query: { source: 'persisted', direction: 'backward' }, nextQuery: null,
+    boundaryEventId: 'event-a', hostCheckpoint: 'opaque-caller-owned-baseline',
+  } });
+  f.resolve(baseline.id);
+  const b = f.pointer('b'), receipt = f.read();
+  const position = {
+    query: { source: 'persisted', direction: 'backward', since: saved.checkpoint!.position.hostCheckpoint,
+      limit: 4, max_bytes: 8192, scan_pages: 2 },
+    nextQuery: { source: 'persisted', direction: 'backward', since: saved.checkpoint!.position.hostCheckpoint,
+      cursor: 'opaque-partial-continuation', limit: 4, max_bytes: 8192, scan_pages: 2 },
+    boundaryEventId: null, coverage: 'since-checkpoint',
+  };
+  f.report(receipt.id, [], { complete: false, position });
+  f.close(); f = fixture(path);
+  f.store.recover();
+  const recovered = f.inbox.pending(caller.sessionId, 0).items[0]!;
+  assert.equal(recovered.id, receipt.id);
+  assert.deepEqual(recovered.progress[0]!.position, position);
+  assert.deepEqual(recovered.sources[0]!.checkpoint, saved.checkpoint);
+  assert.equal(recovered.disposition, 'unresolved');
+  assert.throws(() => f.resolve(receipt.id), { code: 'READ_INCOMPLETE' });
+  f.pointer('c');
+  const stale = f.read();
+  const completed = f.report(receipt.id, [b.id], {
+    expectedCheckpointVersion: saved.checkpoint!.version,
+    position: { query: position.nextQuery, nextQuery: null, hostCheckpoint: 'opaque-next-boundary',
+      boundaryEventId: 'event-b', coverage: 'since-checkpoint' },
+  });
+  f.close(); f = fixture(path);
+  assert.equal(f.read().id, stale.id);
+  assert.equal(f.inbox.pending(caller.sessionId, 0).items.find(item => item.id === receipt.id)!.progress[0]!.complete, true);
+  assert.equal(f.report(stale.id, stale.inboxIds, { position: {
+    query: position.query, nextQuery: null, boundaryEventId: 'event-c', hostCheckpoint: 'older-report',
+  } }).checkpointState, 'stale-base');
+  f.resolve(receipt.id);
+  assert.deepEqual(f.store.inbox().map(item => item.native_id), ['c']);
+  assert.equal(f.read().sources[0]!.checkpoint!.version, completed.checkpoint!.version);
+  assert.ok(f.store.inbox().every(item => item.text === '' && item.question === null && !item.attachments.length));
+});
+
+test('an explicit legacy-position gap survives database reopen without discarding pending pointers', t => {
+  const root = mkdtempSync(join(tmpdir(), 'assistant-position-gap-'));
+  const path = join(root, 'assistant.sqlite');
+  let f = fixture(path);
+  t.after(() => { f.close(); rmSync(root, { recursive: true }); });
+  const a = f.pointer('a'), receipt = f.read();
+  const position = { query: { source: 'persisted', direction: 'backward', cursor: 'legacy-opaque-token' },
+    nextQuery: null, boundaryEventId: null };
+  f.report(receipt.id, [], { complete: false, position, gap: 'Host rejected incompatible legacy position' });
+  f.close(); f = fixture(path);
+  f.store.recover();
+  const recovered = f.inbox.pending(caller.sessionId, 0).items[0]!;
+  assert.equal(recovered.progress[0]!.position!.query.cursor, 'legacy-opaque-token');
+  assert.equal(recovered.progress[0]!.gap, 'Host rejected incompatible legacy position');
+  assert.equal(f.store.inbox()[0]!.id, a.id);
+  assert.throws(() => f.resolve(receipt.id), { code: 'READ_INCOMPLETE' });
+  assert.throws(() => f.report(receipt.id, [a.id]), { code: 'READ_GAP' });
+  assert.equal(f.store.inbox().length, 1);
+});
+
+test('explicit partial-cursor recovery retains the original since interval instead of a recent baseline', t => {
+  const f = fixture(); t.after(f.close);
+  const a = f.pointer('a'), baseline = f.read();
+  const saved = f.report(baseline.id, [a.id], { position: {
+    query: { source: 'persisted', direction: 'backward' }, nextQuery: null,
+    boundaryEventId: 'event-a', hostCheckpoint: 'original-since',
+  } });
+  f.resolve(baseline.id);
+  const b = f.pointer('b'), receipt = f.read();
+  const query = { source: 'persisted', direction: 'backward', since: saved.checkpoint!.position.hostCheckpoint };
+  f.report(receipt.id, [], { complete: false, gap: 'Native partial page changed', position: {
+    query: { ...query, cursor: 'changed-page' }, nextQuery: null,
+    boundaryEventId: null, coverage: 'since-checkpoint',
+  } });
+  const resumed = f.report(receipt.id, [], { complete: false, reset: true, position: {
+    query, nextQuery: { ...query, cursor: 'new-actual-host-continuation' },
+    boundaryEventId: null, coverage: 'since-checkpoint',
+  } });
+  assert.equal(resumed.checkpointState, 'not-advanced');
+  assert.equal(resumed.checkpoint!.version, saved.checkpoint!.version);
+  assert.equal(resumed.receipt.progress[0]!.position!.query.since, 'original-since');
+  assert.equal(resumed.receipt.progress[0]!.position!.query.cursor, undefined);
+  assert.throws(() => f.resolve(receipt.id), { code: 'READ_INCOMPLETE' });
+  f.pointer('later');
+  f.report(receipt.id, [b.id], { position: {
+    query, nextQuery: null, boundaryEventId: 'event-b', hostCheckpoint: 'fully-read-next',
+    coverage: 'since-checkpoint',
+  } });
+  f.resolve(receipt.id);
+  assert.deepEqual(f.store.inbox().map(item => item.native_id), ['later']);
 });
 
 test('ask checkpoints do not turn request IDs into native Chat cursors', t => {

@@ -151,9 +151,31 @@ range; do not scan all history or silently skip unfinished pages.
 
 Record cursor expiry, rewind, deletion or a missing boundary in `gap`, with
 `complete:false`. A later explicit `reset:true` starts rebuilt positioning.
-Host process restart invalidates text tokens: explicitly establish a new recent
-baseline and disclose the gap. Source unload/native child restart does not
-invalidate persisted tokens while the Host signer remains alive.
+On interruption or Host restart, recover the exact stored query/continuation or
+completed Host checkpoint and submit it unchanged. Restart by itself does not
+authorize `gap`, `reset` or replacing unread history with a recent window.
+The Host's version-2 caller-owned position format removes the process-local
+signing dependency. The Host validates position compatibility and native history;
+Assistant neither decodes tokens nor reconstructs native locations. These are
+positions, not authorization credentials, and Host identity/scope still apply.
+
+If a native partial continuation expires or its page changes, explicitly retry
+the incremental interval with the **same saved `since`**, without `cursor`.
+Deduplicate already read fragments by `eventId` and offset. Preserve bounded
+Host calls and all unread pointers until the interval is complete, then advance
+the checkpoint by CAS. If a `gap` was recorded locally, `reset:true` explicitly
+replaces that failed attempt with the same interval; it does not require or
+authorize a new recent-only baseline. Missing or changed anchors and incompatible
+positions remain actual gaps, not successful empty updates.
+
+Legacy Host Rolling 36 positions were signed with a process-local key. The
+corrected Host can accept the strictly parsed legacy payload as a caller-owned
+location assertion and revalidate its native anchor/page, then return its new
+format. This does not verify a lost legacy signature or guarantee recovery of
+changed/deleted history. Submit the original token unchanged; do not decode,
+rewrite or resign it in Assistant. Failed migration retains unresolved pointers.
+Any explicitly chosen replacement baseline must disclose incomplete old coverage;
+it cannot silently acknowledge all outstanding pointers.
 Completed reports advance the per-caller/source checkpoint only if their original
 base revision is still current. The default expected version is captured when the
 inbox receipt is returned. To advance it again, pass the actual returned

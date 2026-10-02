@@ -58,7 +58,7 @@ Packaging creates
 the target database in memory and checks its four active tables:
 `topics`, `deliveries`, `mailbox` and `seen`.
 
-The session-directory/evidence change retains these exact schema-5 definitions
+The session-directory/pointer-inbox change retains these exact schema-5 definitions
 and every existing topic, mapping and history. Its additional values in `seen`
 are namespaced, bodyless source/inbox-range/agent-handling receipts, not a new schema
 or business-status snapshot. New reply rows hold source pointers; old unread
@@ -120,6 +120,44 @@ Local script tests (synthetic fixtures only, not deployable packages):
 ```sh
 node --import tsx --test test/release*.test.ts
 ```
+
+### Native Host consumer probes
+
+The pointer-inbox integration was exercised against the sealed
+[Host Rolling 36](https://github.com/waksana/cockpit/releases/tag/v0.0.0-rolling.36)
+runtime, source `5d9191a9aa5f5e7fded65154982e99773066bc09`.
+Its `runtime.tar.gz` is 55,944,190 bytes, SHA256
+`ebd157eb65b42c913323be6345b7469b06c9b5d515e3dcb9abca4eb6fb0a7fd1`.
+Select and verify the published artifact before extracting it; these scripts
+take an extracted runtime directory, never a production service URL:
+
+```sh
+npm run build
+for probe in evidence response session; do
+  taskset -c 0,1 prlimit --as=17179869184 -- node \
+    --max-old-space-size=2048 --disable-wasm-trap-handler \
+    "scripts/native-$probe-check.mjs" /absolute/path/to/verified-host-runtime
+done
+```
+
+The controlled provider chooses synthetic actions; the actual native runtime,
+ordinary role, immutable tool scope, external `cockpit` stdio MCP, tool calls,
+Chat events and ask callbacks are real. Probes create isolated homes, configuration,
+module data and loopback endpoints, clean successful fixtures and retain failed
+ones for diagnosis. They do not use production sessions or connector bindings.
+The evidence probe preserves genuine Host `since`/checkpoint tokens through
+partial read reports and recovery before exact-ID handling, including concurrent
+arrivals, bounded Unicode fragments and passive unloaded reads. Response and
+session modes cover current asks, queued/steered prompts and original-ID wakes.
+Cold lifecycle `SESSION_TRANSITION` diagnostics are reported explicitly, not
+treated as successful delivery; unrelated errors fail the run.
+
+These are consumer integration probes, not a proof of model judgment or human
+delivery. The Host owns pagination and token-expiry behavior; see its
+[text contract](https://github.com/waksana/cockpit/blob/v0.0.0-rolling.36/docs/native-chat.md#bounded-text-view).
+Production foreground creation/selection and deployment remain separate actions.
+
+### Packaging and publication
 
 The Actions packaging command, after CI and build in a clean committed checkout:
 

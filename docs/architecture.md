@@ -3,7 +3,7 @@
 ```text
 User <-> native Assistant Chat -> Host MCP -> session create/load/prompt/ask
                   |                  +-----> native lightweight Chat/status
-                  +-> Assistant MCP -> directory / inbox / handling
+                  +-> Assistant MCP -> directory / inbox / checkpoint / handling
                   ^                         |
                   +-- enqueue update pointer+ <- registered source idle / ask
 ```

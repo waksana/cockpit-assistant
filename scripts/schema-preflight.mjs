@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers/promises';
@@ -68,6 +68,17 @@ export async function verifySchemaBoundary(activate, directory, migrationEntry) 
       assert.deepEqual(retainedRows(checked, version), before);
       verifyUnread(assert, checked, version);
     } finally { checked.close(); }
+    await assert.rejects(lstat(join(dataRoot, 'recent.sqlite')), { code: 'ENOENT' });
+    const stopping = new AbortController(), upgraded = await activate(context(dataRoot, stopping.signal));
+    await upgraded.onStop(); stopping.abort(); await upgraded.dispose?.(); await setImmediate();
+    const created = new DatabaseSync(join(dataRoot, 'recent.sqlite'), { readOnly: true });
+    try { assert.equal(created.prepare('PRAGMA user_version').get().user_version, 1); }
+    finally { created.close(); }
+    const preserved = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.deepEqual(retainedRows(preserved, version), before);
+      verifyUnread(assert, preserved, version);
+    } finally { preserved.close(); }
   }
   for (const version of [1, 2, 3, 4]) {
     const dataRoot = join(directory, `incompatible-${version}`), path = join(dataRoot, 'assistant.sqlite');

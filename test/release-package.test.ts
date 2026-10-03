@@ -36,7 +36,8 @@ test('actual Rolling packager emits a native-only package without changing track
     assert.deepEqual(readdirSync(output).sort(), assetNames(expected).sort());
     verifyAssets(output, expected, descriptor.product);
     assert.equal(descriptor.product.databases[0].schema, 5);
-    assert.deepEqual(descriptor.product.databases[1], { path: 'recent.sqlite', schema: 1, preserve: [] });
+    assert.deepEqual(descriptor.product.databases[1],
+      { path: 'recent.sqlite', schema: 1, preserve: [], initialization: 'rebuildable-cache' });
     const archive = join(output, expected.archive.name);
     const entries = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8' }).trim().split('\n');
     assert.ok(entries.includes(`./${manifest.backend}`));

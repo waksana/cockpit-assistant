@@ -24,8 +24,16 @@ export const assetNames = expected => [expected.archive.name, `${expected.archiv
 export function assertMigrationTargets(product) {
   const databases = new Map(product.databases.map(database => [database.path, database.schema]));
   assert.equal(databases.size, product.databases.length, 'Database paths must be unique');
+  const caches = new Set();
+  for (const database of product.databases) {
+    if (database.initialization === undefined) continue;
+    assert.equal(database.initialization, 'rebuildable-cache', 'Unknown database initialization policy');
+    assert.deepEqual(database.preserve, [], 'A rebuildable cache cannot declare preserved business records');
+    caches.add(database.path);
+  }
   const migrated = new Set();
   for (const migration of product.migrations) {
+    assert.ok(!caches.has(migration.database), 'A rebuildable cache cannot declare a database migration');
     assert.ok(!migrated.has(migration.database), 'Only one automatic migration per database is supported');
     assert.equal(databases.get(migration.database), migration.to, 'Migration must target the declared final schema');
     assert.ok(migration.to > migration.from, 'Migration must move forward');
@@ -78,7 +86,7 @@ export async function product(root) {
       requiredIntents: [...new Set([...agentRequiredIntents, ...hostSources.flatMap(source =>
         [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1]))])].sort(),
       databases: [{ path: 'assistant.sqlite', schema, preserve: preservedTopics() },
-        { path: 'recent.sqlite', schema: 1, preserve: [] }],
+        { path: 'recent.sqlite', schema: 1, preserve: [], initialization: 'rebuildable-cache' }],
       migrations: schema5Migrations,
     };
     assertMigrationTargets(result);

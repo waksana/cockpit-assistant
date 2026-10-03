@@ -150,7 +150,17 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   }), /declared final schema/);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
   assert.equal(actual.databases[0].schema, 5);
-  assert.deepEqual(actual.databases[1], { path: 'recent.sqlite', schema: 1, preserve: [] });
+  assert.deepEqual(actual.databases[1], { path: 'recent.sqlite', schema: 1, preserve: [], initialization: 'rebuildable-cache' });
+  assert.equal(actual.databases[0].initialization, undefined, 'The business database still requires an existing source');
+  assert.throws(() => assertMigrationTargets({
+    ...actual, databases: [{ ...actual.databases[0], initialization: 'rebuildable-cache' }],
+  }), /preserved business records/);
+  assert.throws(() => assertMigrationTargets({
+    ...actual, migrations: [...actual.migrations, { database: 'recent.sqlite', from: 0, to: 1 }],
+  }), /cache cannot declare a database migration/);
+  assert.throws(() => assertMigrationTargets({
+    ...actual, databases: [{ ...actual.databases[1], initialization: 'optional' }],
+  }), /Unknown database initialization policy/);
   assert.deepEqual(actual.databases[0].preserve, preservedTopics());
   assert.deepEqual(actual.databases[0].preserve.map((entry: { table: string }) => entry.table),
     ['topics']);

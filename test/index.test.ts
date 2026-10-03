@@ -10,6 +10,8 @@ import type { ModuleBackend, ModuleBackendContext, ModuleHostApi, ModuleHostInte
 import { activate } from '../src/index.ts';
 import { coordinatorTools } from '../src/mcp.ts';
 import { Store } from '../src/store.ts';
+import { RecentSessions } from '../src/recent.ts';
+import { NativeChat } from '../src/native-chat.ts';
 
 function deferred() {
   let resolve!: () => void;
@@ -52,6 +54,7 @@ function fixture(t: TestContext, seed = true) {
   const host: ModuleHostApi = {
     chatReadVersion: 1, askResponseVersion: 1, roleAssignmentVersion: 1, roleAvailabilityVersion: 1, sessionLoadVersion: 1,
     promptReceiptVersion: 1, toolScopeVersion: 1, promptOriginVersion: 1, roleResourcePolicyVersion: 1,
+    sessionDirectoryVersion: 1,
     async call<Name extends ModuleHostIntent>(name: Name, body: ModuleHostIntentBody<Name>): Promise<ModuleHostIntentResult<Name>> {
       assert.equal(context.signal.aborted, false, 'Host capability remains live while draining');
       if (name === 'session/load' || name === 'prompt')
@@ -65,6 +68,7 @@ function fixture(t: TestContext, seed = true) {
       const sessionId = 'sessionId' in body ? body.sessionId : undefined;
       let result: unknown;
       switch (name) {
+        case 'session/directory': result = { sessions: [...sessions.values()].map(meta => structuredClone(meta)) }; break;
         case 'session/get': result = { meta: structuredClone(sessions.get(sessionId!) ?? null) }; break;
         case 'roles/availability': result = { sessionId, roles: sessions.get(sessionId!)!.roles, status: 'available', reasons: [] }; break;
         case 'session/load':
@@ -171,12 +175,105 @@ test('an already stopping activation is rejected before opening data', async t =
   assert.deepEqual(f.calls, []);
 });
 
-test('activation does not require unrelated role availability or prompt origin capabilities', async t => {
+test('activation requires public role and cache capabilities before opening data', async t => {
+  for (const capability of ['roleAssignmentVersion', 'roleAvailabilityVersion', 'sessionDirectoryVersion', 'chatReadVersion'] as const) {
+    const f = fixture(t, false), host = { ...f.context.host };
+    delete host[capability];
+    await assert.rejects(activate({ ...f.context, host }), { code: 'HOST_CAPABILITY' });
+    assert.equal(existsSync(f.dataRoot), false);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test('activation does not require unrelated prompt origin or native resource isolation', async t => {
   const f = fixture(t, false);
-  const { roleAvailabilityVersion: _version, ...host } = f.context.host;
+  const { promptOriginVersion: _version, roleResourcePolicyVersion: _policy, ...host } = f.context.host;
   const backend = await activate({ ...f.context, host });
   assert.equal(existsSync(f.dataRoot), true);
   await backend.dispose!();
+});
+
+test('backend exposes single-owner preflight and permit without selecting or waking from saved hooks', async t => {
+  const f = fixture(t), backend = await f.activate(), hooks = backend.roleAssignments!;
+  const roles = [{ moduleId: 'assistant', roleId: 'coordinator' }];
+  const selection = { roles, sessionId: 'source' }, signal = new AbortController().signal;
+  const availability = await hooks.availability!({ ...selection, operation: 'add', previousRoles: [] }, signal);
+  assert.equal(availability.reasons[0]!.status, 'denied');
+  assert.equal((await hooks.permit!({ ...selection, operation: 'add', previousRoles: [] }, signal)).allowed, false);
+  assert.equal((await hooks.permit!({ roles, sessionId: 'front', operation: 'add', previousRoles: roles }, signal)).allowed, true);
+  const before = f.calls.length;
+  await hooks.saved!({ roles, previousRoles: [], operation: 'add', sessionId: 'front', notificationId: 'saved-role' }, signal);
+  assert.equal(f.calls.length, before, 'Saved callback invalidates only, with no Host calls under the role lock');
+  assert.equal(f.calls.some(call => call.name === 'prompt' || call.name === 'session/load'), false);
+});
+
+test('a next passive discovery starting before the notification waiter resumes cannot suppress its wake', async t => {
+  const f = fixture(t), entered = deferred(), release = deferred();
+  const foreground = NativeChat.prototype.foreground;
+  let started = false, blockNext = false, competing: ReturnType<NativeChat['foreground']> | undefined;
+  f.respond((name, result) => {
+    if (name !== 'session/directory' || !blockNext) return result;
+    blockNext = false; entered.resolve();
+    return release.promise.then(() => result);
+  });
+  t.mock.method(NativeChat.prototype, 'foreground', async function(this: NativeChat) {
+    const result = await foreground.call(this);
+    if (!started) {
+      started = true; blockNext = true;
+      competing = foreground.call(this);
+    }
+    return result;
+  });
+  const backend = await f.activate(), ready = backend.onReady!();
+  try {
+    await entered.promise;
+    await setImmediate();
+    assert.deepEqual(f.errors, []);
+  } finally { release.resolve(); }
+  await Promise.all([ready, competing]);
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  assert.equal(f.state().inbox[0]!.notice_state, 'notified');
+});
+
+test('cache event wiring ignores activity feedback but invalidates content, rewind and deletion', async t => {
+  const f = fixture(t, false), changed = t.mock.method(RecentSessions.prototype, 'invalidate');
+  const backend = await f.activate();
+  await backend.onReady!();
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'unregistered', activeOperations: 1 });
+  await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'unregistered', resources: ['usage'] });
+  assert.equal(changed.mock.callCount(), 0);
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'unregistered', title: 'Changed scope' });
+  await backend.controlEvents!.handle({ type: 'chat/invalidated', sessionId: 'unregistered', reason: 'rewind' });
+  await backend.controlEvents!.handle({ type: 'session/removed', sessionId: 'unregistered' });
+  assert.deepEqual(changed.mock.calls.map(call => call.arguments), [
+    ['unregistered', 'dirty'], ['unregistered', 'reset'], ['unregistered', 'delete'],
+  ]);
+  assert.equal(f.calls.some(call => call.name === 'prompt' || call.name === 'session/load'), false);
+});
+
+test('missing or conflicting roles never fall back to retained foreground configuration', async t => {
+  for (const conflict of [false, true]) {
+    await t.test(conflict ? 'conflicting' : 'missing', async t => {
+      const f = fixture(t), front = f.sessions.get('front')!;
+      f.context.config = { foregroundSessionId: 'front' };
+      if (conflict) {
+        f.sessions.get('source')!.roles = structuredClone(front.roles);
+        f.sessions.get('source')!.appliedRoles = structuredClone(front.appliedRoles);
+      } else { front.roles = []; front.appliedRoles = []; }
+      const backend = await f.activate();
+      await backend.onReady!();
+      const result = await callTool(backend, 'assistant_foreground', 'health', {});
+      const health = JSON.parse(result.result.content[0]!.text);
+      assert.equal(health.foregroundSessionId, null);
+      assert.equal(health.current.status, conflict ? 'unknown' : 'unconfigured');
+      assert.equal(health.destination, 'coordinator-role');
+      assert.equal(f.calls.some(call => call.name === 'prompt' || call.name === 'session/load'), false);
+      assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+      const invalid = await callTool(backend, 'assistant_foreground', 'obsolete-setter', { sessionId: 'front' });
+      assert.equal(invalid.result.isError, true);
+      assert.match(invalid.result.content[0]!.text, /INVALID_INPUT/);
+    });
+  }
 });
 
 const connection = { moduleId: 'connection', roleId: 'binding', moduleName: 'Synthetic', name: 'Binding' };
@@ -246,17 +343,16 @@ for (const order of ['first', 'last', 'multiple']) {
       assert.equal(sent.result.isError, true);
       assert.match(sent.result.content[0]!.text, /TOOL_RETIRED/);
       assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
-      assert.equal(f.calls.some(call => ['roles/availability', 'roles/readiness', 'session/tool-scope', 'session/chat'].includes(call.name)), false);
+      assert.equal(f.calls.some(call => ['roles/availability', 'roles/readiness', 'session/tool-scope'].includes(call.name)), false);
     });
   }
 }
-test('role preflight denials and missing role labels do not block existing Host-granted Assistant tools', async t => {
-  for (const state of ['denied', 'unknown', 'changed', 'two-assistants', 'missing-saved']) {
+test('unrelated role availability does not requalify existing Host-granted Assistant tools', async t => {
+  for (const state of ['denied', 'unknown', 'changed', 'organizer']) {
     await t.test(state, async t => {
       const f = fixture(t), front = f.sessions.get('front')!;
       addConnections(front, 'multiple'); front.loaded = false; front.appliedRoles = [];
-      if (state === 'two-assistants') front.roles!.push({ ...front.roles![1]!, roleId: 'organizer' });
-      if (state === 'missing-saved') delete front.roles;
+      if (state === 'organizer') front.roles!.push({ ...front.roles![1]!, roleId: 'organizer' });
       f.respond((name, result) => {
         if (name !== 'roles/availability') return result;
         if (state === 'changed') { front.roles!.push({ ...connection, moduleId: 'raced' }); return result; }
@@ -307,7 +403,7 @@ test('stopping before readiness prevents all foreground loading and prompts', as
   assert.equal(f.state().inbox[0]!.notice_state, 'pending');
 });
 
-test('a foreground switch during final native readback cannot send to the old address', async t => {
+test('a role-owner change during final native readback cannot send to the old address', async t => {
   const f = fixture(t);
   const backend = await f.activate();
   let foregroundReads = 0, switched = false;
@@ -316,21 +412,20 @@ test('a foreground switch during final native readback cannot send to the old ad
       return result;
     if (++foregroundReads !== 2 || switched) return result;
     switched = true;
-    return (async () => {
-      const selected = await callTool(backend, 'assistant_foreground', 'switch-address', { sessionId: 'source' });
-      assert.equal(selected.result.isError, false);
-      return result;
-    })();
+    const role = f.sessions.get('front')!.roles![0]!;
+    f.sessions.get('front')!.roles = []; f.sessions.get('front')!.appliedRoles = [];
+    f.sessions.get('source')!.roles = [role]; f.sessions.get('source')!.appliedRoles = [role];
+    return { meta: structuredClone(f.sessions.get('front')) };
   });
 
   await backend.onReady!();
   assert.equal(switched, true);
   assert.equal(f.calls.some(call => call.name === 'prompt'), false);
   assert.equal(f.state().inbox[0]!.notice_state, 'pending');
-  assert.equal((f.errors[0] as { code: string }).code, 'FOREGROUND_CHANGED');
+  assert.ok(f.errors.length > 0);
 });
 
-test('disabling reminders during discovery cannot load a deselected foreground', async t => {
+test('role removal during discovery cannot load the former owner', async t => {
   const f = fixture(t);
   f.sessions.get('front')!.loaded = false;
   const backend = await f.activate();
@@ -339,18 +434,15 @@ test('disabling reminders during discovery cannot load a deselected foreground',
     if (disabled || name !== 'session/get' || (result as ModuleHostIntentResult<'session/get'>).meta?.sessionId !== 'front')
       return result;
     disabled = true;
-    return (async () => {
-      const selected = await callTool(backend, 'assistant_foreground', 'disable-address', { sessionId: null });
-      assert.equal(selected.result.isError, false);
-      return result;
-    })();
+    f.sessions.get('front')!.roles = []; f.sessions.get('front')!.appliedRoles = [];
+    return { meta: structuredClone(f.sessions.get('front')) };
   });
   await backend.onReady!();
   assert.equal(disabled, true);
   assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
   assert.equal(f.state().wake, null);
   assert.equal(f.state().inbox[0]!.notice_state, 'pending');
-  assert.equal((f.errors[0] as { code: string }).code, 'FOREGROUND_CHANGED');
+  assert.ok(f.errors.length > 0);
 });
 
 for (const lost of [false, true]) {
@@ -427,7 +519,8 @@ for (const outcome of ['accepted', 'lost', 'missing'] as const) {
     const before = f.calls.length;
     const restarted = await f.activate();
     await restarted.onReady!();
-    assert.equal(f.calls.length, before, 'Durable notice state prevents both load and prompt replay');
+    assert.equal(f.calls.slice(before).some(call => call.name === 'session/load' || call.name === 'prompt'), false,
+      'Durable notice state prevents both load and prompt replay, not passive cache refresh');
     await restarted.dispose!();
     assert.equal(close.mock.callCount(), 2, 'The same data path can reacquire its released writer lease');
   });

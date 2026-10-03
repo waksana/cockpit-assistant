@@ -8,13 +8,14 @@
     {
       "id": "coordinator",
       "name": "Assistant",
+      "description": "The single Assistant conversation: context, topic routing and natural presentation. Concrete reasoning belongs to responsible sessions.",
       "instructions": "dist/roles/coordinator.md",
       "skillDirectories": ["skills"],
       "mcpServers": {
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_topic", "assistant_foreground", "assistant_inbox", "assistant_checkpoint", "assistant_resolve"]
+          "tools": ["assistant_topics", "assistant_topic", "assistant_search", "assistant_foreground", "assistant_inbox", "assistant_checkpoint", "assistant_resolve"]
         }
       }
     },

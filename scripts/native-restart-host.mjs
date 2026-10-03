@@ -98,12 +98,17 @@ process.once('message', configuration => { initialization = (async () => {
     moduleHost = new ModuleHost({ hostRoot: dirs.cockpit, observer: engine, origin,
       host: { call: async (name, body) => {
         send({ type: 'module-intent', name, body });
-        assert.ok(!['session/chat', 'session/chat/text', 'session/new', 'respondAsk'].includes(name),
-          'Assistant must not read Chat, create business sessions or proxy answers');
+        assert.ok(!['session/chat/text', 'session/new', 'respondAsk'].includes(name),
+          'Assistant must not proxy full text reads, create business sessions or proxy answers');
+        if (name === 'session/chat') {
+          assert.equal(body.source, 'persisted');
+          assert.equal(body.direction, 'backward');
+          assert.ok(body.max > 0 && body.max <= 16, 'Recent-cache reads are bounded passive native pages');
+        }
         return transport.callModuleIntent(name, body);
       } },
-      report: (_id, error) => send({ type: error.code === 'SESSION_TRANSITION' ? 'diagnostic' : 'failure',
-        error: error.stack ?? String(error) }),
+      report: (_id, error) => send({ type: ['SESSION_TRANSITION', 'FOREGROUND_CHANGED'].includes(error.code) ? 'diagnostic' : 'failure',
+        error: error.stack ?? error.error ?? String(error) }),
     });
     transport.setTestDependencies({ engine, moduleHost });
     await moduleHost.register(app);

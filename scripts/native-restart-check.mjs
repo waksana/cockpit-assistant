@@ -6,10 +6,11 @@ import { chmod, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:f
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ownedProcesses, survivingProcesses, terminateProcesses } from './native-restart-processes.mjs';
+import { assertPassiveModuleRead, isRecordedReminder } from './native-evidence-check.mjs';
 
 const hostTools = ['cockpit_new_session', 'cockpit_get_session', 'cockpit_reload_session',
   'cockpit_send_prompt', 'cockpit_respond_ask', 'cockpit_read_session_text'];
-const assistantTools = ['assistant_topics', 'assistant_topic', 'assistant_foreground',
+const assistantTools = ['assistant_topics', 'assistant_topic', 'assistant_search', 'assistant_foreground',
   'assistant_inbox', 'assistant_checkpoint', 'assistant_resolve'];
 const scope = { builtins: [], mcpServers: [
   { name: 'assistant', tools: assistantTools }, { name: 'cockpit', tools: hostTools },
@@ -128,9 +129,10 @@ export async function runNativeRestartCheck(options = {}) {
     });
   };
   const front = async (name, steps) => {
-    const current = { name, steps, index: 0, finished: false };
+    await idle(foregroundId);
+    const current = { name, steps, index: 0, finished: false, trigger: `RESTART_FRONT:${name}` };
     plan = current;
-    await api('prompt', { sessionId: foregroundId, text: `RESTART_FRONT:${name}`, mode: 'immediate' });
+    await api('prompt', { sessionId: foregroundId, text: current.trigger, mode: 'immediate' });
     await wait(`foreground ${name}`, () => current.finished, 120000);
     await idle(foregroundId);
   };
@@ -173,7 +175,16 @@ export async function runNativeRestartCheck(options = {}) {
       }
       else if (message.type === 'failure') failures.push(new Error(message.error));
       else if (message.type === 'native-event') evidence.events.push(message.row);
-      else if (message.type === 'module-intent') evidence.moduleIntents.push(message);
+      else if (message.type === 'module-intent') {
+        evidence.moduleIntents.push(message);
+        try {
+          assertPassiveModuleRead(message.name, message.body);
+          if (['prompt', 'session/load'].includes(message.name))
+            assert.equal(message.body.sessionId, foregroundId,
+              'Only reminder delivery may wake or load the saved coordinator, never the cached source');
+          if (message.name === 'prompt') assert.equal(message.body.mode, 'enqueue');
+        } catch (error) { failures.push(error); }
+      }
       else if (message.type === 'diagnostic') evidence.diagnostics.push(message.error);
       else if (message.type === 'stopped') record.stopped = true;
     });
@@ -237,7 +248,12 @@ export async function runNativeRestartCheck(options = {}) {
     assert.notEqual(evidence.hosts.at(-1).pid, evidence.hosts.at(-2).pid);
     assert.equal(sessionMeta(await api('session/get', { sessionId: sourceId }), sourceId).loaded, false);
     await api('session/reload', { sessionId: foregroundId });
+    await idle(foregroundId);
     await api('session/tools-initialize', { sessionId: foregroundId });
+    const coordinator = sessionMeta(await api('session/get', { sessionId: foregroundId }), foregroundId);
+    for (const field of ['roles', 'appliedRoles'])
+      assert.ok(coordinator[field]?.some(role => role.moduleId === 'assistant' && role.roleId === 'coordinator'),
+        'Complete Host restart preserves the saved and applied coordinator owner');
     assert.deepEqual((await api('session/tool-scope', { sessionId: foregroundId })).configured, scope);
     const connections = await api('mcp/session', { sessionId: foregroundId });
     for (const name of ['cockpit', 'assistant'])
@@ -358,15 +374,29 @@ export async function runNativeRestartCheck(options = {}) {
         for await (const chunk of request) chunks.push(chunk);
         const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         assert.ok(++requestCount <= 250, 'Bound native provider work');
+        const requestNumber = requestCount;
         const lastUser = JSON.stringify(input.messages.filter(message => message.role === 'user').at(-1));
         const source = /RESTART_SOURCE:([a-z0-9-]+)/.exec(lastUser)?.[1];
         const names = offeredToolNames(input, source ? [] : [...hostTools, ...assistantTools]);
         let raw, args, content = '';
-        if (source) {
+        if (input.tool_choice === 'none') {
+          content = 'Synthetic context summary; verification state remains in the fixture controller and native history.';
+        } else if (source) {
           assert.ok(replies.has(source), `Unexpected synthetic source ${source}`);
           content = replies.get(source);
+        } else if (isRecordedReminder(lastUser, evidence.moduleIntents, foregroundId)
+          && (!plan || plan.finished || !plan.started
+            && !lastUser.includes(JSON.stringify(plan.trigger).slice(1, -1)))) {
+          // Leave unread receipts and partial positions untouched. This neutral
+          // completion is not a business-success or notification-delivery claim.
+          content = 'Synthetic reminder received; no handling report made.';
         } else {
           assert.ok(plan && !plan.finished, `Unexpected foreground wake ${lastUser}`);
+          if (!plan.started) {
+            assert.ok(lastUser.includes(JSON.stringify(plan.trigger).slice(1, -1)),
+              'A delayed automatic reminder cannot execute the next explicit restart plan');
+            plan.started = true;
+          }
           if (plan.index) {
             const previous = plan.steps[plan.index - 1], result = toolResult(input, previous.toolCallId);
             evidence.calls.push({ plan: plan.name, raw: previous.raw, args: previous.actualArgs, ...result });
@@ -378,7 +408,7 @@ export async function runNativeRestartCheck(options = {}) {
             raw = next.raw;
             args = typeof next.args === 'function' ? await next.args() : next.args;
             next.actualArgs = structuredClone(args);
-            next.toolCallId = `restart-${requestCount}`;
+            next.toolCallId = `restart-${requestNumber}`;
           } else {
             plan.finished = true;
             content = `Synthetic foreground ${plan.name}`;
@@ -394,9 +424,9 @@ export async function runNativeRestartCheck(options = {}) {
         assert.ok(!raw || name, `Tool was not genuinely offered: ${raw}`);
         response.writeHead(200, { 'content-type': 'text/event-stream' });
         const delta = { role: 'assistant', content, ...(name ? { tool_calls: [{ index: 0,
-          id: `restart-${requestCount}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } : {}) };
+          id: `restart-${requestNumber}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } : {}) };
         for (const choice of [{ delta, finish_reason: null }, { delta: {}, finish_reason: name ? 'tool_calls' : 'stop' }])
-          response.write(`data: ${JSON.stringify({ id: `restart-${requestCount}`, object: 'chat.completion.chunk',
+          response.write(`data: ${JSON.stringify({ id: `restart-${requestNumber}`, object: 'chat.completion.chunk',
             created: 1, model: 'gpt-4.1', choices: [{ index: 0, ...choice }] })}\n\n`);
         response.end('data: [DONE]\n\n');
       } catch (error) {
@@ -410,6 +440,7 @@ export async function runNativeRestartCheck(options = {}) {
     await startHost(legacyRoot ?? hostRoot, legacyRoot ?? serverRoot, join(root, pack.filename));
     foregroundId = (await api('session/new', { cwd: dirs.work,
       roles: [{ moduleId: 'assistant', roleId: 'coordinator' }], toolScope: scope })).sessionId;
+    await idle(foregroundId);
     await api('session/tools-initialize', { sessionId: foregroundId });
     assert.deepEqual((await api('session/tool-scope', { sessionId: foregroundId })).configured, scope);
     await front('setup', [
@@ -419,7 +450,7 @@ export async function runNativeRestartCheck(options = {}) {
       }),
       step('assistant_topic', () => ({ title: 'Process restart source', sessionId: sourceId })),
       step('assistant_topics', {}, value => assert.ok(value.items.some(item => item.sessionId === sourceId))),
-      step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, null)),
+      step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, foregroundId)),
     ]);
     replies.set('baseline', 'Synthetic restart baseline 中文🙂');
     await front('baseline-send', [sendSource('baseline')]);
@@ -550,8 +581,16 @@ export async function runNativeRestartCheck(options = {}) {
     ]);
     evidence.checks.push('real public rewind produces explicit history gap; no baseline reset, checkpoint advance or unread acknowledgement');
     if (legacyRoot) evidence.checks.push('original legacy artifact token submitted opaque across Host upgrade; native history revalidated');
+    await wait('automatic recent-cache persisted raw Chat read',
+      () => evidence.moduleIntents.some(item => item.name === 'session/chat'));
+    assert.ok(evidence.moduleIntents.some(item => item.name === 'session/directory'));
+    assert.ok(evidence.calls.some(item => item.raw === 'cockpit_read_session_text'),
+      'Context and restart fragments still come from direct native-agent Host Chat text reads');
+    assert.ok(evidence.moduleIntents.some(item => item.name === 'prompt'),
+      'Role-derived automatic reminders remain enabled while unread ranges survive restart');
     assert.deepEqual(failures, []);
     await stopHost();
+    for (const { name, body } of evidence.moduleIntents) assertPassiveModuleRead(name, body);
     assert.deepEqual(failures, []);
     clean = true;
     console.log(`PASS restart: ${evidence.hosts.length} exited Host OS processes; ${requestCount} provider requests; ${evidence.calls.length} actual MCP calls.`);

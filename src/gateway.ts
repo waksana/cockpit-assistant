@@ -10,5 +10,4 @@ export interface Gateway {
   session(id: string): Promise<PublicSessionMeta | null>;
   foregroundId(): string | null;
   foreground(): Promise<PublicSessionMeta | null>;
-  setForeground(sessionId: string | null): Promise<void>;
 }

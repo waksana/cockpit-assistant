@@ -56,7 +56,6 @@ function fixture(config: Partial<Config> = {}) {
     async session(id) { if (onMeta) await onMeta(id); return sessions.get(id) ?? null; },
     foregroundId: () => foregroundId,
     async foreground() { return foregroundId ? sessions.get(foregroundId) ?? null : null; },
-    async setForeground(id) { foregroundId = id; },
   };
   const assistant = new Assistant(store, native, configInput.parse(config), error => errors.push(error));
   const topic = (id: string, sessionId: string | null): Topic => store.saveTopic({ id, title: id, content: '',
@@ -65,6 +64,7 @@ function fixture(config: Partial<Config> = {}) {
   const pointer = (id = 'pending', sessionId = 'a') =>
     store.enqueuePointer(sessionId, id, 'reply', { eventId: `event-${id}`, timestamp: null });
   return { store, assistant, native, sessions, calls, errors, topic, pointer,
+    roleOwner(id: string | null) { foregroundId = id; },
     onCall(value: typeof onCall) { onCall = value; }, onMeta(value: typeof onMeta) { onMeta = value; },
     load(value: typeof loadResult, changesState = true) { loadResult = value; loadChangesState = changesState; },
     fail(value: string | null) { failure = value; },
@@ -220,7 +220,7 @@ test('foreground read failures and absent selection do not replace an identity o
     const f = fixture();
     try {
       pending(f);
-      if (state === 'unconfigured') await f.native.setForeground(null);
+      if (state === 'unconfigured') f.roleOwner(null);
       else f.native.foreground = async () => { throw new Error(state); };
       await f.assistant.notify();
       assert.deepEqual(f.calls, []);
@@ -247,7 +247,7 @@ test('source, foreground and stop invalidations across discovery and load preven
       f.onCall(async name => {
         if (name !== 'session/load') return;
         if (phase === 'load') f.sessions.get('a')!.activity!.processing = true;
-        if (phase === 'identity') await f.native.setForeground('b');
+        if (phase === 'identity') f.roleOwner('b');
         if (phase === 'stop') f.assistant.stop();
         if (phase === 'consumption') await resolveInbox(f);
         if (phase === 'ask') f.sessions.get('a')!.ask = null;
@@ -343,17 +343,41 @@ test('concurrent registry edits detect a changed mapping after native lookup ins
   } finally { release.resolve(); f.close(); }
 });
 
-test('foreground supports passive query, explicit selection and null without human or role selection', async () => {
+test('foreground is query-only and reports the role owner without a separate selection', async () => {
   const f = fixture();
   try {
-    await f.native.setForeground(null);
+    f.roleOwner(null);
     assert.equal((await f.invoke('assistant_foreground') as { foregroundSessionId: unknown }).foregroundSessionId, null);
     f.sessions.get('b')!.rolesNeedReload = true;
-    assert.equal((await f.invoke('assistant_foreground', { sessionId: 'b' }) as { foregroundSessionId: string }).foregroundSessionId, 'b');
-    assert.equal((await f.invoke('assistant_foreground', { sessionId: null }) as { foregroundSessionId: unknown }).foregroundSessionId, null);
+    f.roleOwner('b');
+    assert.equal((await f.invoke('assistant_foreground') as { foregroundSessionId: string }).foregroundSessionId, 'b');
+    await assert.rejects(f.invoke('assistant_foreground', { sessionId: 'b' }));
+    await assert.rejects(f.invoke('assistant_foreground', { sessionId: null }));
     assert.deepEqual(f.calls, []);
     await assert.rejects(f.invoke('assistant_foreground', { human: true }));
   } finally { f.close(); }
+});
+
+test('recent search is bounded, validates input and remains independent of inbox handling', async () => {
+  const f = fixture(), queries: { query: string; limit: number }[] = [];
+  const search = new Assistant(f.store, f.native, f.assistant.config, error => f.errors.push(error), {
+    async search(query, limit) {
+      queries.push({ query, limit });
+      return { items: [{ sessionId: 'a', snippet: 'Synthetic candidate' }], authoritative: false };
+    },
+  });
+  try {
+    pending(f);
+    const result = await search.invoke('assistant_search', { query: '  candidate  ' }, identity('search'));
+    assert.deepEqual(result, { items: [{ sessionId: 'a', snippet: 'Synthetic candidate' }], authoritative: false });
+    assert.deepEqual(queries, [{ query: 'candidate', limit: 10 }]);
+    for (const input of [{ query: '' }, { query: 'x', limit: 11 }, { query: 'x', limit: 0 }, { query: 'x', sessionId: 'a' }])
+      await assert.rejects(search.invoke('assistant_search', input, identity('invalid-search')));
+    await assert.rejects(f.invoke('assistant_search', { query: 'candidate' }), { code: 'SEARCH_UNAVAILABLE' });
+    assert.equal(queries.length, 1);
+    assert.equal(f.store.inbox().length, 1);
+    assert.deepEqual(f.calls, []);
+  } finally { search.stop(); f.close(); }
 });
 
 test('foreground health is passive and preserves historical unknown wake facts', async () => {
@@ -379,12 +403,12 @@ test('foreground health retains the configured identity when metadata is missing
   for (const state of ['missing', 'read-error']) {
     const f = fixture();
     try {
-      await f.native.setForeground('configured-original');
+      f.roleOwner('configured-original');
       if (state === 'read-error') f.native.foreground = async () => { throw new Error('Host metadata unavailable'); };
       const result = await f.invoke('assistant_foreground') as {
         foregroundSessionId: string; current: { sessionId?: string | null; status: string; error?: string };
       };
-      assert.equal(result.foregroundSessionId, 'configured-original');
+      assert.equal(result.foregroundSessionId, state === 'read-error' ? 'configured-original' : null);
       if (state === 'read-error') {
         assert.equal(result.current.status, 'unknown');
         assert.match(result.current.error!, /Host metadata unavailable/);

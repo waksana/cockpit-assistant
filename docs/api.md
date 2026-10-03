@@ -1,6 +1,6 @@
 # Directory and inbox API
 
-Protocol **5**, schema **5**, no frontend. Discover the active module ID/digest
+Protocol **5**, inbox schema **5**, recent-cache schema **1**, no frontend. Discover the active module ID/digest
 via Host `GET /_modules.active`; the API base is
 `/_modules/assistant/<digest>/api`. Old mirrored-chat routes return
 **410 NATIVE_CHAT_REQUIRED**. Native Chat belongs to the Host, not this module.
@@ -8,7 +8,8 @@ via Host `GET /_modules.active`; the API base is
 ## Session setup
 
 The ordinary `assistant/coordinator` role contributes its own HTTP MCP tools
-and shared Skill instructions. It is not exclusive and does not install or
+and shared Skill instructions. Its identity is globally single-owner, without
+native resource isolation. It does not install or
 reference the Host MCP server. Provide the native MCP server named `cockpit`
 separately, using a compatible Host installation's `launch mcp` entry and
 intended endpoint/configuration. Isolated probes must use isolated homes and
@@ -21,7 +22,7 @@ Assistant raw tools are exactly:
 {
   "name": "assistant",
   "tools": [
-    "assistant_topics", "assistant_topic", "assistant_foreground",
+    "assistant_topics", "assistant_topic", "assistant_search", "assistant_foreground",
     "assistant_inbox", "assistant_checkpoint", "assistant_resolve"
   ]
 }
@@ -41,16 +42,18 @@ tools if necessary, then inspect actual configured/applied scope and offered
 names through `session/tool-scope`. A saved role or enabled connection alone does
 not establish that a model can call the tools.
 
-An old immutable scope excluding `cockpit` does not gain it by removing the
-role's exclusive policy. With user approval create a correctly scoped new
-foreground; keep old history in its original session, never migrate it or
-silently change connector bindings. Verify the new tools, then explicitly set
-the ID through `assistant_foreground`. Production creation/selection/connector
-changes require separate authorization; publication does none of them.
+An old immutable scope excluding `cockpit` does not gain it from a role update.
+Changing the entrance requires separate user authorization and supported Host
+role/session operations: a second coordinator cannot be assigned while an owner
+exists. Keep old history in its original session and never silently change
+connector bindings. Multiple pre-existing coordinators surface a conflict;
+installation does not pick or modify an owner. `assistant_foreground` is read-only.
+Publication authorizes none of these production changes.
 
-Module configuration `foregroundSessionId` supplies an existing explicit default.
-A later persisted selection, including null, takes precedence. No first-human
-selection occurs. Legacy `defaultCwd`/`worker` values remain readable but inert;
+Legacy module configuration `foregroundSessionId`, persisted selection and null
+disable receipts remain readable but inert. The actual saved coordinator role
+determines the address. No first-human selection occurs.
+Legacy `defaultCwd`/`worker` values remain readable but inert;
 business session creation and resource selection now belong to direct Host calls.
 The optional organizer role only contributes directory tools/instructions.
 It has no custom `historySessionIds` source-authorization syntax.
@@ -67,7 +70,8 @@ session arguments; Host access controls/tool filters remain unchanged.
 | --- | --- | --- |
 | `assistant_topics` | `{after?,limit?}` | Read identity/responsibility/scope metadata. |
 | `assistant_topic` | `{topicId?,title?,content?,archived?,sessionId?}` | Edit metadata/register an existing session; omit topic ID to create an entry. |
-| `assistant_foreground` | `{sessionId?:string\|null}` | Query/select one existing reminder ID, or disable with null; does not create/load. |
+| `assistant_search` | `{query,limit?}` | Literal keyword search in bounded recent primary text, with session metadata; default/max 10 results. Confirm matches in native Chat. |
+| `assistant_foreground` | `{}` | Query role-owned reminder health; selection and null-disable inputs are rejected. Does not create/load. |
 | `assistant_inbox` | `{ids?,after?,limit?,peek?,decisionsAfter?}` | List a bounded page of locations and current asks, with an exact inbox receipt. |
 | `assistant_checkpoint` | `{receiptId,sessionId,readIds?,position,complete,gap?,reset?,expectedCheckpointVersion?}` | Save an agent-reported read position, distinct from handling. |
 | `assistant_resolve` | `{receiptId,disposition:"silent"\|"notified"}` | Record handling of that returned inbox range; never sends or answers an ask. |
@@ -81,6 +85,33 @@ Directory `contentUse`/warnings explicitly mark old descriptions as background.
 Multiple topics may map to one session. Explicit registration requires an existing
 native ID. Old delivery and creation receipts remain archived without startup
 replay or replacement creation.
+
+## Recent-session discovery
+
+`assistant_search` accepts a trimmed, nonempty `query` of at most 200 characters.
+Matching is literal and case-sensitive, including Chinese and punctuation; it
+does not execute regular expressions. Results contain session metadata, exact
+event/message pointers, primary role, timestamp, a snippet, `syncedAt`,
+`truncated` and `scanLimited`. The response carries `discoveryOnly:true` and
+`nativeChatReadRequired:true`: read native Chat to confirm responsibility and
+context before sending work or reporting progress.
+
+The independent `recent.sqlite` cache retains at most 20 primary messages and
+64 KiB text per session, with an 8 KiB per-message limit. It excludes child-agent
+messages, ephemeral events, tool payloads, reasoning and attachment bytes. Search
+returns at most 10 snippets of 512 Unicode characters, examining at most 100
+candidate message hits and admitting at most four concurrent searches. Different
+hits may refer to the same session. Native existence and source metadata are
+rechecked before returning candidates; unavailable or invalidated sources are
+excluded, with errors and coverage reported rather than stale success.
+
+`coverage` (also `/state.recent`) reports `warming`, `ready`, `partial` or
+`stopped`, inventory completion/error, current/stale/failed/pending counts,
+bounded-window/truncation counts and refresh/skip/drift counts. `resultLimited`
+indicates the search budget may have omitted matches. Ready means the current
+bounded discovery pass is covered, not that all historical messages are indexed.
+No recent match does not establish that an older topic never existed.
+Search neither resolves inbox entries nor advances any agent read checkpoint.
 
 ## Inbox and handling
 
@@ -225,13 +256,15 @@ guidance, not service original-text auditing.
 
 `GET /state` returns protocol/schema identifiers,
 `inbox:"locations-and-handling"` and `health`.
-`health.foregroundSessionId` retains the selected ID even when lookup fails.
+`health.destination` is `coordinator-role`. `health.foregroundSessionId` is the
+discovered role owner, not a configured selection.
 `current` samples the target's native loaded/status/activity/ask with `checkedAt`,
 or gives explicit unknown/error. This is inbox-target health, not a general
 session-status wrapper and not a business completion assertion.
 `lastWakeAttempt` separately preserves historical loading/loaded/failed/unknown
 state and time; `pendingUpdates` counts source locations, not business tasks.
-Passive health reads do not load/send or consult role-selection availability.
+Passive health reads discover saved role ownership but do not load/send or call
+role-selection availability.
 
 Ordinary updates await genuine source `session.idle`, known inactive work and
 empty pending/steering queues; `assistant.turn_end` is not completion. Valid asks
@@ -240,8 +273,8 @@ foreground. Loaded handles are never reloaded, deleted IDs are not replaced.
 Source/foreground are rechecked before an idle `enqueue` location-only reminder.
 An accepted wake is not a user-facing reply or business result.
 
-Missing selected IDs report `FOREGROUND_MISSING`; failed reads retain their actual
-error. Failed/unknown loads preserve pending updates and are not blindly retried.
+No role owner reports an unconfigured target; conflicting or unreadable ownership
+reports an explicit error. Failed/unknown loads preserve pending updates and are not blindly retried.
 An operator may inspect and explicitly load the same original ID through Host
 tools; a later event can observe recovery. Unknown prompts remain unknown after
 restart. No retry timer, replacement creation, keepalive or wake-reset API exists.

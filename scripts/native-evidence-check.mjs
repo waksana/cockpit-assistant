@@ -6,6 +6,29 @@ import { chmod, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:f
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+export function assertPassiveModuleRead(name, body) {
+  assert.ok(!['session/chat/text', 'session/new', 'respondAsk'].includes(name),
+    'The cache uses raw Chat only; the module never creates business sessions or proxies answers');
+  if (name === 'session/chat') {
+    assert.equal(body.source, 'persisted');
+    assert.equal(body.direction, 'backward');
+    assert.equal(body.bootstrap, false);
+    assert.equal(body.waitMs, 0);
+    assert.notEqual(body.includeEphemeral, true);
+    assert.ok(Number.isInteger(body.max) && body.max > 0 && body.max <= 256,
+      'Module raw Chat reads use the bounded max event count, not a text-reader limit');
+  }
+  if (name === 'session/directory') {
+    assert.ok(Number.isInteger(body.limit) && body.limit > 0 && body.limit <= 100);
+  }
+}
+
+export function isRecordedReminder(lastUser, intents, foregroundId) {
+  return intents.some(({ name, body }) => name === 'prompt' && body.sessionId === foregroundId
+    && body.mode === 'enqueue' && typeof body.text === 'string' && body.text.length > 0
+    && lastUser.includes(JSON.stringify(body.text).slice(1, -1)));
+}
+
 // The provider chooses synthetic actions; every advertised tool, MCP connection,
 // tool result, Chat event and ask callback below belongs to the real native Host.
 export async function runNativeCheck(mode = 'evidence') {
@@ -30,7 +53,7 @@ export async function runNativeCheck(mode = 'evidence') {
   let engine, runtime, app, moduleHost, provider, foregroundId, sourceId, topicId, plan, clean = false;
   const hostTools = ['cockpit_new_session', 'cockpit_get_session', 'cockpit_reload_session',
     'cockpit_send_prompt', 'cockpit_respond_ask', 'cockpit_read_session_text'];
-  const assistantTools = ['assistant_topics', 'assistant_topic', 'assistant_foreground',
+  const assistantTools = ['assistant_topics', 'assistant_topic', 'assistant_search', 'assistant_foreground',
     'assistant_inbox', 'assistant_checkpoint', 'assistant_resolve'];
   const scope = { builtins: [], mcpServers: [
     { name: 'assistant', tools: assistantTools }, { name: 'cockpit', tools: hostTools },
@@ -87,7 +110,8 @@ export async function runNativeCheck(mode = 'evidence') {
   };
   const step = (raw, args, check = () => {}) => ({ raw, args, check });
   const front = async (name, steps, text = `FIXTURE_FRONT:${name}`, followUp) => {
-    const current = { name, steps, index: 0, finished: false, followUp };
+    await idle(foregroundId);
+    const current = { name, steps, index: 0, finished: false, followUp, trigger: text };
     plan = current;
     await api('prompt', { sessionId: foregroundId, text, mode: 'immediate' });
     await wait(`foreground plan ${name}`, () => current.finished);
@@ -275,11 +299,14 @@ export async function runNativeCheck(mode = 'evidence') {
         for await (const chunk of request) chunks.push(chunk);
         const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         requests.push(input);
+        const requestNumber = requests.length;
         assert.ok(requests.length <= 100, 'Bound deterministic provider work');
         const lastUser = JSON.stringify(input.messages.filter(message => message.role === 'user').at(-1));
         const source = /FIXTURE_SOURCE:([A-Za-z-]+)/.exec(lastUser)?.[1];
         let raw, args, content = '';
-        if (source) {
+        if (input.tool_choice === 'none') {
+          content = 'Synthetic context summary; verification state remains in the fixture controller and native history.';
+        } else if (source) {
           const count = (sourceCounts.get(source) ?? 0) + 1;
           sourceCounts.set(source, count);
           if (['A', 'C'].includes(source) && count === 1) {
@@ -295,8 +322,19 @@ export async function runNativeCheck(mode = 'evidence') {
               'The genuine native ask callback receives the exact selected answer');
             content = `Synthetic final ${source}${source === 'large' ? ` ${'中文🙂'.repeat(4000)}` : ''}`;
           }
+        } else if (isRecordedReminder(lastUser, intents, foregroundId)
+          && (!plan || plan.finished || plan.trigger && !plan.started
+            && !lastUser.includes(JSON.stringify(plan.trigger).slice(1, -1)))) {
+          // Automatic reminders cannot be disabled. Unplanned reminders finish
+          // without tools: they neither consume Inbox nor start another prompt.
+          content = 'Synthetic reminder received; no handling report made.';
         } else {
           assert.ok(plan && !plan.finished, `Unexpected native foreground wake: ${lastUser}`);
+          if (!plan.started) {
+            assert.ok(plan.trigger ? lastUser.includes(JSON.stringify(plan.trigger).slice(1, -1))
+              : isRecordedReminder(lastUser, intents, foregroundId), 'Only the intended turn starts a synthetic plan');
+            plan.started = true;
+          }
           if (plan.index) {
             const previous = plan.steps[plan.index - 1], value = result(input);
             calls.push({ plan: plan.name, raw: previous.raw, value });
@@ -314,9 +352,9 @@ export async function runNativeCheck(mode = 'evidence') {
         const name = raw ? toolName(input, raw) : undefined;
         response.writeHead(200, { 'content-type': 'text/event-stream' });
         const delta = { role: 'assistant', content, ...(name ? { tool_calls: [{ index: 0,
-          id: `fixture-${requests.length}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } : {}) };
+          id: `fixture-${requestNumber}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } : {}) };
         for (const choice of [{ delta, finish_reason: null }, { delta: {}, finish_reason: name ? 'tool_calls' : 'stop' }])
-          response.write(`data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: 'chat.completion.chunk',
+          response.write(`data: ${JSON.stringify({ id: `fixture-${requestNumber}`, object: 'chat.completion.chunk',
             created: 1, model: 'gpt-4.1', choices: [{ index: 0, ...choice }] })}\n\n`);
         response.end('data: [DONE]\n\n');
       } catch (error) {
@@ -345,8 +383,11 @@ export async function runNativeCheck(mode = 'evidence') {
     app = transport.app;
     moduleHost = new ModuleHost({ hostRoot: dirs.cockpit, observer: engine, origin,
       host: { call: async (name, body) => {
+        assertPassiveModuleRead(name, body);
+        if (name === 'session/load')
+          assert.equal(body.sessionId, foregroundId, 'Only reminder delivery may cold-load the saved coordinator');
         if (name === 'prompt') {
-          assert.equal(body.sessionId, foregroundId, 'The module only wakes the explicitly selected foreground');
+          assert.equal(body.sessionId, foregroundId, 'The module only wakes the saved coordinator-role owner');
           assert.equal(body.mode, 'enqueue');
           const source = await engine.getMeta(sourceId);
           assert.ok(source.ask || source.status === 'idle' && source.activity
@@ -356,8 +397,9 @@ export async function runNativeCheck(mode = 'evidence') {
         intents.push({ name, body });
         return transport.callModuleIntent(name, body);
       } }, report: (_id, error) => {
-        // Observation racing an explicit native unload/reload has no stable metadata.
-        if (error.code === 'SESSION_TRANSITION') diagnostics.push(String(error));
+        // Lifecycle/identity changes may invalidate a passive sample; actual pending wakes are still tested below.
+        if (error.code === 'SESSION_TRANSITION' || error.code === 'FOREGROUND_CHANGED')
+          diagnostics.push(`${error.code}: ${error.error ?? String(error)}`);
         else errors.push(error);
       } });
     transport.setTestDependencies({ engine, moduleHost });
@@ -373,7 +415,15 @@ export async function runNativeCheck(mode = 'evidence') {
     assert.equal((await fetch(`${origin}/health`)).ok, true);
     foregroundId = (await api('session/new', { cwd: dirs.work,
       roles: [{ moduleId: 'assistant', roleId: 'coordinator' }], toolScope: scope })).sessionId;
+    await idle(foregroundId);
     await api('session/tools-initialize', { sessionId: foregroundId });
+    const coordinator = await engine.getMeta(foregroundId);
+    for (const field of ['roles', 'appliedRoles'])
+      assert.ok(coordinator[field]?.some(role => role.moduleId === 'assistant' && role.roleId === 'coordinator'),
+        `The loaded reminder owner requires ${field}, not just a configured foreground`);
+    await assert.rejects(api('session/new', { cwd: dirs.work,
+      roles: [{ moduleId: 'assistant', roleId: 'coordinator' }], toolScope: scope }), /coordinator|role/i,
+    'The actual Host role-assignment transaction must reject a second coordinator');
     const offered = await api('session/tool-scope', { sessionId: foregroundId });
     assert.deepEqual(offered.configured, scope);
     assert.ok(offered.tools?.length, 'Read actual initialized native tools, not declared role names');
@@ -395,7 +445,7 @@ export async function runNativeCheck(mode = 'evidence') {
       step('assistant_topic', () => ({ title: 'Synthetic ordinary source', sessionId: sourceId }), value => {
         assert.equal(value.sessionId, sourceId); topicId = value.topicId;
       }),
-      step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, null)),
+      step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, foregroundId)),
       step('assistant_topics', {}, value => assert.ok(value.items.some(item => item.topicId === topicId))),
     ]);
     assert.deepEqual((await engine.getMeta(sourceId)).roles, []);
@@ -441,7 +491,9 @@ export async function runNativeCheck(mode = 'evidence') {
       ]);
       console.log('PASS connection-only: real create/register, queued/steered Host prompts, exact ask callback and lightweight Chat. Inbox resolution is not covered in this mode.');
     } else if (mode === 'response') {
-      await front('select-response-foreground', [step('assistant_foreground', { sessionId: foregroundId })]);
+      await front('response-role-health', [
+        step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, foregroundId)),
+      ]);
       const queuedRead = { name: 'queued-read', steps: readSteps('silent', 'Synthetic final B'),
         index: 0, finished: false };
       let previousNotices = intents.filter(item => item.name === 'prompt').length;
@@ -493,8 +545,8 @@ export async function runNativeCheck(mode = 'evidence') {
         await front('resumed-read', readSteps('notified', 'Synthetic final resumed'));
         assert.equal((await engine.getMeta(sourceId)).loaded, false,
           'Persisted lightweight since reads do not load the source session');
-        await front('select-cold-foreground', [
-          step('assistant_foreground', { sessionId: foregroundId }),
+        await front('cold-role-health', [
+          step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, foregroundId)),
         ]);
         await api('session/unload', { sessionId: foregroundId });
         assert.equal((await engine.getMeta(foregroundId)).loaded, false);
@@ -504,13 +556,14 @@ export async function runNativeCheck(mode = 'evidence') {
         await wait('original cold foreground resumed by native wake', () => plan.finished);
         await idle(foregroundId); await idle(sourceId);
         assert.equal((await engine.getMeta(foregroundId)).sessionId, foregroundId);
+        assert.ok((await engine.getMeta(foregroundId)).appliedRoles?.some(role =>
+          role.moduleId === 'assistant' && role.roleId === 'coordinator'));
         assert.deepEqual((await api('session/tool-scope', { sessionId: foregroundId })).configured, scope);
         assert.ok(intents.some(item => item.name === 'session/load' && item.body.sessionId === foregroundId));
         assert.equal(calls.filter(item => item.raw === 'cockpit_new_session').length, 1);
         console.log('PASS: Host source reload and automatic cold foreground wake preserve both original IDs, binding and immutable scope.');
       } else {
-        await front('foreground-selection', [
-          step('assistant_foreground', { sessionId: foregroundId }, value => assert.equal(value.foregroundSessionId, foregroundId)),
+        await front('coordinator-role-health', [
           step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, foregroundId)),
         ]);
         const previousNotices = intents.filter(item => item.name === 'prompt').length;
@@ -543,6 +596,10 @@ export async function runNativeCheck(mode = 'evidence') {
         await wait('new arrival independently read and resolved', () => later.finished);
         await idle(foregroundId); await idle(sourceId);
         let askInbox, question;
+        const answeredRead = { name: 'answered-ask-read', steps: [
+          ...readSteps('silent', 'Synthetic final ask'),
+          step('assistant_inbox', { peek: true }, value => assert.equal(value.count, 0)),
+        ], index: 0, finished: false };
         plan = { name: 'native-ask', index: 0, finished: false, steps: [
           step('assistant_inbox', {}, value => {
             askInbox = value;
@@ -558,14 +615,13 @@ export async function runNativeCheck(mode = 'evidence') {
           step('assistant_checkpoint', () => ({ receiptId: askInbox.receipt.id, sessionId: sourceId,
             readIds: askInbox.items.map(item => item.id), position: null, complete: true })),
           step('assistant_resolve', () => ({ receiptId: askInbox.receipt.id, disposition: 'silent' })),
-          step('assistant_foreground', { sessionId: null }),
           step('cockpit_respond_ask', () => ({ session_id: sourceId, request_id: question.requestId,
             answer: 'yes', was_freeform: false }), value => {
             assert.equal(value, `Answered ask ${question.requestId} on ${sourceId}.`);
           }),
-        ] };
+        ], followUp: answeredRead };
         await api('prompt', { sessionId: sourceId, text: 'FIXTURE_SOURCE:ask', mode: 'immediate' });
-        await wait('exact ask callback', () => plan.finished);
+        await wait('exact ask callback and final reply handling', () => answeredRead.finished);
         await idle(foregroundId);
         await wait('native answered reply', () => sourceEvents().some(event => event.data.content === 'Synthetic final ask'));
         await idle(sourceId);
@@ -573,14 +629,26 @@ export async function runNativeCheck(mode = 'evidence') {
         console.log('PASS: idle pointer → Host lightweight Chat/since → complete UTF-8-bounded fragments → agent handling report; new arrivals survive old resolution; real ask_user → exact Host respondAsk.');
       }
     }
+    await front('recent-discovery', [
+      step('assistant_search', { query: 'Synthetic final' }, value => {
+        assert.equal(value.discoveryOnly, true);
+        assert.equal(value.nativeChatReadRequired, true);
+        assert.ok(value.results.some(result => result.sessionId === sourceId),
+          'Actual cached primary text must locate the ordinary business session');
+        assert.ok(value.results.length <= 10);
+      }),
+    ]);
     assert.ok(frontEvents().some(event => event.type === 'assistant.message'));
     assert.ok(!intents.some(item => ['session/new', 'respondAsk'].includes(item.name)),
       'Assistant itself never creates business sessions or proxies answers');
-    assert.ok(!intents.some(item => ['session/chat', 'session/chat/text'].includes(item.name)),
-      'Assistant records pointers/checkpoints only; the native agent reads Host Chat directly');
+    await wait('automatic recent-cache persisted raw Chat read', () => intents.some(item => item.name === 'session/chat'));
+    assert.ok(intents.some(item => item.name === 'session/directory'));
+    for (const { name, body } of intents) assertPassiveModuleRead(name, body);
+    assert.ok(calls.some(item => item.raw === 'cockpit_read_session_text'),
+      'The native agent still reads actual context directly through Host Chat text');
     assert.deepEqual(errors, []);
     console.log(`PASS ${mode}: ${requests.length} deterministic provider requests; ${calls.length} actual MCP calls.`);
-    if (diagnostics.length) console.log(`Observed ${diagnostics.length} expected SESSION_TRANSITION diagnostics during explicit cold lifecycle operations.`);
+    if (diagnostics.length) console.log(`Observed ${diagnostics.length} expected lifecycle/identity sampling diagnostics.`);
     console.log(`Verified scope: ${JSON.stringify(scope)}`);
     console.log('Synthetic policy only: no claim about natural-language judgement or user-visible notification delivery.');
     await moduleHost.stop();
@@ -631,4 +699,5 @@ export async function runNativeCheck(mode = 'evidence') {
   }
 }
 
-if (resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await runNativeCheck(process.argv[4] ?? 'evidence');
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
+  await runNativeCheck(process.argv[4] ?? 'evidence');

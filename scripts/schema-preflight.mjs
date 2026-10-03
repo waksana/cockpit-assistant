@@ -14,7 +14,7 @@ function context(dataRoot, signal) {
     stopping: new AbortController().signal,
     dataRoot, apiBase: '/_modules/assistant/fixture/api', config: {}, signal,
     host: { chatReadVersion: 1, askResponseVersion: 1, roleAssignmentVersion: 1, roleAvailabilityVersion: 1, sessionLoadVersion: 1,
-      promptReceiptVersion: 1, toolScopeVersion: 1, promptOriginVersion: 1, roleResourcePolicyVersion: 1,
+      promptReceiptVersion: 1, sessionDirectoryVersion: 1, toolScopeVersion: 1, promptOriginVersion: 1, roleResourcePolicyVersion: 1,
       async call() { throw new Error('Schema preflight must not call the Host'); } },
     report(error) { throw error; }, publish() {}, invalidate() {},
   };
@@ -30,6 +30,12 @@ export async function verifySchemaBoundary(activate, directory, migrationEntry) 
     assert.deepEqual(sql.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*' ORDER BY name")
       .all().map(row => row.name), applicationTables);
   } finally { sql.close(); }
+  const recent = new DatabaseSync(join(fresh, 'recent.sqlite'), { readOnly: true });
+  try {
+    assert.equal(recent.prepare('PRAGMA user_version').get().user_version, 1);
+    assert.ok(recent.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'").all().length > 0,
+      'The packaged backend creates its declared independent recent cache');
+  } finally { recent.close(); }
   for (const version of [3, 4]) {
     const dataRoot = join(directory, `published-${version}`), path = join(dataRoot, 'assistant.sqlite');
     await mkdir(dataRoot);

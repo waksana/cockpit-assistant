@@ -43,8 +43,9 @@ archive root and as a sidecar. Format 2, channel `rolling`, uses the public
 Independent checksum files avoid a self-referential archive digest.
 
 The product is module **`assistant`**, backend API 1, requiring `shutdown.v1`,
-service readiness, session load and prompt receipts. No module
-frontend/UI, role-availability or prompt-origin capability is required by the
+service readiness, session load, prompt receipts, public session directory,
+Chat reads and role assignment/availability. No module
+frontend/UI, resource-isolation or prompt-origin capability is required by the
 support service. MCP attribution retains native invocation/session/tool-call
 identity. The agent's separately configured Host MCP tools have their own native
 requirements. Missing service capabilities fail before opening data.
@@ -54,9 +55,10 @@ Required intents combine actual backend host calls and the role's direct Host
 MCP dependencies, including `session/chat/text`, creation and ask answers.
 The latter are not service routing wrappers and require no module SDK upgrade.
 An older Host lacking lightweight text support must not accept this release.
-Packaging creates
-the target database in memory and checks its four active tables:
+Packaging checks the main database's four active tables:
 `topics`, `deliveries`, `mailbox` and `seen`.
+The actual packaged activation also creates and checks the independent
+`recent.sqlite` schema-1 cache without requiring a main-database migration.
 
 The session-directory/pointer-inbox change retains these exact schema-5 definitions
 and every existing topic, mapping and history. Its additional values in `seen`
@@ -65,7 +67,11 @@ or business-status snapshot. New reply rows hold source pointers; old unread
 bodies are not rewritten on startup. Explicit handling archives their original
 rows in-place using bodyless receipt markers; no body copy or bulk deletion occurs.
 New pointer rows leave the mailbox when handled. Legacy dispatch/provenance/creation records remain inert, never
-replayed. No production registry cleanup or foreground migration is part of this release.
+replayed. No production registry cleanup or foreground migration is part of this release. The independent rebuildable
+`recent.sqlite` schema-1 database stores only bounded recent primary text and
+source/synchronization metadata. It does not alter schema 5 or read/handling
+checkpoints. Old foreground choices remain inert; actual saved coordinator roles
+determine the reminder target. No existing role or connector binding is migrated.
 The advertised schema-4-to-5 migration below therefore remains necessary and
 unchanged, rather than being replaced by an empty migration list.
 

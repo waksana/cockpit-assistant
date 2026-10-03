@@ -4,6 +4,8 @@ import { BusinessError, errorText, requireFact } from './errors.ts';
 import type { Caller, Gateway } from './gateway.ts';
 import { Store, fingerprint, type InboxItem, type Topic } from './store.ts';
 import { Inbox, checkpointInput, resolveInput } from './inbox.ts';
+import { recentSearchInput as searchInput } from './recent.ts';
+export { searchInput };
 
 const id = z.string().min(1).max(200);
 export const topicInput = z.strictObject({
@@ -15,9 +17,13 @@ export const inboxInput = z.strictObject({
   peek: z.boolean().default(false), decisionsAfter: z.int().nonnegative().default(0),
   after: z.int().nonnegative().default(0),
 });
-export const foregroundInput = z.strictObject({ sessionId: id.nullable().optional() });
+export const foregroundInput = z.strictObject({});
+export interface RecentSearch {
+  search(query: string, limit: number): Promise<unknown>;
+}
 export const pageInput = z.strictObject({ after: z.int().nonnegative().default(0), limit: z.int().min(1).max(100).default(50) });
 export const configInput = z.strictObject({
+  // Legacy selection is accepted for configuration compatibility but never selects the role owner.
   foregroundSessionId: id.nullable().default(null),
   // Old configuration remains readable, but no longer creates or configures sessions.
   defaultCwd: z.string().optional(), worker: z.record(z.string(), z.unknown()).optional(),
@@ -49,7 +55,7 @@ export class Assistant {
   private foregroundObservation = { sessionId: '', version: 0 };
   private stopped = false;
   constructor(readonly store: Store, readonly native: Gateway, readonly config: Config,
-    readonly report: (error: unknown) => void) {
+    readonly report: (error: unknown) => void, readonly recent?: RecentSearch) {
     this.inbox = new Inbox(store, () => this.stopped);
   }
   stop(): void { this.stopped = true; }
@@ -63,14 +69,18 @@ export class Assistant {
           after: page.after + page.limit, hasMore: topics.length > page.after + page.limit };
       }
       case 'assistant_topic': return this.editTopic(caller, topicInput.parse(input));
+      case 'assistant_search': {
+        const query = searchInput.parse(input);
+        requireFact(this.recent, 'SEARCH_UNAVAILABLE', 'Recent-session search is unavailable', 503);
+        return this.recent.search(query.query, query.limit);
+      }
       case 'assistant_dispatch':
       case 'assistant_history':
       case 'assistant_status':
       case 'assistant_read': throw new BusinessError('TOOL_RETIRED',
-        'Assistant only supports the directory and inbox. Use Host tools directly for Chat, session status, creation, prompts and asks.', 410);
+        'Use the directory, recent search and inbox for locations; Host tools directly for Chat, status, creation, prompts and asks.', 410);
       case 'assistant_foreground': {
-        const query = foregroundInput.parse(input ?? {});
-        if (query.sessionId !== undefined) await this.native.setForeground(query.sessionId);
+        foregroundInput.parse(input ?? {});
         return this.health();
       }
       case 'assistant_resolve': return this.inbox.resolve(caller, resolveInput.parse(input));
@@ -98,16 +108,18 @@ export class Assistant {
     }
   }
   async health() {
-    const checkedAt = Date.now(), wake = this.store.foregroundWake(), foregroundSessionId = this.native.foregroundId();
+    const checkedAt = Date.now(), wake = this.store.foregroundWake();
     const lastWakeAttempt = wake ? { ...wake, at: this.store.receipt('foreground-wake')?.createdAt ?? null } : null;
     try {
       const meta = await this.native.foreground();
-      return { foregroundSessionId, current: { checkedAt, sessionId: meta?.sessionId ?? null, loaded: meta?.loaded ?? null,
+      return { foregroundSessionId: meta?.sessionId ?? null, destination: 'coordinator-role' as const,
+        current: { checkedAt, sessionId: meta?.sessionId ?? null, loaded: meta?.loaded ?? null,
         status: meta?.status ?? 'unconfigured', activity: meta?.activity ?? null,
         ask: meta?.ask ? { requestId: meta.ask.requestId } : null },
       lastWakeAttempt, pendingUpdates: this.store.inbox().length };
     } catch (error) {
-      return { foregroundSessionId, current: { checkedAt, status: 'unknown', error: errorText(error) },
+      return { foregroundSessionId: this.native.foregroundId(), destination: 'coordinator-role' as const,
+        current: { checkedAt, status: 'unknown', error: errorText(error) },
         lastWakeAttempt, pendingUpdates: this.store.inbox().length };
     }
   }
@@ -241,7 +253,7 @@ export class Assistant {
           this.store.saveForegroundWake({ sessionId, state: 'failed', error: 'Host rejected the original foreground load' });
           throw new BusinessError('FOREGROUND_LOAD_FAILED', 'Host rejected the original foreground load');
         }
-        const current = await this.native.foreground();
+        const current = this.stopped ? await this.native.session(sessionId) : await this.native.foreground();
         requireFact(current?.sessionId === sessionId && current.loaded, 'FOREGROUND_LOAD_UNKNOWN',
           'The original foreground load could not be confirmed');
         this.store.saveForegroundWake({ sessionId, state: 'loaded', error: null }); meta = current;

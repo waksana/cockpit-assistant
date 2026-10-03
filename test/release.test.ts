@@ -122,12 +122,14 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   for (const capability of ['frontend-api.v3', 'publicComponents.v1', 'conversationPresentation.v1', 'draftOwner.v1', 'draftSubmission.v2']) {
     assert.ok(!actual.requiresCapabilities.includes(capability));
   }
-  assert.ok(!actual.requiresCapabilities.includes('chatRead.v1'));
+  for (const capability of ['chatRead.v1', 'sessionDirectory.v1', 'roleAssignment.v1', 'roleAvailability.v1'])
+    assert.ok(actual.requiresCapabilities.includes(capability));
   assert.ok(actual.requiresCapabilities.includes('shutdown.v1'));
   assert.ok(actual.requiresCapabilities.includes('promptReceipt.v1'));
-  for (const retired of ['toolScope.v1', 'roleResourcePolicy.v1', 'roleAvailability.v1', 'promptOrigin.v1'])
+  for (const retired of ['toolScope.v1', 'roleResourcePolicy.v1', 'promptOrigin.v1'])
     assert.ok(!actual.requiresCapabilities.includes(retired));
-  assert.ok(!actual.requiredIntents.includes('session/chat'));
+  assert.ok(actual.requiredIntents.includes('session/chat'));
+  assert.ok(actual.requiredIntents.includes('session/directory'));
   assert.ok(!actual.requiredIntents.includes('roles/availability'));
   assert.ok(!actual.requiredIntents.includes('session/resources-prepare'));
   for (const agentDependency of ['session/chat/text', 'respondAsk', 'session/new'])
@@ -148,6 +150,7 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   }), /declared final schema/);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
   assert.equal(actual.databases[0].schema, 5);
+  assert.deepEqual(actual.databases[1], { path: 'recent.sqlite', schema: 1, preserve: [] });
   assert.deepEqual(actual.databases[0].preserve, preservedTopics());
   assert.deepEqual(actual.databases[0].preserve.map((entry: { table: string }) => entry.table),
     ['topics']);

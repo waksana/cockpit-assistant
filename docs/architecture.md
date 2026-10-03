@@ -3,23 +3,34 @@
 ```text
 User <-> native Assistant Chat -> Host MCP -> session create/load/prompt/ask
                   |                  +-----> native lightweight Chat/status
-                  +-> Assistant MCP -> directory / inbox / checkpoint / handling
+                  +-> Assistant MCP -> directory / recent search / inbox / checkpoint / handling
                   ^                         |
                   +-- enqueue update pointer+ <- registered source idle / ask
 ```
 
-The agent owns interpretation, routing, session creation, prompt/steering,
-native ask answers and user-facing expression. The module only supplies a
-responsibility directory, inbox and their shared guidance. One explicit
-foreground address and reminder flow belong to the inbox, not another session
-manager. Native Chat and status are direct Host capabilities, not module wrappers.
+The entrance owns conversational context, topic interpretation/routing and
+faithful expression. Responsible sessions own concrete reasoning, research,
+diagnosis and proposals, even when the subject is Assistant itself. The entrance
+can understand references to route correctly, but cannot answer the business
+question or add a solution under the label of summarizing. Only topic lookup and
+summaries of recent contents or established progress remain at the entrance.
+Only topic ambiguity is clarified there; business questions continue in their
+responsible sessions. The shared Skill defines natural incremental handoffs
+and faithful reply integration without work-order templates or routine attribution.
+
+The agent uses direct Host tools for session creation, prompt/steering and native
+ask answers. The module supplies a responsibility directory, recent-session
+search, inbox and shared guidance. The unique coordinator role owner receives
+reminders; there is no independently selected notification address. Native Chat
+and status remain direct Host capabilities, not business execution wrappers.
 
 Host invocation attribution, access control and tool scopes remain authoritative.
 The module does not classify humans, inspect caller input, require coordinator
 membership, check role availability each call or certify user delivery. A
 connector's binding-change guard does not become an Assistant eligibility rule.
-The role is ordinary and non-exclusive; external Host MCP resources are assembled
-separately with exact creation-time scope.
+Coordinator identity is globally single-owner, enforced with Host serialized
+role-assignment hooks. This is not `resourcePolicy: "exclusive"`: external Host
+MCP resources are assembled separately with exact creation-time scope.
 
 ## Persistence
 
@@ -30,16 +41,49 @@ Schema 5 retains its exact four table definitions:
 | `topics` | Identity, responsibility, scope and session mapping; retained legacy creation receipts. |
 | `deliveries` | Inert legacy routing archive, never replayed on startup. |
 | `mailbox` | New native event/message/ask pointers; legacy body/snapshot rows remain in-place as historical data. |
-| `seen` | Native-ID tombstones, returned inbox ranges/agent handling, foreground selection and historical wake attempts; old routing/provenance facts are inert. |
+| `seen` | Native-ID tombstones, returned inbox ranges/agent handling and historical wake attempts; old foreground selection, routing and provenance facts are inert. |
 
 Multiple topics can refer to a session. Explicit registration only accepts an
 existing native ID. Old descriptions containing progress remain background,
 not rewritten or promoted into current facts. Legacy deliveries and creation
 fields are not replayed or reset on startup.
 
+### Independent recent-message cache
+
+`recent.sqlite` schema 1 is a rebuildable discovery copy with bounded text,
+source metadata, successful synchronization markers and a durable pending queue.
+It is neither authoritative Chat nor a second inbox. Its contents do not prove
+that an agent read a conversation or that a reply was presented to the user.
+
+At service readiness, startup begins a background, paginated public session
+inventory. A serial worker yields between jobs and advances inventory between
+batches so a busy source cannot indefinitely prevent discovery of other sessions.
+It compares the source's timestamp/provenance and a one-event native head probe
+with the successfully synchronized source state. Unchanged sources skip the full
+scan; local wall-clock time never stands in for a source checkpoint. A refresh
+reads at most eight 16-event persisted pages plus two one-event head probes,
+normalizes page orientation and validates source state before publishing.
+Normal source drift permits one bounded retry, then remains explicitly stale
+until a later event/startup; genuine access, cursor and format failures remain
+reported. No periodic source polling, model wake or business prompt is involved.
+
+Primary conversation events and content/identity changes invalidate the cache.
+Activity-only patches from the cache's own native reads do not trigger refresh.
+Rewind/compaction invalidation removes the cached text before rebuilding; deletion
+removes the entry. Inventory prunes absent sessions only after complete enumeration.
+Generations fence in-flight publication and search, and shutdown drains both
+worker and search reads before storage closes.
+
+Source metadata plus a head probe cannot detect every arbitrary offline edit to
+interior history when both markers remain unchanged. Cached matches therefore
+always require direct native confirmation. The public raw reader limits **event
+count**, not inbound transport bytes; retention and search output are bounded,
+but this module cannot promise a byte cap on a single returned native event.
+See [search API and budgets](api.md#recent-session-discovery).
+
 ## Observation and handling
 
-Only explicitly registered sources are observed. Reply content is represented by
+Only explicitly registered sources contribute inbox updates. Reply content is represented by
 native source pointers, not a transcript mirror. Primary nonempty message bodies
 are eligible even when accompanied by tool calls; tool payloads/results and
 subagent/ephemeral streams are not separate updates. Errors/aborts retain source
@@ -80,8 +124,14 @@ Semantic novelty, attention and expression remain model decisions.
 
 ## Reminders and lifecycle
 
-An explicit persistent foreground ID is solely a notification address. No
-first-human selection or automatic history migration occurs. Only eligible
+The public Host session directory's saved coordinator role is the reminder
+authority. No owner is unconfigured; multiple pre-existing owners are an explicit
+conflict, not permission to pick one. New assignments cannot create a second
+owner. Loaded owners must actually have the role applied; stale saved labels do
+not imply readiness. Role callbacks inspect public state only, without loading
+or prompting from the assignment transaction. No first-human selection,
+automatic role change, connector rebinding or history migration occurs. Legacy
+foreground configuration and receipts are retained but ignored. Only eligible
 pending updates can load the same original ID; loaded handles are not reloaded.
 Missing/failed/unknown outcomes never trigger replacement creation or blind
 retries. Load intent is recorded before calling the Host, and native identity/
@@ -101,3 +151,19 @@ current Host Chat, honor attention preferences and preserve uncertainty.
 Guidance does not constitute a service authorization layer. `immediate` steers
 an active run, not aborts it or clears its queue. Ask answers use exact live
 request IDs through Host tools, not guessed dispatch text.
+
+## Routing examples and evaluation boundary
+
+| Input | Expected entrance behavior |
+| --- | --- |
+| "Find our export topic" / "What has changed recently?" | Locate topics and summarize actual recent evidence without starting new business work. |
+| "How should the export work?" | Reuse a suitable export session, or search recent candidates and create only if none fits. Do not ask about devices or propose formats at the entrance. |
+| "Why are you analyzing business questions yourself?" | Resolve "you" to Assistant coordinator and route to the Assistant responsible session, without first diagnosing the Skill. |
+| "Is Assistant inbox broken?" | Route immediately to the Assistant responsible session; do not inspect health first as a diagnostic shortcut. |
+| "Change that" with multiple plausible topics | Clarify which topic/object, not implementation details. |
+| A responsible session asks a business question | Present its actual question naturally and return the user's answer to that session; do not invent additional business questions. |
+| A source reports a proposal or partial result | Integrate it naturally as a proposal or partial result, not completed work or the entrance's new recommendation. |
+
+Packaged-guidance assertions protect these explicit boundaries; deterministic
+native probes exercise tools, roles, reminders and read positions. Neither proves
+that every real model will spontaneously obey the routing policy in conversation.

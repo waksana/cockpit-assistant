@@ -1,9 +1,16 @@
 # Cockpit Assistant
 
 A native Assistant conversation backed by a small **support-only service**:
-session directory, inbox, shared Skill and reminders
-to one explicitly selected foreground. There is no separate frontend, transcript
-mirror or input relay.
+session directory, bounded recent-session search, inbox, shared Skill and
+reminders to the single `assistant/coordinator` role owner. There is no separate
+frontend, authoritative transcript mirror or input relay.
+
+The entrance maintains context, connects topics and organizes language; concrete
+questions, analysis and proposals go to suitable responsible sessions before any
+business investigation. Existing sessions are reused; new ordinary sessions are
+created only when needed. This includes questions about Assistant itself. Only
+topic ambiguity is clarified at the entrance. Handoffs and actual replies continue
+one natural conversation, not a sequence of work orders or internal attributions.
 
 The agent uses the Host's tools directly to read lightweight native Chat/status,
 create/load sessions, send or steer prompts and answer native asks. The service does not dispatch business, create
@@ -16,13 +23,17 @@ context loss. Inbox listing and explicit handling reports are separate; neither
 a returned-location receipt nor an agent's `notified` report proves physical user delivery.
 Attention preferences guide meaningful updates versus silent routine progress.
 Ordinary reminders wait for source idle; current asks need not. Wakes use
-`enqueue`, may load only the selected original foreground, and never blindly
+`enqueue`, may load only the original role owner, and never blindly
 retry unknown outcomes.
 
-The ordinary, non-exclusive Assistant role supplies its own MCP tools and shared
+The single-owner Assistant role supplies its own MCP tools and shared
 Skill. **The minimal Host MCP connection and immutable creation-time tool scope
 must be configured separately.** Installing a role alone does not supply those
-Host tools. See [API and setup](docs/api.md), [service architecture](docs/architecture.md)
+Host tools. Identity exclusivity does not enable native resource isolation.
+The service's persistent recent-message cache warms progressively at startup
+and updates from events. Search is only a coarse locator; verify matches in native
+Chat, and do not equate no recent match with no older discussion.
+See [API and setup](docs/api.md), [service architecture](docs/architecture.md)
 and [release/data preservation](docs/releases.md).
 
 ## Development

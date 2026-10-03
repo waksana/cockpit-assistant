@@ -46,7 +46,19 @@ test('shared topic Skill is physically embedded in each role without requiring a
     assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_foreground'));
     assert.ok(!role('organizer').mcpServers.assistant.tools.includes('assistant_dispatch'));
     assert.equal(role('worker'), undefined);
-    assert.equal(role('coordinator').mcpServers.assistant.tools.length, 6);
+    assert.equal(role('coordinator').mcpServers.assistant.tools.length, 7);
+    assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_search'));
+    for (const boundary of [
+      /Do not perform business reasoning or add your own solution/,
+      /including questions about Assistant, its Skill or inbox/,
+      /Route before investigating: read-only diagnosis is still business reasoning/,
+      /Only clarify which topic or object the user means/,
+      /Avoid stock openings/,
+      /Waiting needs no acknowledgement or progress announcement/,
+      /not mechanical relay or new business reasoning/,
+      /cannot select a different session/,
+      /Do not create a new session for each follow-up or a separate topic specialist/,
+    ]) assert.match(front, boundary);
     assert.equal(role('organizer').mcpServers.assistant.tools.length, 2);
     assert.equal(manifest.instructions, undefined, 'The foreground role must not be injected into all native sessions');
     assert.equal(manifest.frontend, undefined);

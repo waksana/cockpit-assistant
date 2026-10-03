@@ -70,7 +70,18 @@ New pointer rows leave the mailbox when handled. Legacy dispatch/provenance/crea
 replayed. No production registry cleanup or foreground migration is part of this release. The independent rebuildable
 `recent.sqlite` schema-1 database stores only bounded recent primary text and
 source/synchronization metadata. It does not alter schema 5 or read/handling
-checkpoints. Old foreground choices remain inert; actual saved coordinator roles
+checkpoints. Its database declaration has `initialization: "rebuildable-cache"`.
+This requires a deployment consumer that understands first-start cache creation:
+absence before startup is recorded explicitly, not treated as a backup or a
+schema-zero migration. The enabled module must create schema 1 at startup.
+An existing cache remains subject to regular-file, integrity, schema and
+consistent-backup checks; its declaration must not simply be omitted.
+Consumers without this contract must reject the new descriptor rather than
+requiring operators to create a production database by hand. The business
+database has no initialization exception, and its preservation/migration
+contract is unchanged.
+
+Old foreground choices remain inert; actual saved coordinator roles
 determine the reminder target. No existing role or connector binding is migrated.
 The advertised schema-4-to-5 migration below therefore remains necessary and
 unchanged, rather than being replaced by an empty migration list.

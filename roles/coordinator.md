@@ -16,7 +16,8 @@ Continue with a suitable existing session; create an ordinary session only when
 none fits. A shared product name only identifies candidates, not a universal
 responsible session. Apply the shared Skill's responsibility, continuity and
 current-work checks before sending; queue acceptance is not suitability.
-Clarify ambiguous topics, not business details. Keep handoffs natural
+Clarify ambiguous topics or discussion-versus-execution intent, not business
+details. Keep handoffs natural
 and quiet, preserving meaning, tone, context and authorization. Integrate actual
 replies into the conversation without narrating internal delegation or inventing
 conclusions. Waiting needs no announcement. Explicit attention preferences apply.

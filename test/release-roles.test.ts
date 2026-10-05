@@ -52,7 +52,7 @@ test('shared topic Skill is physically embedded in each role without requiring a
       /Do not perform business reasoning or add your own solution/,
       /including questions about Assistant, its Skill or inbox/,
       /Route before investigating: read-only diagnosis is still business reasoning/,
-      /Only clarify which topic or object the user means/,
+      /Only clarify the intended topic\/object or whether the user intends discussion\s+or an execution change/,
       /Avoid stock openings/,
       /Waiting needs no acknowledgement or progress announcement/,
       /not mechanical relay or new business reasoning/,
@@ -78,6 +78,33 @@ test('shared topic Skill is physically embedded in each role without requiring a
       assert.match(front, selection);
       assert.match(organizer, selection);
     }
+    for (const workflow of [
+      /stage, completed evidence and remaining dependencies before dispatching/,
+      /Message length does not determine recipient or dispatch count/,
+      /the current conversation, not unrelated historical matters/,
+      /Organize necessary\s+handoffs from that scope, actual responsibilities and stage dependencies/,
+      /do not require the user to issue each internal step as a separate instruction/,
+      /Clarify genuinely ambiguous scope or intent, not routine internal decomposition/,
+      /Choose the specific recipient needed for each necessary action/,
+      /Preserve existing source and\s+rework ownership/,
+      /a shared outcome does not transfer every responsibility\s+to one session/,
+      /Topic separation does not require new sessions or a message\s+to every owner/,
+      /Dispatch only necessary, authorized remaining actions/,
+      /development, review\/merge, publication and deployment are distinct\s+stages/,
+      /Confirm prerequisites from current native Chat evidence before handing off\s+a dependent stage/,
+      /Reuse completed results and existing operation identities/,
+      /do not repeat work for organizational symmetry or resend an uncertain operation/,
+      /A single executor for a shared operation owns that operation only/,
+      /Read the surrounding conversation/,
+      /a proposed sequence or hypothetical example is not automatically a new dispatch,\s+retry or reassignment/,
+      /If that distinction is unclear, clarify it before taking\s+a new operational action/,
+      /Discussion alone neither resumes nor cancels existing work/,
+    ]) {
+      assert.match(front, workflow);
+      assert.match(organizer, workflow);
+    }
+    assert.match(front, /Clarify ambiguous topics or discussion-versus-execution intent, not business\s+details/);
+    assert.doesNotMatch(front, /Only ambiguity about the intended topic is clarified/);
     assert.equal(role('organizer').mcpServers.assistant.tools.length, 2);
     assert.equal(manifest.instructions, undefined, 'The foreground role must not be injected into all native sessions');
     assert.equal(manifest.frontend, undefined);

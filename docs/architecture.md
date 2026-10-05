@@ -142,6 +142,15 @@ location-only `enqueue` prompt. A wake accepted by native runtime is not a final
 reply or physical user delivery. Unknown sends remain unknown across restart,
 without a poller, keepalive or replay timer. Unrelated roles are not requalified.
 
+Native/control event callbacks are independent observations, not prompt
+middleware continuations. The Host must isolate their middleware recursion
+context before delivery. Assistant has no middleware `next` to call and does
+not bypass the Host guard. If a Host call throws after a notice is reserved,
+including a pre-dispatch guard rejection, the original notice stays `unknown`
+and its inbox sources remain available; later events do not retry it. A Host
+fix prevents future false recursion failures but does not settle or replay
+existing unknown notices.
+
 `shutdown.v1` stops new producers early, drains already-started calls while
 storage remains open, then closes storage/releases the writer lease at disposal.
 Retained data and offline migration are described in [releases](releases.md).

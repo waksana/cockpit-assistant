@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -155,6 +156,34 @@ async function assertIngressStopped(backend: ModuleBackend, f: ReturnType<typeof
   }), { code: 'NOT_READY' });
   assert.equal(f.calls.length, before, 'Stopped callbacks do not start even passive Host reads');
 }
+
+test('an inherited Host prompt guard failure preserves the inbox without replay from later events', async t => {
+  const f = fixture(t), activePrompt = new AsyncLocalStorage<boolean>();
+  const call = f.context.host.call;
+  f.context.host.call = (name, body) => {
+    if (name === 'prompt' && activePrompt.getStore()) {
+      throw Object.assign(new Error('Recursive host.call(prompt) is forbidden; use next'),
+        { code: 'MODULE_MIDDLEWARE_INVALID' });
+    }
+    return call(name, body);
+  };
+  f.sessions.get('source')!.status = 'running';
+  const backend = await f.activate();
+  await backend.onReady!();
+  f.sessions.get('source')!.status = 'idle';
+  await activePrompt.run(true, () => backend.events!.handle({
+    sessionId: 'source', cwd: '/synthetic',
+    event: { id: 'source-idle', type: 'session.idle', data: {} },
+  }));
+  assert.equal(f.errors.length, 1);
+  assert.match(String(f.errors[0]), /Recursive host\.call\(prompt\)/);
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 0, 'Host guard rejected before native dispatch');
+  assert.equal(f.state().inbox[0]!.notice_state, 'unknown');
+  assert.equal(f.state().inbox[0]!.notification_receipt, null);
+  await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source', resources: ['queue'] });
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 0, 'A later clean context is not replay authority');
+  assert.equal(f.state().inbox.length, 1, 'The original source remains available for explicit handling');
+});
 
 test('activation rejects a missing shutdown.v1 before opening the database or acquiring its lease', async t => {
   const f = fixture(t, false);

@@ -16,8 +16,9 @@ including questions about Assistant, its Skill, configuration or inbox.
 Route before investigating: read-only diagnosis is still business reasoning.
 Routine inbox collection is coordination; investigating why the inbox fails is not.
 
-Use a suitable existing session. When the directory has no suitable match,
-use the available `assistant_search` recent-session index for candidate locations,
+Use a suitable existing session under the selection rules below. When the
+directory has no suitable match, use the available `assistant_search`
+recent-session index for candidate locations,
 then confirm scope and context with direct Host Chat/status. Search is a clue,
 not proof of responsibility or progress. It covers a bounded recent window,
 may be incomplete or stale while warming, and cannot establish that older
@@ -53,6 +54,43 @@ answer. Waiting needs no acknowledgement or progress announcement.
 These routing rules govern the coordinator, not permission for a directory-only
 organizer to use tools it has not been granted.
 
+## Selecting a session before sending
+
+A shared product name only identifies candidates. Reuse requires evidence of
+the same specific responsibility or a continuing discussion, not merely a broad
+product owner or a familiar session. Topic reuse and session reuse are separate
+decisions; a directory match alone does not settle the destination.
+
+Before sending, confirm the candidate's actual scope and recent work goal and
+phase in native Chat, alongside current Host activity and queues. Use relevant
+evidence already read and still current, or bounded reads where needed; do not
+scan every session or all history. These are routing checks, not permission for
+the entrance to diagnose or solve the business question. Directory and search
+metadata only locate candidates; native session/Chat remains the business fact
+source. Do not record live workload in responsibility descriptions.
+
+Neither `running`, elapsed time nor shell count alone establishes heavy or
+long-running work. Interpret activity with the actual current work; unknown
+activity is not idle, and an idle session is not necessarily a suitable owner.
+Do not introduce a scheduler or workload score to replace this judgment.
+
+Distinguish independent discussion from feedback required by current execution.
+Independent questions must not default to the queue of a session occupied by
+heavy or long-running work, even about the same product. Prefer a matching
+existing discussion session. Only when necessary lookup finds none suitable,
+create an ordinary session with a specific discussion goal, not a topic expert.
+Do not create a new session merely because a candidate is `running`, or for
+each follow-up. Continue related discussion where it belongs.
+
+Corrections, constraints, materials and question answers required by current
+execution still belong to the executing session; do not bypass it because it is
+busy. Use the exact current native ask when applicable. Otherwise choose enqueue
+or authorized steering according to urgency and the user's intent; independent
+discussion never authorizes interrupting or cancelling existing work.
+Do not mechanically redirect to a superior or broadcast to multiple recipients.
+Choose the specific recipient needed for this message, not everyone related to
+the product. Being able to enqueue does not make a session suitable to receive.
+
 ## Responsibility metadata
 
 The directory answers who handles a matter: identity, responsibility and scope.
@@ -80,8 +118,9 @@ loaded target: it closes/resumes the handle and is not a passive query.
 Use `cockpit_send_prompt` directly, faithfully preserving the user's scope,
 constraints, attachments and distinction between discussion and implementation.
 `immediate` is steering into an active run, not abort, queue clearing or a
-guaranteed separate turn. `enqueue` waits behind existing work. Cancellation is
-a separate action, never an implicit side effect of sending another prompt.
+guaranteed separate turn. `enqueue` waits behind existing work; it does not
+replace the session-selection checks above. Cancellation is a separate action,
+never an implicit side effect of sending another prompt.
 Acceptance is not business completion; unknown outcomes must not be blindly resent.
 
 For a current native ask, get the exact target session and request ID from live
@@ -224,4 +263,6 @@ An unloaded owner may be loaded for a necessary update using its same ID;
 failed or unknown wakes are retained, not automatically retried.
 Do not change roles, create a replacement entrance, move history or change
 connector bindings without user authorization. Do not diagnose these product
-problems at the entrance: pass them to the Assistant responsible session.
+problems at the entrance: select a session responsible for that specific question
+using the same scope, continuity and current-work checks, not a catch-all
+Assistant owner.

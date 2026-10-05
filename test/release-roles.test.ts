@@ -52,7 +52,7 @@ test('shared topic Skill is physically embedded in each role without requiring a
       /Do not perform business reasoning or add your own solution/,
       /including questions about Assistant, its Skill or inbox/,
       /Route before investigating: read-only diagnosis is still business reasoning/,
-      /Only clarify the intended topic\/object or whether the user intends discussion\s+or an execution change/,
+      /Only clarify the intended topic\/object, request scope or discussion-versus-execution\s+intent/,
       /Avoid stock openings/,
       /Waiting needs no acknowledgement or progress announcement/,
       /not mechanical relay or new business reasoning/,
@@ -61,8 +61,14 @@ test('shared topic Skill is physically embedded in each role without requiring a
     ]) assert.match(front, boundary);
     for (const selection of [
       /A shared product name only identifies candidates/,
-      /Reuse requires evidence of\s+the same specific responsibility or a continuing discussion/,
-      /Topic reuse and session reuse are separate\s+decisions/,
+      /Reuse requires evidence of the\s+same specific responsibility or a continuing discussion/,
+      /Topic reuse\s+and session reuse are separate decisions/,
+      /Apply relevant, available\s+responsibility-discovery capabilities and their guidance while choosing/,
+      /Reuse sufficient evidence already read and still\s+current/,
+      /Do not exclude a clearly relevant candidate merely because its recent snippet\s+covers a different subtask/,
+      /material candidate conflicts are resolved, not just when one lookup returns a\s+match/,
+      /After a scope correction, reconsider relevant candidates rather than only\s+validating the first recipient/,
+      /a current subtask or quiet period\s+does not by itself narrow or end an agreement/,
       /recent work goal and\s+phase in native Chat, alongside current Host activity and queues/,
       /Neither `running`, elapsed time nor shell count alone establishes heavy/,
       /unknown\s+activity is not idle/,
@@ -82,13 +88,18 @@ test('shared topic Skill is physically embedded in each role without requiring a
       /stage, completed evidence and remaining dependencies before dispatching/,
       /Message length does not determine recipient or dispatch count/,
       /the current conversation, not unrelated historical matters/,
-      /Organize necessary\s+handoffs from that scope, actual responsibilities and stage dependencies/,
-      /do not require the user to issue each internal step as a separate instruction/,
-      /Clarify genuinely ambiguous scope or intent, not routine internal decomposition/,
+      /Neither one recipient nor multiple recipients is a default/,
+      /Continue an integrated goal with the session responsible for that integration/,
+      /Business decomposition, domain\s+dependencies and trade-offs belong there/,
+      /do not launch a parallel set of\s+assignments from the entrance/,
+      /A partial executor does not gain overall\s+responsibility merely by receiving the first question/,
+      /Organize necessary handoffs from that scope, actual responsibilities and known\s+stage dependencies/,
+      /do not require the user to issue each internal step as a\s+separate instruction/,
+      /Clarify genuinely ambiguous scope or intent, not routine\s+internal decomposition/,
       /Choose the specific recipient needed for each necessary action/,
-      /Preserve existing source and\s+rework ownership/,
-      /a shared outcome does not transfer every responsibility\s+to one session/,
-      /Topic separation does not require new sessions or a message\s+to every owner/,
+      /Preserve\s+existing source and rework ownership/,
+      /a shared outcome does not transfer every\s+responsibility to one session/,
+      /Topic separation does not require new sessions or\s+a message to every owner/,
       /Dispatch only necessary, authorized remaining actions/,
       /development, review\/merge, publication and deployment are distinct\s+stages/,
       /Confirm prerequisites from current native Chat evidence before handing off\s+a dependent stage/,
@@ -116,9 +127,10 @@ test('shared topic Skill is physically embedded in each role without requiring a
       assert.match(front, continuation);
       assert.match(organizer, continuation);
     }
-    assert.match(front, /Do not expand ordinary questions into work orders or add analysis\s+directions or requirements/);
-    assert.match(front, /Clarify ambiguous topics or discussion-versus-execution intent, not business\s+details/);
+    assert.match(front, /Do not expand ordinary questions into work orders or add analysis directions or\s+requirements/);
+    assert.match(front, /Clarify only topic, request scope or discussion-versus-execution intent, not business\s+details/);
     assert.doesNotMatch(front, /Only ambiguity about the intended topic is clarified/);
+    assert.doesNotMatch(front, /cockpit-task|task_read|parent_assignee|work_mode|orchestrate|Task role/);
     assert.equal(role('organizer').mcpServers.assistant.tools.length, 2);
     assert.equal(manifest.instructions, undefined, 'The foreground role must not be injected into all native sessions');
     assert.equal(manifest.frontend, undefined);

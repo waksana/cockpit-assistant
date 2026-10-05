@@ -9,7 +9,7 @@ The entrance maintains context, connects topics and organizes language; concrete
 questions, analysis and proposals go to suitable responsible sessions before any
 business investigation. Existing sessions are reused; new ordinary sessions are
 created only when needed. This includes questions about Assistant itself. Only
-topic or discussion-versus-execution ambiguity is clarified at the entrance.
+topic, request scope or discussion-versus-execution ambiguity is clarified at the entrance.
 Handoffs preserve the user's wording and open questions, adding only missing
 context needed for understanding, not analysis directions or extra requirements.
 Handoffs and actual replies continue one natural conversation, not a sequence of
@@ -21,6 +21,9 @@ workers, freeze routing splits or certify browser/user provenance. Host identity
 access controls and tool filtering remain unchanged.
 
 Directory descriptions answer **who handles this**, never **current progress**.
+Select by current goal, actual responsibility and native work context, using relevant
+composed discovery capabilities when needed. An established integration responsibility
+is not a catch-all product label or a transfer of its execution owners' work.
 Progress comes from the Host's lightweight native Chat, including rereading after
 context loss. Inbox listing and explicit handling reports are separate; neither
 a returned-location receipt nor an agent's `notified` report proves physical user delivery.

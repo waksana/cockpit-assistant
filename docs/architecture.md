@@ -14,7 +14,7 @@ diagnosis and proposals, even when the subject is Assistant itself. The entrance
 can understand references to route correctly, but cannot answer the business
 question or add a solution under the label of summarizing. Only topic lookup and
 summaries of recent contents or established progress remain at the entrance.
-Only topic or discussion-versus-execution ambiguity is clarified there; business
+Only topic, request scope or discussion-versus-execution ambiguity is clarified there; business
 questions continue in their responsible sessions. The shared Skill defines natural
 incremental handoffs: preserve the user's wording and open questions, add only
 missing context needed for understanding, and do not prescribe analysis directions
@@ -163,11 +163,16 @@ current Host Chat, honor attention preferences and preserve uncertainty.
 Guidance does not constitute a service authorization layer. `immediate` steers
 an active run, not aborts it or clears its queue. Ask answers use exact live
 request IDs through Host tools, not guessed dispatch text.
-Session selection considers specific responsibility and discussion continuity
-separately from topic identity, then checks recent native work goals/phases and
-current activity/queues. Product labels only locate candidates. This is shared
-agent guidance, not a dispatch gate, scheduler or workload scoring system;
-queue acceptance does not establish suitability.
+Session selection starts with the current goal and intent, then identifies actual
+responsibility using the directory, recent search and relevant composed discovery
+capabilities. Clearly relevant candidates are not excluded by recent snippets alone;
+scope corrections reopen the comparison, not automatically the execution. Native
+Chat and current activity/queues establish context and suitability, not a substitute
+for enduring scope. An existing integration owner retains business decomposition
+and its concrete execution owners; a batch of independently owned deliveries instead
+needs only the authorized remaining handoffs. This is shared agent guidance, not a
+dispatch gate, scheduler, workload score or hard dependency on another module.
+Queue acceptance does not establish suitability.
 
 ## Routing examples and evaluation boundary
 
@@ -179,9 +184,12 @@ queue acceptance does not establish suitability.
 | "Why did you send such a long message?" continuing a routing discussion | Continue the question in the suitable discussion session, resolving "you" to Assistant only if needed and adding only missing facts about the message. Do not append an analysis agenda, required recommendations or a reporting template. |
 | "Is Assistant inbox broken?" | Select a session responsible for this inbox question using scope, continuity and current-work evidence; do not inspect inbox health at the entrance as a diagnostic shortcut. |
 | An independent Assistant role question while a product-related session implements another change | Prefer a matching existing discussion session; only after necessary lookup finds none suitable, create an ordinary session for that specific discussion. Do not default to the implementation queue. |
+| An integrated goal spans several areas and a clearly relevant candidate's recent snippet covers only one subtask | Use relevant available discovery guidance and native Chat to establish the candidate's actual scope. If it already owns integration, continue there and retain its execution owners rather than splitting the goal at the entrance. |
+| The user corrects a partial request to an overall goal after one recipient was chosen | Reconsider the relevant candidates and responsibility evidence, not just the first recipient's current work. The correction alone does not authorize duplicate dispatch or cancellation. |
+| Current evidence already establishes a suitable recipient | Reuse it; do not require another metadata lookup or a full directory scan merely to satisfy a checklist. |
 | A correction, constraint, material or answer needed by an active execution | Keep the executing session as recipient despite its workload; answer its exact current ask or choose enqueue/authorized steering according to urgency and intent. |
 | A candidate is `running`, has a shell or has been active for a long time | Combine recent native Chat goals/phases with current activity and queues; no one signal proves heavy work, and unknown activity does not prove idle. |
-| A busy candidate has a superior or several related sessions | Do not mechanically escalate or broadcast; select the specific recipient needed for this message. |
+| A busy candidate has a superior or several related sessions | Do not mechanically escalate or broadcast; select the specific recipient needed for each necessary action. |
 | "Merge both changes, then deploy" when one change is already merged and published | Preserve each source/rework responsibility, reuse completed evidence and dispatch only authorized remaining work. Confirm prerequisites before a dependent stage; a shared operation's executor does not inherit all source ownership. |
 | "Should these be separate topics, with deployment afterwards?" during a discussion of the Assistant's working method | Interpret the surrounding conversation; clarify discussion-versus-execution intent if ambiguous before changing execution. Do not turn the example into reassignment, retries or a message to every owner. Separate topics do not require new sessions. |
 | "Change that" with multiple plausible topics | Clarify which topic/object, not implementation details. |

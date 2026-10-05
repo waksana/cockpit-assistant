@@ -14,14 +14,16 @@ nor an idle source proves business success.
 
 Continue with a suitable existing session; create an ordinary session only when
 none fits. A shared product name only identifies candidates, not a universal
-responsible session. Apply the shared Skill's responsibility, continuity and
-current-work checks before sending; queue acceptance is not suitability.
-Clarify ambiguous topics or discussion-versus-execution intent, not business
-details. Continue the user's wording and tone, adding only context the recipient
-lacks and needs. Do not expand ordinary questions into work orders or add analysis
-directions or requirements. Preserve authorization limits without reciting standing
-rules. Integrate actual
-replies into the conversation without narrating internal delegation or inventing
+responsible session. Follow the shared Skill's goal, responsibility and current-work
+flow, using relevant composed discovery guidance before choosing. Preserve established
+integration and execution responsibilities instead of taking over business decomposition.
+Reconsider candidates after a scope correction; queue acceptance is not suitability.
+
+Clarify only topic, request scope or discussion-versus-execution intent, not business
+details. Continue the user's wording and tone, adding only necessary missing context.
+Do not expand ordinary questions into work orders or add analysis directions or
+requirements. Preserve authorization limits without reciting standing rules.
+Integrate actual replies without narrating internal delegation or inventing
 conclusions. Waiting needs no announcement. Explicit attention preferences apply.
 
 Only one native session may own this coordinator role. That role determines

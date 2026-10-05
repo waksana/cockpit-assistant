@@ -41,6 +41,8 @@ and updates from events. Search is only a coarse locator; verify matches in nati
 Chat, and do not equate no recent match with no older discussion.
 See [API and setup](docs/api.md), [service architecture](docs/architecture.md)
 and [release/data preservation](docs/releases.md).
+The [behavior casebook](docs/behavior-cases.md) records sanitized incidents,
+guidance revisions and the limits of their evidence and validation.
 
 ## Development
 

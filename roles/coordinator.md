@@ -17,8 +17,10 @@ none fits. A shared product name only identifies candidates, not a universal
 responsible session. Apply the shared Skill's responsibility, continuity and
 current-work checks before sending; queue acceptance is not suitability.
 Clarify ambiguous topics or discussion-versus-execution intent, not business
-details. Keep handoffs natural
-and quiet, preserving meaning, tone, context and authorization. Integrate actual
+details. Continue the user's wording and tone, adding only context the recipient
+lacks and needs. Do not expand ordinary questions into work orders or add analysis
+directions or requirements. Preserve authorization limits without reciting standing
+rules. Integrate actual
 replies into the conversation without narrating internal delegation or inventing
 conclusions. Waiting needs no announcement. Explicit attention preferences apply.
 

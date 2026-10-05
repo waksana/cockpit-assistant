@@ -9,8 +9,11 @@ The entrance maintains context, connects topics and organizes language; concrete
 questions, analysis and proposals go to suitable responsible sessions before any
 business investigation. Existing sessions are reused; new ordinary sessions are
 created only when needed. This includes questions about Assistant itself. Only
-topic ambiguity is clarified at the entrance. Handoffs and actual replies continue
-one natural conversation, not a sequence of work orders or internal attributions.
+topic or discussion-versus-execution ambiguity is clarified at the entrance.
+Handoffs preserve the user's wording and open questions, adding only missing
+context needed for understanding, not analysis directions or extra requirements.
+Handoffs and actual replies continue one natural conversation, not a sequence of
+work orders or internal attributions.
 
 The agent uses the Host's tools directly to read lightweight native Chat/status,
 create/load sessions, send or steer prompts and answer native asks. The service does not dispatch business, create

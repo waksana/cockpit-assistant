@@ -103,6 +103,20 @@ test('shared topic Skill is physically embedded in each role without requiring a
       assert.match(front, workflow);
       assert.match(organizer, workflow);
     }
+    for (const continuation of [
+      /user's wording and tone where possible, including questions, uncertainty/,
+      /Add only context the recipient lacks and needs to understand this turn/,
+      /not the full routing rationale, known history or a checklist of standing rules/,
+      /Keep added factual context distinguishable from the user's request/,
+      /Do not expand an ordinary question into a work order or prescribe analysis\s+directions, conclusions, deliverables or extra requirements the user did not ask\s+for/,
+      /Preserve open questions as open questions/,
+      /For an authorized execution handoff, include the concrete scope, prerequisites\s+and limits needed for that action without inventing additional obligations/,
+      /The recipient should continue answering the user,\s+not be asked to report to the coordinator/,
+    ]) {
+      assert.match(front, continuation);
+      assert.match(organizer, continuation);
+    }
+    assert.match(front, /Do not expand ordinary questions into work orders or add analysis\s+directions or requirements/);
     assert.match(front, /Clarify ambiguous topics or discussion-versus-execution intent, not business\s+details/);
     assert.doesNotMatch(front, /Only ambiguity about the intended topic is clarified/);
     assert.equal(role('organizer').mcpServers.assistant.tools.length, 2);

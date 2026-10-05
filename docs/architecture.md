@@ -14,9 +14,12 @@ diagnosis and proposals, even when the subject is Assistant itself. The entrance
 can understand references to route correctly, but cannot answer the business
 question or add a solution under the label of summarizing. Only topic lookup and
 summaries of recent contents or established progress remain at the entrance.
-Only topic ambiguity is clarified there; business questions continue in their
-responsible sessions. The shared Skill defines natural incremental handoffs
-and faithful reply integration without work-order templates or routine attribution.
+Only topic or discussion-versus-execution ambiguity is clarified there; business
+questions continue in their responsible sessions. The shared Skill defines natural
+incremental handoffs: preserve the user's wording and open questions, add only
+missing context needed for understanding, and do not prescribe analysis directions
+or extra requirements. Reply integration is faithful, without work-order templates
+or routine attribution.
 
 The agent uses direct Host tools for session creation, prompt/steering and native
 ask answers. The module supplies a responsibility directory, recent-session
@@ -173,6 +176,7 @@ queue acceptance does not establish suitability.
 | "Find our export topic" / "What has changed recently?" | Locate topics and summarize actual recent evidence without starting new business work. |
 | "How should the export work?" | Reuse a suitable export session, or search recent candidates and create only if none fits. Do not ask about devices or propose formats at the entrance. |
 | "Why are you analyzing business questions yourself?" | Resolve "you" to Assistant coordinator and select a session matching this routing discussion, not a catch-all product owner; do not first diagnose the Skill. |
+| "Why did you send such a long message?" continuing a routing discussion | Continue the question in the suitable discussion session, resolving "you" to Assistant only if needed and adding only missing facts about the message. Do not append an analysis agenda, required recommendations or a reporting template. |
 | "Is Assistant inbox broken?" | Select a session responsible for this inbox question using scope, continuity and current-work evidence; do not inspect inbox health at the entrance as a diagnostic shortcut. |
 | An independent Assistant role question while a product-related session implements another change | Prefer a matching existing discussion session; only after necessary lookup finds none suitable, create an ordinary session for that specific discussion. Do not default to the implementation queue. |
 | A correction, constraint, material or answer needed by an active execution | Keep the executing session as recipient despite its workload; answer its exact current ask or choose enqueue/authorized steering according to urgency and intent. |

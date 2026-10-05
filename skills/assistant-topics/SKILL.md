@@ -89,13 +89,19 @@ busy. Use the exact current native ask when applicable. Otherwise choose enqueue
 or authorized steering according to urgency and the user's intent; independent
 discussion never authorizes interrupting or cancelling existing work.
 Do not mechanically redirect to a superior or broadcast to multiple recipients.
-Choose the specific recipient needed for this message, not everyone related to
+Choose the specific recipient needed for each necessary action, not everyone related to
 the product. Being able to enqueue does not make a session suitable to receive.
 
 ## Joint requests and workflow discussion
 
 For a joint request, distinguish each concrete responsibility, its current
 stage, completed evidence and remaining dependencies before dispatching.
+Message length does not determine recipient or dispatch count: a one-sentence
+"handle everything" or "deploy everything" refers to the work identified in
+the current conversation, not unrelated historical matters. Organize necessary
+handoffs from that scope, actual responsibilities and stage dependencies;
+do not require the user to issue each internal step as a separate instruction.
+Clarify genuinely ambiguous scope or intent, not routine internal decomposition.
 This is coordination, not business reasoning. Preserve existing source and
 rework ownership; a shared outcome does not transfer every responsibility
 to one session. Topic separation does not require new sessions or a message

@@ -80,6 +80,12 @@ test('shared topic Skill is physically embedded in each role without requiring a
     }
     for (const workflow of [
       /stage, completed evidence and remaining dependencies before dispatching/,
+      /Message length does not determine recipient or dispatch count/,
+      /the current conversation, not unrelated historical matters/,
+      /Organize necessary\s+handoffs from that scope, actual responsibilities and stage dependencies/,
+      /do not require the user to issue each internal step as a separate instruction/,
+      /Clarify genuinely ambiguous scope or intent, not routine internal decomposition/,
+      /Choose the specific recipient needed for each necessary action/,
       /Preserve existing source and\s+rework ownership/,
       /a shared outcome does not transfer every responsibility\s+to one session/,
       /Topic separation does not require new sessions or a message\s+to every owner/,

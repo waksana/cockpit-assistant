@@ -59,6 +59,25 @@ test('shared topic Skill is physically embedded in each role without requiring a
       /cannot select a different session/,
       /Do not create a new session for each follow-up or a separate topic specialist/,
     ]) assert.match(front, boundary);
+    for (const selection of [
+      /A shared product name only identifies candidates/,
+      /Reuse requires evidence of\s+the same specific responsibility or a continuing discussion/,
+      /Topic reuse and session reuse are separate\s+decisions/,
+      /recent work goal and\s+phase in native Chat, alongside current Host activity and queues/,
+      /Neither `running`, elapsed time nor shell count alone establishes heavy/,
+      /unknown\s+activity is not idle/,
+      /Independent questions must not default to the queue/,
+      /Prefer a matching\s+existing discussion session/,
+      /Only when necessary lookup finds none suitable,\s+create an ordinary session with a specific discussion goal/,
+      /Corrections, constraints, materials and question answers required by current\s+execution still belong to the executing session/,
+      /Use the exact current native ask/,
+      /Do not mechanically redirect to a superior or broadcast to multiple recipients/,
+      /Being able to enqueue does not make a session suitable to receive/,
+      /not a catch-all\s+Assistant owner/,
+    ]) {
+      assert.match(front, selection);
+      assert.match(organizer, selection);
+    }
     assert.equal(role('organizer').mcpServers.assistant.tools.length, 2);
     assert.equal(manifest.instructions, undefined, 'The foreground role must not be injected into all native sessions');
     assert.equal(manifest.frontend, undefined);

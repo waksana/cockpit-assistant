@@ -151,6 +151,11 @@ current Host Chat, honor attention preferences and preserve uncertainty.
 Guidance does not constitute a service authorization layer. `immediate` steers
 an active run, not aborts it or clears its queue. Ask answers use exact live
 request IDs through Host tools, not guessed dispatch text.
+Session selection considers specific responsibility and discussion continuity
+separately from topic identity, then checks recent native work goals/phases and
+current activity/queues. Product labels only locate candidates. This is shared
+agent guidance, not a dispatch gate, scheduler or workload scoring system;
+queue acceptance does not establish suitability.
 
 ## Routing examples and evaluation boundary
 
@@ -158,8 +163,12 @@ request IDs through Host tools, not guessed dispatch text.
 | --- | --- |
 | "Find our export topic" / "What has changed recently?" | Locate topics and summarize actual recent evidence without starting new business work. |
 | "How should the export work?" | Reuse a suitable export session, or search recent candidates and create only if none fits. Do not ask about devices or propose formats at the entrance. |
-| "Why are you analyzing business questions yourself?" | Resolve "you" to Assistant coordinator and route to the Assistant responsible session, without first diagnosing the Skill. |
-| "Is Assistant inbox broken?" | Route immediately to the Assistant responsible session; do not inspect health first as a diagnostic shortcut. |
+| "Why are you analyzing business questions yourself?" | Resolve "you" to Assistant coordinator and select a session matching this routing discussion, not a catch-all product owner; do not first diagnose the Skill. |
+| "Is Assistant inbox broken?" | Select a session responsible for this inbox question using scope, continuity and current-work evidence; do not inspect inbox health at the entrance as a diagnostic shortcut. |
+| An independent Assistant role question while a product-related session implements another change | Prefer a matching existing discussion session; only after necessary lookup finds none suitable, create an ordinary session for that specific discussion. Do not default to the implementation queue. |
+| A correction, constraint, material or answer needed by an active execution | Keep the executing session as recipient despite its workload; answer its exact current ask or choose enqueue/authorized steering according to urgency and intent. |
+| A candidate is `running`, has a shell or has been active for a long time | Combine recent native Chat goals/phases with current activity and queues; no one signal proves heavy work, and unknown activity does not prove idle. |
+| A busy candidate has a superior or several related sessions | Do not mechanically escalate or broadcast; select the specific recipient needed for this message. |
 | "Change that" with multiple plausible topics | Clarify which topic/object, not implementation details. |
 | A responsible session asks a business question | Present its actual question naturally and return the user's answer to that session; do not invent additional business questions. |
 | A source reports a proposal or partial result | Integrate it naturally as a proposal or partial result, not completed work or the entrance's new recommendation. |

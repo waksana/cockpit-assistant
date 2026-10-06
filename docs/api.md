@@ -110,6 +110,12 @@ excluded, with errors and coverage reported rather than stale success.
 bounded-window/truncation counts and refresh/skip/drift counts. `resultLimited`
 indicates the search budget may have omitted matches. Ready means the current
 bounded discovery pass is covered, not that all historical messages are indexed.
+The additive `deferred` count identifies stale entries whose passive metadata
+read returned `SESSION_TRANSITION`. Such entries are excluded from results,
+not marked failed or deleted; a search that encounters the transition includes
+its session ID and the fixed `SESSION_TRANSITION` diagnostic in `errors`.
+They await a later natural native/content or identity/control/queue lifecycle
+notification (or startup), without polling or an immediate retry.
 No recent match does not establish that an older topic never existed.
 Search neither resolves inbox entries nor advances any agent read checkpoint.
 
@@ -248,6 +254,10 @@ repeating an uncertain user-facing presentation.
 
 Current ask IDs are revalidated against loaded native state. Stale asks expire;
 unavailable/unloaded asks remain pending without being presented as live.
+If required ask metadata is unreadable during a lifecycle transition, an
+explicit `assistant_inbox` request (including `peek`) propagates
+`SESSION_TRANSITION`, without returning a success-shaped partial page or
+discarding that ask.
 Disposition itself does not answer a question. The agent uses the exact current
 request ID with `cockpit_respond_ask`; attention/semantic decisions remain agent
 guidance, not service original-text auditing.
@@ -266,12 +276,29 @@ state and time; `pendingUpdates` counts source locations, not business tasks.
 Passive health reads discover saved role ownership but do not load/send or call
 role-selection availability.
 
+When that passive target sample returns `SESSION_TRANSITION`, `current.status`
+is `deferred` with the fixed `code:"SESSION_TRANSITION"`; it is not unconfigured,
+idle or unloaded. `health.observations` adds `coordinatorDeferred`,
+`deferredSourceCount`, a bodyless `deferredSources` list of `{sessionId,code}`
+(at most 100 entries), and `truncated`. Source records are bounded by registered
+sources and cleared on a definitive successful read or removal. They describe
+in-process observations, not delivery receipts; persisted inbox pointers and
+historical wake attempts retain their separate meaning. No later natural
+notification means no claimed recovery. Activity-only metadata-read feedback
+does not reschedule observations.
+
 Ordinary updates await genuine source `session.idle`, known inactive work and
 empty pending/steering queues; `assistant.turn_end` is not completion. Valid asks
 bypass source-idle waiting. An eligible update may load the sole original
 foreground. Loaded handles are never reloaded, deleted IDs are not replaced.
 Source/foreground are rechecked before an idle `enqueue` location-only reminder.
 An accepted wake is not a user-facing reply or business result.
+An initially deferred passive sample cannot start a load or reserve a notice.
+After a load is confirmed, passive revalidation may defer the prompt without
+repeating that load. The same error code during an actual load/prompt or
+uncertain post-load confirmation remains reported with its original
+unknown/failed receipt and never authorizes replay. Other metadata errors
+retain their existing behavior.
 
 No role owner reports an unconfigured target; conflicting or unreadable ownership
 reports an explicit error. Failed/unknown loads preserve pending updates and are not blindly retried.

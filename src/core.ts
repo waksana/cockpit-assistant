@@ -1,6 +1,6 @@
 import type { McpInvocationMeta, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
 import { z } from 'zod';
-import { BusinessError, errorText, requireFact } from './errors.ts';
+import { BusinessError, errorText, requireFact, sampleMetadata, type MetadataSample } from './errors.ts';
 import type { Caller, Gateway } from './gateway.ts';
 import { Store, fingerprint, type InboxItem, type Topic } from './store.ts';
 import { Inbox, checkpointInput, resolveInput } from './inbox.ts';
@@ -52,6 +52,8 @@ export class Assistant {
   private observations = new Map<string, Promise<void>>();
   private awaitingIdle = new Set<string>();
   private sourceVersions = new Map<string, number>();
+  private deferredSources = new Map<string, number>();
+  private coordinatorDeferred = false;
   private foregroundObservation = { sessionId: '', version: 0 };
   private stopped = false;
   constructor(readonly store: Store, readonly native: Gateway, readonly config: Config,
@@ -86,7 +88,7 @@ export class Assistant {
       case 'assistant_resolve': return this.inbox.resolve(caller, resolveInput.parse(input));
       case 'assistant_checkpoint': return this.inbox.checkpoint(caller, checkpointInput.parse(input));
       case 'assistant_inbox': {
-        const query = inboxInput.parse(input ?? {}), sources = await this.refreshQuestions();
+        const query = inboxInput.parse(input ?? {}), sources = await this.refreshQuestions(false);
         const available = new Set(this.store.inbox().filter(item => item.kind !== 'ask'
           || liveQuestion(this.currentSample(item.session_id, sources.get(item.session_id)), item)).map(item => item.id));
         if (query.peek) return { count: available.size };
@@ -111,17 +113,36 @@ export class Assistant {
     const checkedAt = Date.now(), wake = this.store.foregroundWake();
     const lastWakeAttempt = wake ? { ...wake, at: this.store.receipt('foreground-wake')?.createdAt ?? null } : null;
     try {
-      const meta = await this.native.foreground();
+      const sample = await this.sampleForeground();
+      if (sample.state === 'deferred') return {
+        foregroundSessionId: this.native.foregroundId(), destination: 'coordinator-role' as const,
+        current: { checkedAt, status: 'deferred', code: 'SESSION_TRANSITION' },
+        lastWakeAttempt, pendingUpdates: this.store.inbox().length, observations: this.observationHealth(),
+      };
+      const meta = sample.meta;
       return { foregroundSessionId: meta?.sessionId ?? null, destination: 'coordinator-role' as const,
         current: { checkedAt, sessionId: meta?.sessionId ?? null, loaded: meta?.loaded ?? null,
         status: meta?.status ?? 'unconfigured', activity: meta?.activity ?? null,
         ask: meta?.ask ? { requestId: meta.ask.requestId } : null },
-      lastWakeAttempt, pendingUpdates: this.store.inbox().length };
+      lastWakeAttempt, pendingUpdates: this.store.inbox().length, observations: this.observationHealth() };
     } catch (error) {
       return { foregroundSessionId: this.native.foregroundId(), destination: 'coordinator-role' as const,
         current: { checkedAt, status: 'unknown', error: errorText(error) },
-        lastWakeAttempt, pendingUpdates: this.store.inbox().length };
+        lastWakeAttempt, pendingUpdates: this.store.inbox().length, observations: this.observationHealth() };
     }
+  }
+  private observationHealth() {
+    for (const sessionId of this.deferredSources.keys())
+      if (!this.store.managed(sessionId)) this.deferredSources.delete(sessionId);
+    return { coordinatorDeferred: this.coordinatorDeferred, deferredSourceCount: this.deferredSources.size,
+      deferredSources: [...this.deferredSources.keys()].slice(0, 100).map(sessionId => ({
+        sessionId, code: 'SESSION_TRANSITION' as const,
+      })), truncated: this.deferredSources.size > 100 };
+  }
+  private async sampleForeground() {
+    const sample = await sampleMetadata(() => this.native.foreground());
+    if (!this.stopped) this.coordinatorDeferred = sample.state === 'deferred';
+    return sample;
   }
   private async editTopic(caller: Caller, value: z.infer<typeof topicInput>) {
     const key = `topic:${caller.sessionId}:${caller.toolCallId}`, hash = fingerprint(value);
@@ -142,14 +163,24 @@ export class Assistant {
         session_id: sessionId, mapping_state: preserveMapping ? current.mapping_state : sessionId ? 'bound' : 'unbound',
         mapping_error: current?.mapping_error ?? null, creation_receipt: current?.creation_receipt ?? null };
       this.store.saveTopic(topic); this.store.remember(key, hash);
+      for (const sessionId of this.deferredSources.keys())
+        if (!this.store.managed(sessionId)) this.deferredSources.delete(sessionId);
       return displayTopic(topic);
     });
   }
+  invalidateObservation(sessionId: string): void {
+    if (this.stopped) return;
+    if (sessionId === this.foregroundObservation.sessionId) this.foregroundObservation.version++;
+    if (!this.store.managed(sessionId)) {
+      this.deferredSources.delete(sessionId);
+      return;
+    }
+    this.sourceVersions.set(sessionId, (this.sourceVersions.get(sessionId) ?? 0) + 1);
+  }
   observe(sessionId: string, event?: NativeChatEvent): Promise<void> {
     if (this.stopped) return Promise.resolve();
-    if (sessionId === this.foregroundObservation.sessionId) this.foregroundObservation.version++;
+    this.invalidateObservation(sessionId);
     if (!this.store.managed(sessionId)) return Promise.resolve();
-    this.sourceVersions.set(sessionId, (this.sourceVersions.get(sessionId) ?? 0) + 1);
     const run = () => this.observeSource(sessionId, event);
     const previous = this.observations.get(sessionId), operation = previous ? previous.then(run, run) : run();
     this.observations.set(sessionId, operation);
@@ -158,9 +189,7 @@ export class Assistant {
     return operation;
   }
   private async observeSource(sessionId: string, event?: NativeChatEvent): Promise<void> {
-    if (this.stopped) return;
-    const meta = await this.native.session(sessionId);
-    if (!meta) return;
+    if (this.stopped || !this.store.managed(sessionId)) return;
     if (event && primary(event) && event.type === 'assistant.message'
       && (typeof event.data.content === 'string' && event.data.content.trim() || Array.isArray(event.data.attachments) && event.data.attachments.length)) {
       const nativeId = typeof event.data.messageId === 'string' ? event.data.messageId : event.id;
@@ -171,23 +200,35 @@ export class Assistant {
       if (this.store.enqueuePointer(sessionId, event.id, 'reply',
         { eventId: event.id, timestamp: event.timestamp ?? null, type: event.type })) this.awaitingIdle.add(sessionId);
     }
-    if (event && rootEvent(event) && event.type === 'session.idle'
-      || meta.status === 'error' && settled(meta)) this.awaitingIdle.delete(sessionId);
-    if (meta.ask) this.store.enqueuePointer(sessionId, meta.ask.requestId, 'ask');
+    if (event && rootEvent(event) && event.type === 'session.idle') this.awaitingIdle.delete(sessionId);
+    const sample = await this.sampleSource(sessionId);
+    if (this.stopped) return;
+    const meta = this.currentSample(sessionId, sample);
+    if (meta?.status === 'error' && settled(meta)) this.awaitingIdle.delete(sessionId);
+    if (this.store.managed(sessionId) && meta?.loaded && meta.ask)
+      this.store.enqueuePointer(sessionId, meta.ask.requestId, 'ask');
     await this.notify();
   }
-  private async sampleSource(sessionId: string) {
+  private async sampleSource(sessionId: string, defer = true) {
     const version = this.sourceVersions.get(sessionId) ?? 0;
-    return { version, meta: await this.native.session(sessionId) };
+    const sample: MetadataSample<PublicSessionMeta | null> = defer && this.deferredSources.get(sessionId) === version
+      ? { state: 'deferred' }
+      : defer ? await sampleMetadata(() => this.native.session(sessionId))
+        : { state: 'read', meta: await this.native.session(sessionId) };
+    if (!this.stopped && version === (this.sourceVersions.get(sessionId) ?? 0)) {
+      if (sample.state === 'deferred' && this.store.managed(sessionId)) this.deferredSources.set(sessionId, version);
+      else this.deferredSources.delete(sessionId);
+    }
+    return { version, ...sample };
   }
-  private currentSample(sessionId: string, sample?: { version: number; meta: PublicSessionMeta | null }) {
-    return sample && sample.version === (this.sourceVersions.get(sessionId) ?? 0) ? sample.meta : null;
+  private currentSample(sessionId: string, sample?: Awaited<ReturnType<Assistant['sampleSource']>>) {
+    return sample?.state === 'read' && sample.version === (this.sourceVersions.get(sessionId) ?? 0) ? sample.meta : null;
   }
-  private async refreshQuestions() {
+  private async refreshQuestions(defer = true) {
     const sessions = new Map<string, Awaited<ReturnType<Assistant['sampleSource']>>>();
     for (const item of this.store.inbox()) {
       if (item.kind !== 'ask' || !this.store.managed(item.session_id)) continue;
-      if (!sessions.has(item.session_id)) sessions.set(item.session_id, await this.sampleSource(item.session_id));
+      if (!sessions.has(item.session_id)) sessions.set(item.session_id, await this.sampleSource(item.session_id, defer));
     }
     for (const item of this.store.inbox()) {
       if (item.kind !== 'ask') continue;
@@ -234,7 +275,9 @@ export class Assistant {
     if (this.stopped || !this.store.inbox().some(item => item.notice_state === 'pending')) return;
     let sources = await this.noticeSources();
     if (this.stopped || !this.eligibleNotices(sources).size) return;
-    let meta = await this.native.foreground();
+    const foreground = await this.sampleForeground();
+    if (foreground.state === 'deferred') return;
+    let meta = foreground.meta;
     if (this.stopped || !meta) return;
     const sessionId = meta.sessionId;
     requireFact(this.native.foregroundId() === sessionId, 'FOREGROUND_CHANGED',
@@ -267,7 +310,9 @@ export class Assistant {
     const foregroundVersion = this.foregroundObservation.version;
     sources = await this.noticeSources();
     if (this.stopped) return;
-    const current = await this.native.foreground();
+    const confirmation = await this.sampleForeground();
+    if (confirmation.state === 'deferred') return;
+    const current = confirmation.meta;
     requireFact(this.native.foregroundId() === sessionId && current?.sessionId === sessionId,
       'FOREGROUND_CHANGED', 'Foreground selection changed; no message was sent');
     if (this.stopped || !foregroundIdle(current) || this.foregroundObservation.version !== foregroundVersion) return;

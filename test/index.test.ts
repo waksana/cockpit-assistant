@@ -157,6 +157,132 @@ async function assertIngressStopped(backend: ModuleBackend, f: ReturnType<typeof
   assert.equal(f.calls.length, before, 'Stopped callbacks do not start even passive Host reads');
 }
 
+test('activation defers source transitions without activity feedback and recovers on natural control events', async t => {
+  const f = fixture(t);
+  f.sessions.get('source')!.status = 'running';
+  const backend = await f.activate();
+  await backend.onReady!();
+  const unavailable = new Set(['source']);
+  const call = f.context.host.call;
+  const feedback: Promise<unknown>[] = [];
+  f.context.host.call = (name, body) => {
+    if (name === 'session/get') {
+      const sessionId = (body as { sessionId: string }).sessionId;
+      feedback.push(Promise.resolve(backend.controlEvents!.handle({
+        type: 'session/patch', sessionId, activeOperations: 1,
+      })));
+      if (unavailable.has(sessionId)) throw Object.assign(new Error('metadata transition'), { code: 'SESSION_TRANSITION' });
+    }
+    return call(name, body);
+  };
+  const observation = (event: NativeChatEvent) => backend.events!.handle({ sessionId: 'source', cwd: '/synthetic', event });
+  await observation({ id: 'new-message', type: 'assistant.message', data: { messageId: 'new-reply', content: 'Not mirrored' } });
+  await observation({ id: 'idle', type: 'session.idle', ephemeral: true, data: {} });
+  await Promise.all(feedback);
+  assert.equal(f.state().inbox.length, 2);
+  assert.ok(f.state().inbox.every(item => item.notice_state === 'pending'));
+  assert.equal(f.state().inbox[1]!.text, '');
+  const state = await backend.routes.find(route => route.path === '/state')!.handler({
+    params: {}, query: {}, headers: {}, body: null, signal: f.context.signal,
+  });
+  assert.equal((state.body as { health: { observations: { deferredSourceCount: number } } }).health.observations.deferredSourceCount, 1);
+  assert.equal(f.calls.some(call => call.name === 'prompt' || call.name === 'session/load'), false);
+  assert.deepEqual(f.errors, []);
+  unavailable.clear(); f.sessions.get('source')!.status = 'idle';
+  await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source', resources: ['control', 'queue'] });
+  await Promise.all(feedback);
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', loaded: true });
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  assert.deepEqual(f.errors, []);
+  await backend.onStop!();
+  await assertIngressStopped(backend, f);
+});
+
+test('activation lifecycle notifications wake only explicitly deferred recent entries, never activity-read feedback', async t => {
+  const f = fixture(t, false);
+  const refresh = t.mock.method(RecentSessions.prototype, 'resumeDeferred');
+  const start = t.mock.method(RecentSessions.prototype, 'start');
+  let transitioning = true;
+  f.respond((name, result) => {
+    if (transitioning && name === 'session/get') throw Object.assign(new Error('metadata transition'), { code: 'SESSION_TRANSITION' });
+    return result;
+  });
+  const backend = await f.activate();
+  await backend.onReady!();
+  const instance = start.mock.calls[0]!.this as RecentSessions;
+  await instance.waitIdle();
+  assert.equal(instance.health().deferred, 2);
+  const calls = f.calls.length, resumes = refresh.mock.callCount();
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', activeOperations: 1 });
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', controls: null });
+  await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source', resources: ['usage'] });
+  await instance.waitIdle();
+  assert.equal(f.calls.length, calls);
+  assert.equal(refresh.mock.callCount(), resumes);
+  transitioning = false;
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', closing: false, loaded: true });
+  await instance.waitIdle();
+  assert.equal(instance.health().deferred, 1);
+  assert.equal(instance.health().current, 1);
+  assert.deepEqual(f.errors, []);
+});
+
+test('failed metadata controls patches invalidate evidence without recursively scheduling reads', async t => {
+  const f = fixture(t);
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  const backend = await f.activate();
+  const call = f.context.host.call, failure = new Error('Native metadata RPC unavailable');
+  let reads = 0;
+  f.context.host.call = (name, body) => {
+    if (name === 'session/get' && 'sessionId' in body && body.sessionId === 'source') {
+      reads++;
+      if (reads === 5) f.stop();
+      void backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', activity: null });
+      void backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', controls: null });
+      throw failure;
+    }
+    return call(name, body);
+  };
+  await backend.onReady!();
+  await setImmediate();
+  assert.equal(reads, 1, 'Read failure feedback cannot start another read');
+  assert.deepEqual(f.errors, [failure], 'The genuine original failure is still reported');
+  assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+  assert.equal(f.calls.some(call => call.name === 'prompt' || call.name === 'session/load'), false);
+});
+
+test('activation defers unreadable coordinator identity then loads only its fresh original owner on a natural event', async t => {
+  const f = fixture(t);
+  f.sessions.get('front')!.loaded = false;
+  let transitioning = true;
+  f.respond((name, result) => {
+    if (transitioning && name === 'session/get'
+      && (result as ModuleHostIntentResult<'session/get'>).meta?.sessionId === 'front')
+      throw Object.assign(new Error('metadata transition'), { code: 'SESSION_TRANSITION' });
+    return result;
+  });
+  const backend = await f.activate();
+  await backend.onReady!();
+  assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
+  const response = await backend.routes.find(route => route.path === '/state')!.handler({
+    params: {}, query: {}, headers: {}, body: null, signal: f.context.signal,
+  });
+  const health = (response.body as { health: { foregroundSessionId: string | null; current: { status: string } } }).health;
+  assert.equal(health.current.status, 'deferred');
+  assert.equal(health.foregroundSessionId, null, 'No synthetic selected role when discovery could not read metadata');
+  assert.equal(f.state().wake, null);
+  transitioning = false;
+  await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'front', resources: ['identity'] });
+  assert.deepEqual(f.calls.filter(call => call.name === 'session/load' || call.name === 'prompt').map(call => call.name),
+    ['session/load', 'prompt']);
+  assert.equal(f.state().wake!.state, 'loaded');
+  await backend.events!.handle({ sessionId: 'front', cwd: '/synthetic',
+    event: { id: 'front-idle', type: 'session.idle', data: {} } });
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  assert.deepEqual(f.errors, []);
+});
+
 test('an inherited Host prompt guard failure preserves the inbox without replay from later events', async t => {
   const f = fixture(t), activePrompt = new AsyncLocalStorage<boolean>();
   const call = f.context.host.call;

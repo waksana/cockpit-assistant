@@ -99,6 +99,209 @@ function pending(f: ReturnType<typeof fixture>, id = 'pending') {
   f.pointer(id);
 }
 
+const transition = () => Object.assign(new Error('Native session metadata is unavailable during a lifecycle transition'),
+  { code: 'SESSION_TRANSITION', statusCode: 409 });
+
+test('transition observations preserve bodyless reply/error/abort pointers and idle without self-retrying', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    f.sessions.get('assistant')!.loaded = false;
+    let reads = 0;
+    f.onMeta(async id => { if (id === 'a') { reads++; throw transition(); } });
+    await f.assistant.observe('a', message('reply', 'Must not be stored'));
+    await f.assistant.observe('a', { id: 'error', type: 'session.error', data: { message: 'Private error body' } });
+    await f.assistant.observe('a', { id: 'abort', type: 'abort', data: {} });
+    await f.assistant.observe('a', idle());
+    assert.equal(reads, 4, 'One unreadable read per natural observation; notify does not immediately retry it');
+    assert.equal(f.store.inbox().length, 3);
+    assert.ok(f.store.inbox().every(item => item.text === '' && item.notice_state === 'pending'));
+    assert.equal(f.store.source(f.store.inbox()[0]!.id)!.eventId, 'reply');
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(f.errors, []);
+    assert.deepEqual((await f.assistant.health()).observations.deferredSources, [{ sessionId: 'a', code: 'SESSION_TRANSITION' }]);
+    await f.assistant.notify();
+    assert.equal(reads, 4);
+    f.onMeta(null);
+    await Promise.all([f.assistant.observe('a'), f.assistant.notify(), f.assistant.notify()]);
+    assert.deepEqual(f.calls.map(call => call.name), ['session/load', 'prompt']);
+    assert.equal((await f.assistant.health()).observations.deferredSourceCount, 0);
+    await f.assistant.observe('a', message('reply'));
+    await f.assistant.observe('a', idle());
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  } finally { f.close(); }
+});
+
+test('transition leaves asks pending, explicit inbox rejects, and unrelated valid source still notifies', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic-a', 'a'); f.topic('topic-b', 'b');
+    f.store.enqueuePointer('a', 'old-ask', 'ask'); f.pointer('valid', 'b');
+    f.sessions.get('a')!.ask = { requestId: 'new-ask', question: 'Current?' };
+    f.onMeta(async id => { if (id === 'a') throw transition(); });
+    await f.assistant.notify();
+    assert.equal(f.errors.length, 0);
+    assert.equal(f.calls.length, 1);
+    assert.ok(!(f.calls[0]!.body as { text: string }).text.includes('old-ask'));
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['pending', 'notified']);
+    await assert.rejects(f.invoke('assistant_inbox'), { code: 'SESSION_TRANSITION' });
+    await assert.rejects(f.invoke('assistant_inbox', { peek: true }), { code: 'SESSION_TRANSITION' });
+    assert.equal(f.store.inbox().some(item => item.native_id === 'old-ask'), true);
+    f.onMeta(null);
+    await f.assistant.observe('a');
+    assert.equal(f.store.inbox().some(item => item.native_id === 'old-ask'), false);
+    const inbox = await f.invoke('assistant_inbox') as { items: { questionRequestId?: string }[] };
+    assert.deepEqual(inbox.items.flatMap(item => item.questionRequestId ?? []), ['new-ask']);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 2);
+  } finally { f.close(); }
+});
+
+test('transition foreground samples before load or reserve defer without selecting a synthetic owner', async () => {
+  for (const phase of ['initial', 'final'] as const) {
+    const f = fixture();
+    try {
+      pending(f);
+      f.sessions.get('assistant')!.loaded = phase !== 'initial';
+      let reads = 0;
+      f.native.foreground = async () => {
+        if (++reads >= (phase === 'initial' ? 1 : 2)) throw transition();
+        return f.sessions.get('assistant')!;
+      };
+      await f.assistant.notify();
+      const health = await f.assistant.health();
+      assert.equal(health.current.status, 'deferred');
+      assert.equal(health.observations.coordinatorDeferred, true);
+      assert.equal(health.lastWakeAttempt, null);
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+      assert.equal(f.calls.length, 0); assert.deepEqual(f.errors, []);
+      f.native.foreground = async () => f.sessions.get('assistant')!;
+      await f.assistant.observe('assistant');
+      await f.assistant.notify();
+      assert.deepEqual(f.calls.map(call => call.name), phase === 'initial' ? ['session/load', 'prompt'] : ['prompt']);
+      assert.equal((await f.assistant.health()).observations.coordinatorDeferred, false);
+    } finally { f.close(); }
+  }
+});
+
+test('transition during actual prompt, load or post-load confirmation stays unknown and reported without replay', async () => {
+  for (const phase of ['prompt', 'session/load', 'confirmation']) {
+    const f = fixture();
+    try {
+      pending(f);
+      f.sessions.get('assistant')!.loaded = phase === 'prompt';
+      f.onCall(async name => {
+        if (name === phase) throw transition();
+        if (phase === 'confirmation' && name === 'session/load')
+          f.native.foreground = async () => { throw transition(); };
+      });
+      await f.assistant.notify();
+      assert.equal(f.errors.length, 1);
+      if (phase === 'prompt') assert.equal(f.store.inbox()[0]!.notice_state, 'unknown');
+      else assert.equal(f.store.foregroundWake()!.state, 'unknown');
+      f.onCall(null);
+      f.sessions.get('assistant')!.loaded = phase === 'prompt';
+      f.native.foreground = async () => f.sessions.get('assistant')!;
+      await f.assistant.observe('a', idle());
+      assert.equal(f.calls.length, 1);
+    } finally { f.close(); }
+  }
+});
+
+test('only coded passive transitions defer; ordinary and permission errors still reject or report', async () => {
+  for (const error of [new Error('Native session metadata is unavailable during a lifecycle transition'),
+    Object.assign(new Error('denied'), { code: 'FORBIDDEN' }),
+    Object.assign(new Error('guard'), { code: 'MODULE_MIDDLEWARE_INVALID' })]) {
+    const f = fixture();
+    try {
+      pending(f);
+      f.onMeta(async () => { throw error; });
+      await assert.rejects(f.assistant.observe('a', message('preserved')), value => value === error);
+      assert.equal(f.store.inbox().some(item => item.native_id === 'message-preserved'), true);
+      await f.assistant.notify();
+      assert.deepEqual(f.errors, [error]);
+      assert.equal((await f.assistant.health()).observations.deferredSourceCount, 0);
+      assert.equal(f.calls.length, 0);
+    } finally { f.close(); }
+  }
+});
+
+test('transition capture retains primary filtering and does not enqueue unregistered or stopped sources', async () => {
+  const f = fixture();
+  try {
+    f.topic('topic', 'a');
+    f.onMeta(async () => { throw transition(); });
+    await f.assistant.observe('b', message('unregistered'));
+    await f.assistant.observe('a', { ...message('child'), agentId: 'child' });
+    await f.assistant.observe('a', { ...message('ephemeral'), ephemeral: true });
+    await f.assistant.observe('a', message('empty', ' '));
+    assert.equal(f.store.inbox().length, 0);
+    f.assistant.stop();
+    await f.assistant.observe('a', message('stopped'));
+    assert.equal(f.store.inbox().length, 0);
+    assert.equal(f.calls.length, 0);
+  } finally { f.close(); }
+});
+
+test('concurrent transition observations preserve pointer order and later generations without resurrecting unknown notices', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    pending(f, 'historical');
+    const notice = f.store.reserveNotice()!;
+    f.store.settleNotice(notice.id, null, false);
+    let first = true;
+    f.onMeta(async id => {
+      if (id === 'a' && first) { first = false; entered.resolve(); await release.promise; throw transition(); }
+    });
+    const messageRead = f.assistant.observe('a', message('new'));
+    await entered.promise;
+    assert.equal(f.store.inbox().length, 2, 'The pointer is durable before the awaited metadata sample');
+    const idleRead = f.assistant.observe('a', idle());
+    release.resolve();
+    await Promise.all([messageRead, idleRead]);
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['unknown', 'notified']);
+    assert.equal(f.calls.length, 1);
+    assert.equal((await f.assistant.health()).observations.deferredSourceCount, 0);
+    assert.deepEqual(f.errors, []);
+  } finally { release.resolve(); f.close(); }
+});
+
+test('deferred source diagnostics are bounded and pruned by absent reads and registry removal', async () => {
+  const f = fixture();
+  try {
+    f.onMeta(async () => { throw transition(); });
+    for (let i = 0; i < 102; i++) {
+      f.topic(`topic-${i}`, `source-${i}`);
+      await f.assistant.observe(`source-${i}`);
+    }
+    const health = await f.assistant.health();
+    assert.equal(health.observations.deferredSourceCount, 102);
+    assert.equal(health.observations.deferredSources.length, 100);
+    assert.equal(health.observations.truncated, true);
+    await f.invoke('assistant_topic', { topicId: 'topic-0', sessionId: null });
+    f.onMeta(null);
+    await f.assistant.observe('source-1');
+    const recovered = await f.assistant.health();
+    assert.equal(recovered.observations.deferredSourceCount, 100);
+    assert.equal(recovered.observations.truncated, false);
+    assert.equal(recovered.observations.deferredSources.some(source => ['source-0', 'source-1'].includes(source.sessionId)), false);
+  } finally { f.close(); }
+});
+
+test('stop during a transition metadata read preserves its pointer but starts no new effects', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    f.topic('topic', 'a');
+    f.onMeta(async () => { entered.resolve(); await release.promise; throw transition(); });
+    const read = f.assistant.observe('a', message('before-stop'));
+    await entered.promise;
+    f.assistant.stop(); release.resolve(); await read;
+    assert.equal(f.store.inbox().length, 1);
+    assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+    assert.equal(f.calls.length, 0);
+    assert.deepEqual(f.errors, []);
+  } finally { release.resolve(); f.close(); }
+});
+
 test('recovered updates load the exact foreground, coalesce wakes, and keep unread pointers', async () => {
   const f = fixture(), entered = deferred(), release = deferred();
   try {
@@ -437,6 +640,26 @@ test('explicit rebind repairs unknown mappings while retaining archived creation
     assert.deepEqual(f.store.topic('legacy'), repaired);
     assert.deepEqual(f.calls, []);
   } finally { f.close(); }
+});
+
+test('controls-only invalidations fence source and foreground evidence without scheduling reads', async () => {
+  for (const target of ['a', 'assistant']) {
+    const f = fixture();
+    try {
+      pending(f);
+      let samples = 0;
+      f.onMeta(async id => {
+        if (id === 'a' && ++samples === 2) f.assistant.invalidateObservation(target);
+      });
+      await f.assistant.notify();
+      assert.equal(samples, 2, 'Invalidation does not initiate another observation');
+      assert.deepEqual(f.calls, []);
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+      f.onMeta(null);
+      await f.assistant.observe('a');
+      assert.equal(f.calls.length, 1, 'A later natural event obtains fresh evidence');
+    } finally { f.close(); }
+  }
 });
 
 test('foreground activity observed during source sampling prevents a stale idle wake', async () => {

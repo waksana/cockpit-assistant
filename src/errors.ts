@@ -10,3 +10,13 @@ export function requireFact(condition: unknown, code: string, message: string, s
 export function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+export type MetadataSample<T> = { state: 'read'; meta: T } | { state: 'deferred' };
+export async function sampleMetadata<T>(read: () => Promise<T>): Promise<MetadataSample<T>> {
+  try { return { state: 'read', meta: await read() }; }
+  catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'SESSION_TRANSITION')
+      return { state: 'deferred' };
+    throw error;
+  }
+}

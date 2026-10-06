@@ -73,6 +73,112 @@ function fixture(path = ':memory:') {
   };
 }
 
+const transition = () => Object.assign(new Error('metadata transition'), { code: 'SESSION_TRANSITION' });
+
+test('metadata transition defers recent refresh as stale without retry, and natural invalidation resumes it', async t => {
+  const f = fixture(); t.after(() => f.close());
+  f.add('s'); f.add('other');
+  f.getWith(async id => { if (id === 's') throw transition(); return f.sessions.get(id)!; });
+  await f.start();
+  assert.equal(f.store.get('s')!.state, 'stale');
+  assert.equal(f.store.get('s')!.requested, false);
+  assert.equal(f.store.get('s')!.error, 'SESSION_TRANSITION');
+  assert.equal(f.store.get('other')!.state, 'current');
+  assert.equal(f.recent.health().deferred, 1);
+  assert.equal(f.recent.health().failed, 0);
+  assert.equal(f.recent.health().state, 'partial');
+  assert.deepEqual(f.errors, []);
+  const reads = f.calls.length;
+  await f.recent.waitIdle();
+  assert.equal(f.calls.length, reads, 'No immediate worker rescheduling for deferred rows');
+  f.getWith(null);
+  f.recent.resumeDeferred('s'); await f.recent.waitIdle();
+  assert.equal(f.store.get('s')!.state, 'current');
+  assert.equal(f.recent.health().deferred, 0);
+  const recovered = f.calls.length;
+  f.recent.resumeDeferred('s'); f.recent.resumeDeferred('other'); await f.recent.waitIdle();
+  assert.equal(f.calls.length, recovered, 'Lifecycle notifications do not dirty healthy entries');
+});
+
+test('search metadata transition excludes cached hits and exposes deferral, not failed or absent', async t => {
+  const f = fixture(); t.after(() => f.close());
+  f.add('s', [event('one', 'search phrase'), event('two', 'search phrase')]);
+  await f.start();
+  f.getWith(async () => { throw transition(); });
+  const result = await f.recent.search('search phrase');
+  assert.deepEqual(result.results, []);
+  assert.deepEqual(result.errors, [{ sessionId: 's', error: 'SESSION_TRANSITION' }]);
+  assert.equal(result.coverage.deferred, 1);
+  assert.equal(f.store.get('s')!.state, 'stale');
+  assert.equal(f.store.messages('s').length, 2, 'Unavailable metadata is not source deletion');
+  assert.deepEqual(f.errors, []);
+  const reads = f.calls.length;
+  assert.deepEqual((await f.recent.search('search phrase')).results, []);
+  assert.equal(f.calls.length, reads, 'Stale entries are not resampled by search');
+  f.getWith(null);
+  f.recent.resumeDeferred('s'); await f.recent.waitIdle();
+  assert.equal((await f.recent.search('search phrase')).results.length, 2);
+});
+
+test('post-scan metadata transition does not publish recent text, while same code from chat remains a failure', async t => {
+  for (const phase of ['metadata', 'chat']) {
+    const f = fixture(); t.after(() => f.close());
+    f.add('s');
+    if (phase === 'metadata') {
+      let reads = 0;
+      f.getWith(async id => { if (++reads === 2) throw transition(); return f.sessions.get(id)!; });
+    } else f.chatWith(async () => { throw transition(); });
+    await f.start();
+    assert.equal(f.store.get('s')!.state, phase === 'metadata' ? 'stale' : 'failed');
+    assert.equal(f.store.messages('s').length, 0);
+    assert.equal(f.errors.length, phase === 'metadata' ? 0 : 1);
+  }
+});
+
+test('transition deferral cannot overwrite a later recent generation or schedule after stop', async t => {
+  const f = fixture(); t.after(() => f.close());
+  f.add('s');
+  const entered = deferred(), release = deferred();
+  let first = true;
+  f.getWith(async id => {
+    if (first) { first = false; entered.resolve(); await release.promise; throw transition(); }
+    return f.sessions.get(id)!;
+  });
+  f.recent.start(); await entered.promise;
+  f.recent.resumeDeferred('s');
+  release.resolve(); await f.recent.waitIdle();
+  assert.equal(f.store.get('s')!.state, 'current');
+  assert.equal(f.recent.health().deferred, 0);
+  await f.recent.stop();
+  const reads = f.calls.length;
+  f.recent.resumeDeferred('s'); f.recent.invalidate('s');
+  assert.equal(f.calls.length, reads);
+});
+
+test('lifecycle recovery during search validation fences its late transition and refreshes once', async t => {
+  const f = fixture(); t.after(() => f.close());
+  f.add('s', [event('one', 'search phrase')]);
+  await f.start();
+  const entered = deferred(), release = deferred();
+  let first = true;
+  f.getWith(async id => {
+    if (first) { first = false; entered.resolve(); await release.promise; throw transition(); }
+    return f.sessions.get(id)!;
+  });
+  const search = f.recent.search('search phrase');
+  await entered.promise;
+  f.recent.resumeDeferred('s');
+  release.resolve();
+  assert.deepEqual((await search).results, []);
+  await f.recent.waitIdle();
+  assert.equal(f.store.get('s')!.state, 'current');
+  assert.equal(f.recent.health().deferred, 0);
+  assert.deepEqual(f.errors, []);
+  const calls = f.calls.length;
+  f.recent.resumeDeferred('s'); await f.recent.waitIdle();
+  assert.equal(f.calls.length, calls, 'Settled healthy entries do not keep rescheduling');
+});
+
 test('durable schema1 cache reopens and unchanged source skips full history but probes current head', async t => {
   const dir = join(process.cwd(), '.recent-test-' + randomUUID());
   mkdirSync(dir, { recursive: true });

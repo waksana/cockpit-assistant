@@ -231,12 +231,13 @@ export class RecentStore {
     this.sql.prepare('DELETE FROM recent_sessions WHERE seen_run IS NULL OR seen_run<>?').run(run);
   }
   remove(sessionId: string): void { this.sql.prepare('DELETE FROM recent_sessions WHERE session_id=?').run(sessionId); }
-  counts(): { sessions: number; current: number; stale: number; failed: number; pending: number; truncated: number; scanLimited: number } {
+  counts(): { sessions: number; current: number; stale: number; failed: number; pending: number; truncated: number; scanLimited: number; deferred: number } {
     const row = this.sql.prepare(`SELECT count(*) sessions,sum(state='current') current,sum(state='stale') stale,
-      sum(state='failed') failed,sum(requested) pending,sum(truncated) truncated,sum(scan_limited) scanLimited FROM recent_sessions`).get()!;
+      sum(state='failed') failed,sum(requested) pending,sum(truncated) truncated,sum(scan_limited) scanLimited,
+      sum(state='stale' AND error='SESSION_TRANSITION') deferred FROM recent_sessions`).get()!;
     return { sessions: Number(row.sessions), current: Number(row.current ?? 0), stale: Number(row.stale ?? 0),
       failed: Number(row.failed ?? 0), pending: Number(row.pending ?? 0), truncated: Number(row.truncated ?? 0),
-      scanLimited: Number(row.scanLimited ?? 0) };
+      scanLimited: Number(row.scanLimited ?? 0), deferred: Number(row.deferred ?? 0) };
   }
   close(): void { if (!this.closed) { this.closed = true; this.sql.close(); } }
 }

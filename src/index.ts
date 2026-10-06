@@ -90,7 +90,10 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
         if (!event.agentId && !event.parentToolCallId && !event.data.agentId && !event.data.parentToolCallId
           && (!event.ephemeral || !['user.message', 'assistant.message'].includes(event.type)))
           recent.invalidate(observation.sessionId, 'dirty');
-        return track(() => assistant.observe(observation.sessionId, observation.event));
+        return track(async () => {
+          await assistant.observe(observation.sessionId, observation.event);
+          if (!store.managed(observation.sessionId)) await assistant.notify();
+        });
       }
     } },
     controlEvents: { types: ['session/patch', 'session/invalidated', 'session/added', 'session/removed', 'chat/invalidated'],
@@ -109,9 +112,22 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
             : event.type !== 'session/invalidated' || !event.resources || event.resources.includes('identity');
           if (cacheChanged) recent.invalidate(sessionId, event.type === 'session/removed' ? 'delete'
             : event.type === 'chat/invalidated' ? 'reset' : 'dirty');
-          return track(async () => {
-            await assistant.observe(sessionId); await assistant.notify();
-          });
+          const lifecycleChanged = event.type === 'session/patch'
+            ? ownerChanged || cacheChanged || event.loaded !== undefined || event.status !== undefined
+              || event.loading !== undefined || event.closing !== undefined || event.ask !== undefined
+              || event.queue !== undefined
+            : event.type !== 'session/invalidated' || !event.resources
+              || event.resources.some(resource => ['identity', 'instructions', 'control', 'controls', 'queue'].includes(resource));
+          // Failed reads also clear controls. Invalidate stale evidence without scheduling another read.
+          if (!lifecycleChanged && event.type === 'session/patch'
+            && (event.activity === null || event.controls !== undefined)) assistant.invalidateObservation(sessionId);
+          if (lifecycleChanged) {
+            if (!cacheChanged) recent.resumeDeferred(sessionId);
+            return track(async () => {
+              await assistant.observe(sessionId);
+              if (!store.managed(sessionId)) await assistant.notify();
+            });
+          }
         }
       } },
     onStop: drain,

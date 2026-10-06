@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import type { ModuleHostApi, ModuleHostIntentResult, NativeChatEvent } from '@waksana/cockpit-module-sdk/backend';
 import { z } from 'zod';
-import { BusinessError, errorText, requireFact } from './errors.ts';
+import { BusinessError, errorText, requireFact, sampleMetadata } from './errors.ts';
 import { RECENT_LIMITS, RecentStore } from './recent-store.ts';
 import type { RecentMessage, RecentMetadata, RecentRow } from './recent-store.ts';
 
@@ -61,6 +61,7 @@ export class RecentSessions {
   private cursorDistance = 0;
   private cursorPower = 1;
   private searches = new Set<Promise<unknown>>();
+  private samples = new Map<string, number>();
   private finalHealth: ReturnType<RecentSessions['health']> | null = null;
   private skipped = 0;
   private refreshed = 0;
@@ -84,6 +85,21 @@ export class RecentSessions {
     requireFact(validId(sessionId), 'RECENT_SESSION', 'A bounded, exact native session ID is required');
     this.store.invalidate(sessionId, kind, this.run ?? undefined);
     if (this.started) this.kick();
+  }
+  resumeDeferred(sessionId: string): void {
+    if (this.stopped) return;
+    const row = this.store.get(sessionId);
+    if (row && !row.requested && (this.samples.has(sessionId)
+      || row.state === 'stale' && row.error === 'SESSION_TRANSITION'))
+      this.invalidate(sessionId);
+  }
+  private beginSample(sessionId: string): () => void {
+    this.samples.set(sessionId, (this.samples.get(sessionId) ?? 0) + 1);
+    return () => {
+      const remaining = this.samples.get(sessionId)! - 1;
+      if (remaining) this.samples.set(sessionId, remaining);
+      else this.samples.delete(sessionId);
+    };
   }
   private report(error: RecentError): void {
     const bounded = { ...error, error: error.error.slice(0, 512) };
@@ -112,7 +128,8 @@ export class RecentSessions {
       const job = this.store.next();
       if (job && (this.directoryDone || jobsSinceDirectory < 32)) {
         this.store.claim(job);
-        await this.refresh(job);
+        const finish = this.beginSample(job.sessionId);
+        try { await this.refresh(job); } finally { finish(); }
         jobsSinceDirectory++;
       } else if (!this.directoryDone) {
         await this.inventoryPage();
@@ -152,10 +169,12 @@ export class RecentSessions {
   private valid(row: RecentRow): boolean {
     return !this.stopped && this.store.get(row.sessionId)?.generation === row.generation;
   }
-  private async session(sessionId: string): Promise<RecentMetadata | null> {
-    const result = await this.host.call('session/get', { sessionId });
+  private async session(sessionId: string) {
+    const sample = await sampleMetadata(() => this.host.call('session/get', { sessionId }));
+    if (sample.state === 'deferred') return sample;
+    const result = sample.meta;
     requireFact(!result.meta || result.meta.sessionId === sessionId, 'RECENT_IDENTITY', 'Native session identity differs');
-    return result.meta ? metadata(result.meta) : null;
+    return { state: 'read' as const, meta: result.meta ? metadata(result.meta) : null };
   }
   private async page(sessionId: string, max: number, cursor?: string): Promise<ChatPage> {
     const result = await this.host.call('session/chat', { sessionId, source: 'persisted', direction: 'backward',
@@ -168,8 +187,10 @@ export class RecentSessions {
   }
   private async refresh(row: RecentRow, retry = false): Promise<void> {
     try {
-      const before = await this.session(row.sessionId);
+      const beforeSample = await this.session(row.sessionId);
       if (!this.valid(row)) return;
+      if (beforeSample.state === 'deferred') { this.store.defer(row, 'SESSION_TRANSITION'); return; }
+      const before = beforeSample.meta;
       if (!before) { this.store.remove(row.sessionId); return; }
       const head = await this.page(row.sessionId, 1);
       if (!this.valid(row)) return;
@@ -225,8 +246,10 @@ export class RecentSessions {
         if (!this.valid(row)) return;
         requireFact(eventAnchor(afterHead.events[0]) === anchor, 'RECENT_CHANGED', 'Native history changed during refresh');
       }
-      const after = await this.session(row.sessionId);
+      const afterSample = await this.session(row.sessionId);
       if (!this.valid(row)) return;
+      if (afterSample.state === 'deferred') { this.store.defer(row, 'SESSION_TRANSITION'); return; }
+      const after = afterSample.meta;
       if (!after) { this.store.remove(row.sessionId); return; }
       requireFact(sameSource(before, after), 'RECENT_CHANGED', 'Native source metadata changed during refresh');
       if (this.store.publish(row, after, anchor, messages, { scanLimited, truncated })) {
@@ -272,15 +295,22 @@ export class RecentSessions {
       metadata: RecentMetadata; syncedAt: number | null; scanLimited: boolean;
     }> = [];
     const errors: Array<{ sessionId: string; error: string }> = [];
-    const checked = new Map<string, RecentMetadata | null>();
+    const checked = new Map<string, Awaited<ReturnType<RecentSessions['session']>>>();
     for (const candidate of candidates.slice(0, RECENT_LIMITS.searchCandidates)) {
       if (this.stopped || results.length >= input.limit) break;
+      const finish = this.beginSample(candidate.sessionId);
       try {
         if (!checked.has(candidate.sessionId)) checked.set(candidate.sessionId, await this.session(candidate.sessionId));
         if (this.stopped) break;
-        const meta = checked.get(candidate.sessionId)!;
+        const sample = checked.get(candidate.sessionId)!;
         const row = this.store.get(candidate.sessionId);
         if (!row || row.generation !== candidate.generation || row.state !== 'current') continue;
+        if (sample.state === 'deferred') {
+          this.store.defer(row, 'SESSION_TRANSITION');
+          if (errors.length < RECENT_LIMITS.snippets) errors.push({ sessionId: candidate.sessionId, error: 'SESSION_TRANSITION' });
+          continue;
+        }
+        const meta = sample.meta;
         if (!meta) { this.invalidate(candidate.sessionId, 'delete'); continue; }
         if (!sameSource(meta, row.metadata)) { this.invalidate(candidate.sessionId); continue; }
         const text = candidate.message.text;
@@ -295,11 +325,11 @@ export class RecentSessions {
         if (this.stopped) break;
         const failure = { sessionId: candidate.sessionId, error: errorText(error).slice(0, 512) };
         if (errors.length < RECENT_LIMITS.snippets) errors.push(failure);
-        checked.set(candidate.sessionId, null);
+        checked.set(candidate.sessionId, { state: 'read', meta: null });
         const row = this.store.get(candidate.sessionId);
         if (row?.generation === candidate.generation) this.store.fail(row, failure.error);
         this.report({ operation: 'search', ...failure });
-      }
+      } finally { finish(); }
     }
     // Another event may have invalidated an earlier candidate while a later native lookup awaited.
     const current = this.stopped ? [] : results.filter(result => {
@@ -315,7 +345,7 @@ export class RecentSessions {
     state: 'warming' | 'ready' | 'partial' | 'stopped'; inventoryComplete: boolean;
     inventoryError: string | null; workerError: string | null; skipped: number; refreshed: number; drifted: number;
     sessions: number; current: number; stale: number; failed: number; pending: number;
-    truncated: number; scanLimited: number;
+    truncated: number; scanLimited: number; deferred: number;
   } {
     if (this.finalHealth) return this.finalHealth;
     const counts = this.store.counts();

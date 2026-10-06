@@ -110,6 +110,21 @@ test('missing callers, mismatched readback and failed native reads fail explicit
   } finally { f.close(); }
 });
 
+test('direct session, caller and foreground reads still propagate original transition errors', async () => {
+  const f = fixture(), error = Object.assign(new Error('metadata transition'), { code: 'SESSION_TRANSITION' });
+  try {
+    f.owner();
+    f.readWith(async () => { throw error; });
+    await assert.rejects(f.chat.session('front'), value => value === error);
+    await assert.rejects(f.chat.caller(f.identity), value => value === error);
+    await assert.rejects(f.chat.foreground(), value => value === error);
+    assert.equal(f.chat.foregroundId(), null);
+    f.directoryWith(async () => { throw error; });
+    await assert.rejects(f.chat.availability({ ...assignment(), operation: 'add' }, signal()), value => value === error);
+    await assert.rejects(f.chat.permit(assignment(), signal()), value => value === error);
+  } finally { f.close(); }
+});
+
 test('configuration, old receipt and explicit foreground ID/null stay unchanged inert archives across restart', async () => {
   for (const previous of ['other', null]) {
     const f = fixture('front');

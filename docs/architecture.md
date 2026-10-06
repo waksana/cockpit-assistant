@@ -72,6 +72,14 @@ reported. No periodic source polling, model wake or business prompt is involved.
 
 Primary conversation events and content/identity changes invalidate the cache.
 Activity-only patches from the cache's own native reads do not trigger refresh.
+If a passive metadata read returns the typed `SESSION_TRANSITION` error, the
+entry remains stale with a bodyless deferred marker, not current, absent or
+failed. Search excludes it and reports incomplete coverage. There is no
+immediate retry: a later native/content event or identity/control/queue
+lifecycle notification can reschedule that deferred entry. Healthy entries
+are not dirtied by lifecycle-only recovery notifications. A lifecycle event
+that arrives during an in-flight refresh/search invalidates that sample, so
+a late transition failure cannot overwrite recovery or miss its only wake-up.
 Rewind/compaction invalidation removes the cached text before rebuilding; deletion
 removes the entry. Inventory prunes absent sessions only after complete enumeration.
 Generations fence in-flight publication and search, and shutdown drains both
@@ -102,6 +110,12 @@ Current native asks bypass source-idle waiting. Ask request IDs are checked agai
 loaded live state; question bodies/options are read directly from Host `get_session`.
 Stale asks expire, unavailable ones stay pending. Per-source
 serialized observations and versioned samples reject stale asynchronous facts.
+Trusted primary reply/error/abort pointers and root idle bookkeeping are
+captured before sampling native metadata. A typed `SESSION_TRANSITION` from
+that passive sample defers the source without losing the pointer or declaring
+it idle. Deferred sources do not block unrelated eligible sources; unreadable
+asks remain pending and are not presented as live. Explicit inbox reads
+propagate unavailable ask evidence rather than returning a silent partial page.
 An inbox read may expose partial progress before idle; no business terminal-state
 classifier exists.
 
@@ -139,6 +153,17 @@ pending updates can load the same original ID; loaded handles are not reloaded.
 Missing/failed/unknown outcomes never trigger replacement creation or blind
 retries. Load intent is recorded before calling the Host, and native identity/
 receipt readback stays separate from current health.
+
+Passive source/coordinator metadata transitions remain observable in health.
+Natural native events and identity/control/queue lifecycle notifications
+resample fresh state; read-generated activity or controls-only notifications
+invalidate stale evidence without scheduling another read. They do not create
+a feedback loop. Without a later event, deferral remains visible.
+There is no timer, backoff, synthetic coordinator selection or stale-state
+send. This exception applies only to passive metadata samples before effect
+reservation: transition errors from load, prompt or post-load confirmation
+retain the original failed/unknown receipt and reporting behavior. Direct
+native caller, registration and role checks still propagate their errors.
 
 After revalidating source and target, an idle foreground receives a bounded
 location-only `enqueue` prompt. A wake accepted by native runtime is not a final

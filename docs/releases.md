@@ -52,24 +52,24 @@ requirements. Missing service capabilities fail before opening data.
 `shutdown.v1` requires the early stopping signal and awaited `onStop`/`dispose`
 contract; installing a newer SDK alone does not establish Host support.
 Required intents combine actual backend host calls and the role's direct Host
-MCP dependencies, including `session/chat/text`, creation and ask answers.
+MCP dependencies, including `session/directory`, `session/chat/text`, creation and ask answers.
 The latter are not service routing wrappers and require no module SDK upgrade.
 An older Host lacking lightweight text support must not accept this release.
-Packaging checks the main database's four active tables:
-`topics`, `deliveries`, `mailbox` and `seen`.
+Packaging checks the main database's five retained/current tables:
+`topics`, `deliveries`, `mailbox`, `seen` and `watches`.
 The actual packaged activation also creates and checks the independent
 `recent.sqlite` schema-1 cache without requiring a main-database migration.
 
-The session-directory/pointer-inbox change retains these exact schema-5 definitions
-and every existing topic, mapping and history. Its additional values in `seen`
-are namespaced, bodyless source/inbox-range/agent-handling receipts, not a new schema
-or business-status snapshot. New reply rows hold source pointers; old unread
+The session-centered change adds `watches` in schema 6, independently of retained
+read-only topics. Every schema-5 table definition, original field, row and receipt
+is preserved. Namespaced values in `seen` remain bodyless source/inbox-range/read/
+handling records, not business-status snapshots. New reply rows hold source pointers; old unread
 bodies are not rewritten on startup. Explicit handling archives their original
 rows in-place using bodyless receipt markers; no body copy or bulk deletion occurs.
 New pointer rows leave the mailbox when handled. Legacy dispatch/provenance/creation records remain inert, never
 replayed. No production registry cleanup or foreground migration is part of this release. The independent rebuildable
 `recent.sqlite` schema-1 database stores only bounded recent primary text and
-source/synchronization metadata. It does not alter schema 5 or read/handling
+source/synchronization metadata. It does not replace the business database or read/handling
 checkpoints. Its database declaration has `initialization: "rebuildable-cache"`.
 This requires a deployment consumer that understands first-start cache creation:
 absence before startup is recorded explicitly, not treated as a backup or a
@@ -78,23 +78,30 @@ An existing cache remains subject to regular-file, integrity, schema and
 consistent-backup checks; its declaration must not simply be omitted.
 Consumers without this contract must reject the new descriptor rather than
 requiring operators to create a production database by hand. The business
-database has no initialization exception, and its preservation/migration
-contract is unchanged.
+database has no initialization exception.
 
 Old foreground choices remain inert; actual saved coordinator roles
 determine the reminder target. No existing role or connector binding is migrated.
-The advertised schema-4-to-5 migration below therefore remains necessary and
-unchanged, rather than being replaced by an empty migration list.
-
-The descriptor declares schema 5 and one explicit **nondestructive 4-to-5**
-migration for the currently deployed database. The deployment service accepts
+The descriptor declares schema 6 and one explicit **nondestructive 5-to-6**
+migration. The deployment service accepts
 only one source-to-target migration per database, not alternative entries.
-The offline utility separately supports a checkpointed schema-3 upgrade when
-explicitly invoked; that is not an advertised automatic schema-3 path.
-Existing topic columns remain the deployment preservation projection.
-The offline migration additionally fingerprints every old table's exact columns,
-row IDs and values before and after its transaction. Published schema-3/4 layouts
-are independently pinned, not inferred from target-only definitions.
+The offline utility separately supports checkpointed schema-3/4 upgrades when
+explicitly invoked; these are not additional automatic deployment paths.
+The declaration preserves the schema-5 tables, not a preimage of the newly added
+`watches` table that does not yet exist in schema 5. The migration additionally
+checks every old table's columns, row IDs, values and SQL objects before and after
+its transaction. Published schema-3/4/5 layouts are independently pinned, not
+inferred solely from target definitions.
+
+The migration seeds one enabled watch per distinct nonempty `topics.session_id`.
+Archived topics are included because schema 5 observed those sessions too;
+duplicates collapse only in the new attention table, never in the original data.
+Watch `updated_at=0` records that the old schema supplied no attention timestamp.
+Unbound/unknown creation receipts, old deliveries and unrelated mailbox rows do
+not enroll guessed sources. Existing pending/accepted/unknown notices, native
+deduplication tombstones, read checkpoints and handling reports remain intact.
+Migration neither sends nor reserves notifications. Schema-6 reinspection/apply
+is read-only in effect and does not recreate watches disabled after migration.
 
 Old message mirrors and delivery records stay as inert archive tables in the
 migrated database; fresh stores do not create them. Runtime code neither reads
@@ -110,17 +117,32 @@ declared JSON confirmation on standard output. It never calls Host/session
 APIs or resets data.
 
 There is no migration or reset claim for schema 1, schema 2 or an incompatible
-schema-3/4 draft. These are rejected unchanged. A nonempty WAL must first be
+schema-3/4/5 draft. These are rejected unchanged. A nonempty WAL must first be
 captured through the deployment service's SQLite-aware snapshot; preflight must
 not ignore it or create sidecars. Migration success is not permission
 to deploy or restart a running service.
 
 `pack:check` loads the actual packaged backend in isolated data directories.
 It exercises the actual packaged migration entry against retained synthetic
-schema-3/4 originals, questions, mappings, unread results and native receipts.
+schema-3/4/5 originals, questions, mappings, unread results, checkpoints and native receipts.
 It compares every old field before/after, checks read-only preflight and repeated
 apply, and proves that incompatible schema 1/2/draft inputs remain
 unchanged. No production database or native session is used.
+
+The organizer role and mutable topic tool are retired; legacy topic reads remain
+optional discovery hints. The Skill retains its existing discovery name/path.
+Existing immutable session tool scopes do not automatically admit new
+`assistant_watch`/`assistant_watches` or direct `cockpit_list_sessions` tools.
+Installation and any explicitly authorized session-resource transition must
+check the offered scope, preserve the original native identities and history,
+and avoid forcing active sessions to reload. Merge/publication does not authorize
+that transition or any production role edit.
+In particular, the current Host does not ignore missing saved roles on cold load.
+Installation must not strand sessions still selecting `assistant/organizer`;
+inventory them first and resolve their disposition under separate explicit user
+authorization. This package neither removes sessions nor rewrites native role
+metadata. Resolving one site's legacy sessions does not waive the preflight for
+another installation or a later-created selection.
 
 Publication creates a draft prerelease, uploads each asset once, downloads every
 asset by ID, checks API digest/size, checksum, archive identity and embedded

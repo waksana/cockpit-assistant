@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { attachmentsSchema } from './attachments.ts';
 import { requireFact } from './errors.ts';
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const definitions = {
   topics: `CREATE TABLE topics (
     id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
@@ -29,6 +29,9 @@ export const definitions = {
     notice_state TEXT NOT NULL CHECK(notice_state IN ('pending','calling','notified','unknown')),
     notice_id TEXT, notification_receipt TEXT)`,
   seen: 'CREATE TABLE seen (id TEXT PRIMARY KEY NOT NULL, fingerprint TEXT, created_at INTEGER NOT NULL)',
+  watches: `CREATE TABLE watches (
+    session_id TEXT PRIMARY KEY NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    version INTEGER NOT NULL CHECK(version > 0), updated_at INTEGER NOT NULL)`,
 } as const;
 export const archivedTables = ['messages', 'topic_messages', 'foreground_inputs', 'inbox', 'workers', 'tool_actions'];
 const normalized = (sql: string) => sql.replace(/\s+/g, ' ').trim();
@@ -64,6 +67,11 @@ const topicRow = z.object({
   mapping_error: z.string().nullable(), creation_receipt: json.nullable(),
 });
 export type Topic = z.infer<typeof topicRow>;
+const watchRow = z.object({
+  session_id: z.string(), enabled: z.number().transform(Boolean),
+  version: z.number().int().positive(), updated_at: z.number().int().nonnegative(),
+});
+export type Watch = z.infer<typeof watchRow>;
 const inboxRow = z.object({
   sequence: z.number(), id: z.string(), session_id: z.string(), native_id: z.string(),
   kind: z.enum(['reply', 'ask']), text: z.string(), attachments: json.pipe(attachmentsSchema),
@@ -131,6 +139,19 @@ export class Store {
       topic.creation_receipt === null ? null : JSON.stringify(topic.creation_receipt));
     return topic;
   }
+  watches(): Watch[] {
+    return this.sql.prepare('SELECT * FROM watches ORDER BY rowid').all().map(row => watchRow.parse(row));
+  }
+  watch(sessionId: string): Watch | null {
+    const row = this.sql.prepare('SELECT * FROM watches WHERE session_id=?').get(sessionId);
+    return row ? watchRow.parse(row) : null;
+  }
+  saveWatch(watch: Watch): Watch {
+    this.sql.prepare(`INSERT INTO watches VALUES(?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+      enabled=excluded.enabled,version=excluded.version,updated_at=excluded.updated_at`)
+      .run(watch.session_id, Number(watch.enabled), watch.version, watch.updated_at);
+    return watch;
+  }
   seen(id: string, hash: string): boolean {
     const row = this.sql.prepare('SELECT fingerprint FROM seen WHERE id=?').get(id);
     if (!row) return false;
@@ -165,7 +186,11 @@ export class Store {
       .run('foreground-wake', JSON.stringify(wakeSchema.parse(wake)), Date.now());
   }
   managed(sessionId: string): boolean {
-    return !!this.sql.prepare('SELECT 1 FROM topics WHERE session_id=? LIMIT 1').get(sessionId);
+    return !!this.sql.prepare('SELECT 1 FROM watches WHERE session_id=? AND enabled=1 LIMIT 1').get(sessionId);
+  }
+  hasPending(sessionId: string): boolean {
+    return !!this.sql.prepare(`SELECT 1 FROM mailbox WHERE session_id=? AND NOT EXISTS
+      (SELECT 1 FROM seen WHERE seen.id='inbox-archived:'||mailbox.id) LIMIT 1`).get(sessionId);
   }
   enqueuePointer(sessionId: string, nativeId: string, kind: Incoming['kind'],
     source?: { eventId: string; timestamp: string | number | null; type?: string }): boolean {

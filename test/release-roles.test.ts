@@ -1,53 +1,53 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, mkdir, readFile, copyFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, copyFile, writeFile, access, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 // @ts-expect-error Packaging helpers are native ESM scripts outside the runtime type build.
 import { buildRoleInstructions } from '../scripts/role-instructions.mjs';
 
-test('shared topic Skill is physically embedded in each role without requiring a Skill-reading tool', async () => {
+test('session guidance is embedded only in coordinator and retires organizer without a topic prerequisite', async () => {
   const root = await mkdtemp(join(tmpdir(), 'assistant-role-instructions-'));
   try {
     await mkdir(join(root, 'roles'));
     await mkdir(join(root, 'skills/assistant-topics'), { recursive: true });
-    for (const path of ['roles/coordinator.md', 'roles/organizer.md', 'skills/assistant-topics/SKILL.md']) {
+    for (const path of ['roles/coordinator.md', 'skills/assistant-topics/SKILL.md']) {
       await copyFile(path, join(root, path));
     }
+    await mkdir(join(root, 'dist/roles'), { recursive: true });
+    await writeFile(join(root, 'dist/roles/organizer.md'), 'Old generated role');
     await buildRoleInstructions(root);
     const shared = (await readFile('skills/assistant-topics/SKILL.md', 'utf8'))
       .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
     const front = await readFile(join(root, 'dist/roles/coordinator.md'), 'utf8');
-    const organizer = await readFile(join(root, 'dist/roles/organizer.md'), 'utf8');
     assert.ok(front.endsWith(`${shared}\n`));
-    assert.ok(organizer.endsWith(`${shared}\n`));
+    await assert.rejects(access(join(root, 'dist/roles/organizer.md')), { code: 'ENOENT' });
     assert.match(front, /continuous Assistant conversation/);
-    assert.match(organizer, /not the foreground/);
-    assert.match(organizer, /Host/);
     assert.match(shared, /Do not automatically\s+read\s+older pages/);
     assert.match(front, /Host's session and prompt tools directly/);
     assert.match(front, /never business authorization/);
     assert.match(front, /cockpit_respond_ask/);
     assert.match(front, /not proof the user saw a response/);
     assert.match(shared, /Inbox\s+listing does not\s+consume replies/);
-    assert.match(shared, /never as current evidence/);
+    assert.match(shared, /never current evidence/);
     assert.match(shared, /context loss/);
     assert.match(shared, /attention preferences take priority/);
     assert.match(shared, /assistant_resolve/);
-    assert.match(shared, /omit `topicId`/);
-    assert.match(shared, /never creates or dispatches/);
+    assert.match(shared, /never creates or dispatches to a business session/);
     const manifest = JSON.parse(await readFile('cockpit.module.json', 'utf8'));
     const role = (id: string) => manifest.roles.find((entry: { id: string }) => entry.id === id);
     assert.equal(role('coordinator').instructions, 'dist/roles/coordinator.md');
     assert.equal(role('coordinator').resourcePolicy, undefined);
-    assert.equal(role('organizer').resourcePolicy, undefined);
-    assert.equal(role('organizer').instructions, 'dist/roles/organizer.md');
+    assert.equal(role('organizer'), undefined);
+    assert.deepEqual(manifest.roles.map((entry: { id: string }) => entry.id), ['coordinator']);
     assert.ok(!role('coordinator').mcpServers.assistant.tools.includes('assistant_dispatch'));
     assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_foreground'));
-    assert.ok(!role('organizer').mcpServers.assistant.tools.includes('assistant_dispatch'));
     assert.equal(role('worker'), undefined);
-    assert.equal(role('coordinator').mcpServers.assistant.tools.length, 7);
+    assert.equal(role('coordinator').mcpServers.assistant.tools.length, 8);
     assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_search'));
+    assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_watch'));
+    assert.ok(role('coordinator').mcpServers.assistant.tools.includes('assistant_watches'));
+    assert.ok(!role('coordinator').mcpServers.assistant.tools.includes('assistant_topic'));
     for (const boundary of [
       /Do not perform business reasoning or add your own solution/,
       /including questions about Assistant, its Skill or inbox/,
@@ -62,9 +62,13 @@ test('shared topic Skill is physically embedded in each role without requiring a
     for (const selection of [
       /A shared product name only identifies candidates/,
       /Reuse requires evidence of the\s+same specific responsibility or a continuing discussion/,
-      /Topic reuse\s+and session reuse are separate decisions/,
+      /A topic\s+label neither defines that responsibility nor determines session reuse/,
+      /A known suitable session needs no topic lookup, topic creation or directory scan/,
+      /native session discovery \(`cockpit_list_sessions`\) and direct Chat\/status reads/,
+      /hints are optional ways to locate candidates, not sequential\s+gates/,
+      /Topic registration or maintenance is never a prerequisite/,
       /Apply relevant, available\s+responsibility-discovery capabilities and their guidance while choosing/,
-      /Reuse sufficient evidence already read and still\s+current/,
+      /Reuse sufficient\s+evidence already read and still current/,
       /Do not exclude a clearly relevant candidate merely because its recent snippet\s+covers a different subtask/,
       /material candidate conflicts are resolved, not just when one lookup returns a\s+match/,
       /After a scope correction, reconsider relevant candidates rather than only\s+validating the first recipient/,
@@ -82,7 +86,6 @@ test('shared topic Skill is physically embedded in each role without requiring a
       /not a catch-all\s+Assistant owner/,
     ]) {
       assert.match(front, selection);
-      assert.match(organizer, selection);
     }
     for (const workflow of [
       /stage, completed evidence and remaining dependencies before dispatching/,
@@ -112,7 +115,6 @@ test('shared topic Skill is physically embedded in each role without requiring a
       /Discussion alone neither resumes nor cancels existing work/,
     ]) {
       assert.match(front, workflow);
-      assert.match(organizer, workflow);
     }
     for (const continuation of [
       /user's wording and tone where possible, including questions, uncertainty/,
@@ -125,13 +127,22 @@ test('shared topic Skill is physically embedded in each role without requiring a
       /The recipient should continue answering the user,\s+not be asked to report to the coordinator/,
     ]) {
       assert.match(front, continuation);
-      assert.match(organizer, continuation);
     }
     assert.match(front, /Do not expand ordinary questions into work orders or add analysis directions or\s+requirements/);
     assert.match(front, /Clarify only topic, request scope or discussion-versus-execution intent, not business\s+details/);
     assert.doesNotMatch(front, /Only ambiguity about the intended topic is clarified/);
     assert.doesNotMatch(front, /cockpit-task|task_read|parent_assignee|work_mode|orchestrate|Task role/);
-    assert.equal(role('organizer').mcpServers.assistant.tools.length, 2);
+    for (const attention of [
+      /Watches are independent of topics/,
+      /An attention choice is\s+not an assignment, a role change or authorization to start work/,
+      /an already enabled watch needs no repeated write/,
+      /Do not watch every candidate, helper or historical topic/,
+      /organizer role are retired/,
+      /Pending pointers, read\s+checkpoints, handling receipts and native history are retained/,
+      /Re-enabling does not scan or replay missed history/,
+      /without automatic\s+role edits, replacement sessions or background reorganization/,
+    ]) assert.match(front, attention);
+    assert.doesNotMatch(shared, /Use `assistant_topics` to find|call `assistant_topic`|when it has no suitable match/);
     assert.equal(manifest.instructions, undefined, 'The foreground role must not be injected into all native sessions');
     assert.equal(manifest.frontend, undefined);
   } finally { await rm(root, { recursive: true, force: true }); }

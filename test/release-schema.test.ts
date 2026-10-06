@@ -1,14 +1,15 @@
 import { test } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { activate } from '../src/index.ts';
 import { build } from 'esbuild';
 // @ts-expect-error Packaging helpers run directly in Node outside the TS bundle.
 import { verifySchemaBoundary } from '../scripts/schema-preflight.mjs';
 
-test('packaged migration preserves all schema-3/4 history and unread results while retiring chat mirrors', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'assistant-schema-preflight-'));
+test('packaged offline 3/4/5-to-6 migration preserves history, inbox evidence and explicit watch edits', async () => {
+  const directory = join(process.cwd(), 'node_modules/.cache', `assistant-schema-preflight-${randomUUID()}`);
+  await mkdir(directory, { recursive: true });
   try {
     const migrationEntry = join(directory, 'migrate.mjs');
     await build({ entryPoints: ['scripts/migrate-entry.mjs'], outfile: migrationEntry,

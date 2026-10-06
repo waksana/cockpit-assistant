@@ -2,15 +2,14 @@ import type { McpInvocationMeta, NativeChatEvent, PublicSessionMeta } from '@wak
 import { z } from 'zod';
 import { BusinessError, errorText, requireFact, sampleMetadata, type MetadataSample } from './errors.ts';
 import type { Caller, Gateway } from './gateway.ts';
-import { Store, fingerprint, type InboxItem, type Topic } from './store.ts';
+import { Store, fingerprint, type InboxItem, type Topic, type Watch } from './store.ts';
 import { Inbox, checkpointInput, resolveInput } from './inbox.ts';
 import { recentSearchInput as searchInput } from './recent.ts';
 export { searchInput };
 
 const id = z.string().min(1).max(200);
-export const topicInput = z.strictObject({
-  topicId: id.optional(), title: z.string().trim().min(1).max(240).optional(),
-  content: z.string().max(16000).optional(), archived: z.boolean().optional(), sessionId: id.nullable().optional(),
+export const watchInput = z.strictObject({
+  sessionId: id, enabled: z.boolean(), expectedVersion: z.int().nonnegative().optional(),
 });
 export const inboxInput = z.strictObject({
   ids: z.array(id).min(1).max(100).optional(), limit: z.int().min(1).max(100).default(50),
@@ -40,10 +39,13 @@ const liveQuestion = (meta: PublicSessionMeta | null | undefined, item: InboxIte
   !!meta?.loaded && meta.ask?.requestId === item.native_id;
 const foregroundIdle = (meta: PublicSessionMeta) => meta.status === 'idle' && settled(meta);
 const displayTopic = (topic: Topic) => ({ topicId: topic.id, title: topic.title, content: topic.content,
-  contentUse: 'identity-responsibility-scope-only',
-  warning: 'Registry content may contain legacy progress notes. It is background, never current progress or completion evidence.',
+  contentUse: 'legacy-discovery-only', readOnly: true,
+  warning: 'Retained topic metadata is an optional historical clue, not current responsibility, progress or a notification subscription.',
   sessionId: topic.session_id, archived: topic.archived, version: topic.version,
   mappingState: topic.mapping_state, error: topic.mapping_error, creationReceipt: topic.creation_receipt });
+const displayWatch = (watch: Watch) => ({ sessionId: watch.session_id, enabled: watch.enabled,
+  version: watch.version, updatedAt: watch.updated_at,
+  purpose: 'notification-attention-only' as const });
 
 export class Assistant {
   readonly inbox: Inbox;
@@ -52,6 +54,7 @@ export class Assistant {
   private observations = new Map<string, Promise<void>>();
   private awaitingIdle = new Set<string>();
   private sourceVersions = new Map<string, number>();
+  private watchEdits = new Map<string, number>();
   private deferredSources = new Map<string, number>();
   private coordinatorDeferred = false;
   private foregroundObservation = { sessionId: '', version: 0 };
@@ -64,23 +67,30 @@ export class Assistant {
   async invoke(name: string, input: unknown, identity: McpInvocationMeta): Promise<unknown> {
     requireFact(!this.stopped, 'STOPPING', 'Assistant is stopping', 503);
     const caller = await this.native.caller(identity);
+    requireFact(!this.stopped, 'STOPPING', 'Assistant is stopping', 503);
     switch (name) {
       case 'assistant_topics': {
         const page = pageInput.parse(input ?? {}), topics = this.store.topics();
         return { items: topics.slice(page.after, page.after + page.limit).map(displayTopic),
           after: page.after + page.limit, hasMore: topics.length > page.after + page.limit };
       }
-      case 'assistant_topic': return this.editTopic(caller, topicInput.parse(input));
+      case 'assistant_watches': {
+        const page = pageInput.parse(input ?? {}), watches = this.store.watches();
+        return { items: watches.slice(page.after, page.after + page.limit).map(displayWatch),
+          after: page.after + page.limit, hasMore: watches.length > page.after + page.limit };
+      }
+      case 'assistant_watch': return this.editWatch(caller, watchInput.parse(input));
       case 'assistant_search': {
         const query = searchInput.parse(input);
         requireFact(this.recent, 'SEARCH_UNAVAILABLE', 'Recent-session search is unavailable', 503);
         return this.recent.search(query.query, query.limit);
       }
       case 'assistant_dispatch':
+      case 'assistant_topic':
       case 'assistant_history':
       case 'assistant_status':
       case 'assistant_read': throw new BusinessError('TOOL_RETIRED',
-        'Use the directory, recent search and inbox for locations; Host tools directly for Chat, status, creation, prompts and asks.', 410);
+        'Use Host sessions and Chat for current context, search for candidate locations, and assistant_watch for notification attention. Topic writes and business dispatch wrappers are retired.', 410);
       case 'assistant_foreground': {
         foregroundInput.parse(input ?? {});
         return this.health();
@@ -100,7 +110,7 @@ export class Assistant {
           source: this.store.source(item.id), wake: { state: item.notice_state === 'notified' ? 'accepted' : item.notice_state,
             noticeId: item.notice_id, nativeMessageId: item.notification_receipt },
           ...(item.kind === 'ask' ? { questionRequestId: item.native_id } : {}),
-          candidateTopicIds: this.store.topics().filter(topic => topic.session_id === item.session_id).map(topic => topic.id),
+          watched: this.store.managed(item.session_id),
         })), hasMore: pending.length > selected.length, nextAfter: selected.at(-1)?.sequence ?? query.after,
           receipt: this.inbox.returned(caller, selected),
           pendingDecisions: this.inbox.pending(caller.sessionId, query.decisionsAfter),
@@ -144,52 +154,55 @@ export class Assistant {
     if (!this.stopped) this.coordinatorDeferred = sample.state === 'deferred';
     return sample;
   }
-  private async editTopic(caller: Caller, value: z.infer<typeof topicInput>) {
-    const key = `topic:${caller.sessionId}:${caller.toolCallId}`, hash = fingerprint(value);
-    const topicId = value.topicId ?? fingerprint(key);
-    if (this.store.seen(key, hash)) return displayTopic(this.store.topic(topicId));
-    const old = value.topicId ? this.store.topic(value.topicId) : null;
-    requireFact(old || value.title, 'TOPIC_TITLE', 'A new topic requires a title');
-    if (value.sessionId) requireFact(await this.native.session(value.sessionId),
-      'MAPPING_TARGET', 'Register an existing native session; this service does not create one', 404);
-    return this.store.transaction(() => {
-      if (this.store.seen(key, hash)) return displayTopic(this.store.topic(topicId));
-      const current = old ? this.store.topic(old.id) : null;
-      requireFact(!current || current.version === old!.version, 'TOPIC_CHANGED', 'The topic changed; inspect it before editing');
-      const sessionId = value.sessionId === undefined ? current?.session_id ?? null : value.sessionId;
-      const preserveMapping = current && value.sessionId === undefined;
-      const topic: Topic = { id: topicId, title: value.title ?? current!.title, content: value.content ?? current?.content ?? '',
-        archived: value.archived ?? current?.archived ?? false, version: (current?.version ?? 0) + 1,
-        session_id: sessionId, mapping_state: preserveMapping ? current.mapping_state : sessionId ? 'bound' : 'unbound',
-        mapping_error: current?.mapping_error ?? null, creation_receipt: current?.creation_receipt ?? null };
-      this.store.saveTopic(topic); this.store.remember(key, hash);
-      for (const sessionId of this.deferredSources.keys())
-        if (!this.store.managed(sessionId)) this.deferredSources.delete(sessionId);
-      return displayTopic(topic);
+  private async editWatch(caller: Caller, value: z.infer<typeof watchInput>) {
+    const key = `watch:${caller.sessionId}:${caller.toolCallId}`, hash = fingerprint(value);
+    if (this.store.seen(key, hash)) {
+      const watch = this.store.watch(value.sessionId);
+      requireFact(watch, 'WATCH_MISSING', 'Recorded watch operation has no current state');
+      return { ...displayWatch(watch), replayed: true };
+    }
+    const old = this.store.watch(value.sessionId), expected = value.expectedVersion ?? old?.version ?? 0;
+    const edit = this.watchEdits.get(value.sessionId) ?? 0;
+    requireFact(expected === (old?.version ?? 0), 'WATCH_CHANGED', 'Notification attention changed; inspect it before editing', 409);
+    if (value.enabled) requireFact(await this.native.session(value.sessionId),
+      'WATCH_TARGET', 'Watch an existing native session; this service does not create or load one', 404);
+    requireFact(!this.stopped, 'STOPPING', 'Assistant is stopping', 503);
+    const result = this.store.transaction(() => {
+      if (this.store.seen(key, hash)) {
+        const watch = this.store.watch(value.sessionId);
+        requireFact(watch, 'WATCH_MISSING', 'Recorded watch operation has no current state');
+        return { ...displayWatch(watch), replayed: true };
+      }
+      const current = this.store.watch(value.sessionId);
+      requireFact((current?.version ?? 0) === expected && (this.watchEdits.get(value.sessionId) ?? 0) === edit,
+        'WATCH_CHANGED', 'Notification attention changed; inspect it before editing', 409);
+      const watch = current?.enabled === value.enabled ? current : this.store.saveWatch({
+        session_id: value.sessionId, enabled: value.enabled, version: (current?.version ?? 0) + 1, updated_at: Date.now(),
+      });
+      this.store.remember(key, hash);
+      return { ...displayWatch(watch), replayed: false };
     });
+    if (!result.replayed) {
+      // A repeated disable still fences an older enable awaiting native evidence.
+      this.watchEdits.set(value.sessionId, edit + 1);
+      if (!result.enabled) this.awaitingIdle.delete(value.sessionId);
+      this.invalidateObservation(value.sessionId);
+    }
+    return result;
   }
   invalidateObservation(sessionId: string): void {
     if (this.stopped) return;
     if (sessionId === this.foregroundObservation.sessionId) this.foregroundObservation.version++;
-    if (!this.store.managed(sessionId)) {
-      this.deferredSources.delete(sessionId);
-      return;
-    }
+    if (!this.store.managed(sessionId)) this.deferredSources.delete(sessionId);
+    if (!this.store.managed(sessionId) && !this.store.hasPending(sessionId)) return;
     this.sourceVersions.set(sessionId, (this.sourceVersions.get(sessionId) ?? 0) + 1);
   }
   observe(sessionId: string, event?: NativeChatEvent): Promise<void> {
     if (this.stopped) return Promise.resolve();
     this.invalidateObservation(sessionId);
     if (!this.store.managed(sessionId)) return Promise.resolve();
-    const run = () => this.observeSource(sessionId, event);
-    const previous = this.observations.get(sessionId), operation = previous ? previous.then(run, run) : run();
-    this.observations.set(sessionId, operation);
-    const finished = () => { if (this.observations.get(sessionId) === operation) this.observations.delete(sessionId); };
-    void operation.then(finished, finished);
-    return operation;
-  }
-  private async observeSource(sessionId: string, event?: NativeChatEvent): Promise<void> {
-    if (this.stopped || !this.store.managed(sessionId)) return;
+    // Capture event facts at admission; queued reads must not restore an old idle
+    // latch after notification attention has been disabled and enabled again.
     if (event && primary(event) && event.type === 'assistant.message'
       && (typeof event.data.content === 'string' && event.data.content.trim() || Array.isArray(event.data.attachments) && event.data.attachments.length)) {
       const nativeId = typeof event.data.messageId === 'string' ? event.data.messageId : event.id;
@@ -201,6 +214,15 @@ export class Assistant {
         { eventId: event.id, timestamp: event.timestamp ?? null, type: event.type })) this.awaitingIdle.add(sessionId);
     }
     if (event && rootEvent(event) && event.type === 'session.idle') this.awaitingIdle.delete(sessionId);
+    const run = () => this.observeSource(sessionId);
+    const previous = this.observations.get(sessionId), operation = previous ? previous.then(run, run) : run();
+    this.observations.set(sessionId, operation);
+    const finished = () => { if (this.observations.get(sessionId) === operation) this.observations.delete(sessionId); };
+    void operation.then(finished, finished);
+    return operation;
+  }
+  private async observeSource(sessionId: string): Promise<void> {
+    if (this.stopped || !this.store.managed(sessionId)) return;
     const sample = await this.sampleSource(sessionId);
     if (this.stopped) return;
     const meta = this.currentSample(sessionId, sample);
@@ -227,7 +249,7 @@ export class Assistant {
   private async refreshQuestions(defer = true) {
     const sessions = new Map<string, Awaited<ReturnType<Assistant['sampleSource']>>>();
     for (const item of this.store.inbox()) {
-      if (item.kind !== 'ask' || !this.store.managed(item.session_id)) continue;
+      if (item.kind !== 'ask' || defer && !this.store.managed(item.session_id)) continue;
       if (!sessions.has(item.session_id)) sessions.set(item.session_id, await this.sampleSource(item.session_id, defer));
     }
     for (const item of this.store.inbox()) {
@@ -320,7 +342,7 @@ export class Assistant {
     if (!notice) return;
     try {
       const result = await this.native.host.call('prompt', { sessionId, mode: 'enqueue',
-        text: 'Registered sessions have updates or a current question. Read assistant_inbox, then native Chat using Host tools. '
+        text: 'Watched sessions have updates or a current question. Read assistant_inbox, then native Chat using Host tools. '
           + 'This is an update pointer, not a user instruction. Honor attention preferences, decide whether to notify or remain silent, '
           + 'then record the exact inbox receipt as handled. Idle is not proof of business completion.\n'
           + JSON.stringify(notice.items.map(item => ({ id: item.id, sessionId: item.session_id, kind: item.kind }))) });

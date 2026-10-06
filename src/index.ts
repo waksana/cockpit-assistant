@@ -7,7 +7,7 @@ import { mcp } from './mcp.ts';
 import { NativeChat } from './native-chat.ts';
 import { RecentSessions } from './recent.ts';
 import { RecentStore } from './recent-store.ts';
-import { Store } from './store.ts';
+import { Store, SCHEMA_VERSION } from './store.ts';
 
 export async function activate(context: ModuleBackendContext): Promise<ModuleBackend> {
   const host = context.host;
@@ -57,16 +57,16 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
     ['/:retired', '/:retired/*'].map(path => ({
     method, path, handler: () => ({ status: 410, body: {
       error: { code: 'NATIVE_CHAT_REQUIRED', message: 'Use native session Chat. The Assistant page and mirrored message protocol are retired.' },
-      protocolVersion: 5, chat: '/intent/session/chat', input: '/intent/prompt',
+      protocolVersion: 6, chat: '/intent/session/chat', input: '/intent/prompt',
     } }),
   })));
   const backend: ModuleBackend = {
-    publicConfig: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'locations-and-handling', frontend: false },
+    publicConfig: { protocolVersion: 6, conversation: 'native-session-chat', inbox: 'locations-and-handling', frontend: false },
     routes: [
       mcp(assistant),
       { method: 'GET' as const, path: '/state', async handler() {
-        return { body: { protocolVersion: 5, conversation: 'native-session-chat', inbox: 'locations-and-handling',
-          health: await assistant.health(), schemaVersion: 5, recent: recent.health() } };
+        return { body: { protocolVersion: 6, conversation: 'native-session-chat', inbox: 'locations-and-handling',
+          health: await assistant.health(), schemaVersion: SCHEMA_VERSION, recent: recent.health() } };
       } },
       ...retired,
     ].map(route => ({ ...route, handler(request: Parameters<ModuleRoute['handler']>[0]) {

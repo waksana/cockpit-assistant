@@ -8,9 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { ownedProcesses, survivingProcesses, terminateProcesses } from './native-restart-processes.mjs';
 import { assertPassiveModuleRead, isRecordedReminder } from './native-evidence-check.mjs';
 
-const hostTools = ['cockpit_new_session', 'cockpit_get_session', 'cockpit_reload_session',
+const hostTools = ['cockpit_new_session', 'cockpit_list_sessions', 'cockpit_get_session', 'cockpit_reload_session',
   'cockpit_send_prompt', 'cockpit_respond_ask', 'cockpit_read_session_text'];
-const assistantTools = ['assistant_topics', 'assistant_topic', 'assistant_search', 'assistant_foreground',
+// Directory discovery is advertised; this isolated fixture creates known IDs instead of invoking cockpit_list_sessions.
+const assistantTools = ['assistant_topics', 'assistant_watches', 'assistant_watch', 'assistant_search', 'assistant_foreground',
   'assistant_inbox', 'assistant_checkpoint', 'assistant_resolve'];
 const scope = { builtins: [], mcpServers: [
   { name: 'assistant', tools: assistantTools }, { name: 'cockpit', tools: hostTools },
@@ -448,8 +449,13 @@ export async function runNativeRestartCheck(options = {}) {
         sourceId = /Created session ([0-9a-f-]{36})/.exec(String(value))?.[1];
         assert.ok(sourceId);
       }),
-      step('assistant_topic', () => ({ title: 'Process restart source', sessionId: sourceId })),
-      step('assistant_topics', {}, value => assert.ok(value.items.some(item => item.sessionId === sourceId))),
+      step('assistant_watch', () => ({ sessionId: sourceId, enabled: true, expectedVersion: 0 }), value => {
+        assert.equal(value.sessionId, sourceId); assert.equal(value.enabled, true);
+        assert.equal(value.version, 1); assert.equal(value.replayed, false);
+      }),
+      step('assistant_watches', {}, value => assert.ok(value.items.some(item =>
+        item.sessionId === sourceId && item.enabled && item.version === 1))),
+      step('assistant_topics', {}, value => assert.deepEqual(value.items, [])),
       step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, foregroundId)),
     ]);
     replies.set('baseline', 'Synthetic restart baseline 中文🙂');
@@ -467,6 +473,8 @@ export async function runNativeRestartCheck(options = {}) {
         expected.push(`RESTART_SOURCE:${label}`, replies.get(label));
       }
       await front(`${phase}-restart-updates`, [
+        step('assistant_watches', {}, value => assert.ok(value.items.some(item =>
+          item.sessionId === sourceId && item.enabled && item.version === 1))),
         step('cockpit_reload_session', () => ({ session_id: sourceId })), ...labels.map(sendSource),
       ]);
     }

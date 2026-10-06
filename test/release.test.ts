@@ -4,11 +4,11 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 // @ts-expect-error Release scripts execute directly in Node; they are not part of the TS runtime.
-import { identity, repository, checkEvent, assetNames, hash, verifyAssets, product, assertMigrationTargets } from '../scripts/release-contract.mjs';
+import { identity, repository, checkEvent, assetNames, hash, verifyAssets, product, assertMigrationTargets, agentRequiredIntents } from '../scripts/release-contract.mjs';
 // @ts-expect-error Release scripts execute directly in Node; they are not part of the TS runtime.
 import { publish, snapshot } from '../scripts/release.mjs';
 // @ts-expect-error Migration declaration helpers run directly in Node.
-import { preservedTopics, schema5Migrations } from '../scripts/migration-contract.mjs';
+import { preservedSchema, schema6Migrations } from '../scripts/migration-contract.mjs';
 
 const sha = 'a'.repeat(40);
 const expected = identity('17', sha);
@@ -132,24 +132,28 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   assert.ok(actual.requiredIntents.includes('session/directory'));
   assert.ok(!actual.requiredIntents.includes('roles/availability'));
   assert.ok(!actual.requiredIntents.includes('session/resources-prepare'));
-  for (const agentDependency of ['session/chat/text', 'respondAsk', 'session/new'])
+  for (const agentDependency of ['session/directory', 'session/chat/text', 'respondAsk', 'session/new']) {
+    assert.ok(agentRequiredIntents.includes(agentDependency), 'Guidance dependencies must not rely on incidental runtime Host calls');
     assert.ok(actual.requiredIntents.includes(agentDependency), 'Direct agent Host tools are explicit installation dependencies');
-  assert.deepEqual(actual.migrations, schema5Migrations);
+  }
+  assert.ok(actual.requiredIntents.every((intent: string) => !intent.startsWith('task/')));
+  assert.deepEqual(actual.migrations, schema6Migrations);
   assert.equal(actual.migrations.length, 1, 'The deployer accepts one automatic source per database');
-  assert.equal(actual.migrations[0].from, 4);
-  assert.equal(actual.migrations[0].to, 5);
+  assert.equal(actual.migrations[0].from, 5);
+  assert.equal(actual.migrations[0].to, 6);
+  assert.equal(actual.migrations[0].nondestructive, true);
   assert.equal(actual.migrations[0].database, 'assistant.sqlite');
   assert.throws(() => assertMigrationTargets({
     ...actual, migrations: [...actual.migrations, { ...actual.migrations[0], from: 3 }],
   }), /one automatic migration/);
   assert.throws(() => assertMigrationTargets({
-    ...actual, migrations: [{ ...actual.migrations[0], to: 6 }],
+    ...actual, migrations: [{ ...actual.migrations[0], to: 7 }],
   }), /declared final schema/);
   assert.throws(() => assertMigrationTargets({
     ...actual, migrations: [{ ...actual.migrations[0], database: 'missing.sqlite' }],
   }), /declared final schema/);
   assert.equal(actual.databases[0].path, 'assistant.sqlite');
-  assert.equal(actual.databases[0].schema, 5);
+  assert.equal(actual.databases[0].schema, 6);
   assert.deepEqual(actual.databases[1], { path: 'recent.sqlite', schema: 1, preserve: [], initialization: 'rebuildable-cache' });
   assert.equal(actual.databases[0].initialization, undefined, 'The business database still requires an existing source');
   assert.throws(() => assertMigrationTargets({
@@ -161,9 +165,9 @@ test('descriptor declares native-only capabilities and explicit preserved-histor
   assert.throws(() => assertMigrationTargets({
     ...actual, databases: [{ ...actual.databases[1], initialization: 'optional' }],
   }), /Unknown database initialization policy/);
-  assert.deepEqual(actual.databases[0].preserve, preservedTopics());
+  assert.deepEqual(actual.databases[0].preserve, preservedSchema(5));
   assert.deepEqual(actual.databases[0].preserve.map((entry: { table: string }) => entry.table),
-    ['topics']);
+    ['deliveries', 'mailbox', 'seen', 'topics'], 'The source-5 projection cannot include the not-yet-created watches table');
 });
 
 test('Checksums, embedded descriptor and archive identity must all agree', () => {

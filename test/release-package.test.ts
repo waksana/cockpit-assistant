@@ -35,7 +35,7 @@ test('actual Rolling packager emits a native-only package without changing track
     const output = join(root, 'release-candidate');
     assert.deepEqual(readdirSync(output).sort(), assetNames(expected).sort());
     verifyAssets(output, expected, descriptor.product);
-    assert.equal(descriptor.product.databases[0].schema, 5);
+    assert.equal(descriptor.product.databases[0].schema, 6);
     assert.deepEqual(descriptor.product.databases[1],
       { path: 'recent.sqlite', schema: 1, preserve: [], initialization: 'rebuildable-cache' });
     const archive = join(output, expected.archive.name);
@@ -45,6 +45,8 @@ test('actual Rolling packager emits a native-only package without changing track
     assert.equal(entries.some(entry => entry.startsWith('./dist/web/')), false);
     const packed = JSON.parse(execFileSync('tar', ['-xOzf', archive, './cockpit.module.json'], { encoding: 'utf8' }));
     assert.equal(packed.frontend, undefined);
+    assert.deepEqual(packed.roles.map((role: { id: string }) => role.id), ['coordinator']);
+    assert.equal(entries.some(entry => /(?:^|\/)organizer\.md$/.test(entry)), false);
     assert.equal(packed.version, expected.version);
     assert.equal(JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version, '0.0.0-dev');
     assert.equal(git('status', '--porcelain', '--untracked-files=no'), '');

@@ -1,6 +1,6 @@
-# Directory and inbox API
+# Session attention and inbox API
 
-Protocol **5**, inbox schema **5**, recent-cache schema **1**, no frontend. Discover the active module ID/digest
+Protocol **6**, inbox schema **6**, recent-cache schema **1**, no frontend. Discover the active module ID/digest
 via Host `GET /_modules.active`; the API base is
 `/_modules/assistant/<digest>/api`. Old mirrored-chat routes return
 **410 NATIVE_CHAT_REQUIRED**. Native Chat belongs to the Host, not this module.
@@ -22,15 +22,15 @@ Assistant raw tools are exactly:
 {
   "name": "assistant",
   "tools": [
-    "assistant_topics", "assistant_topic", "assistant_search", "assistant_foreground",
+    "assistant_topics", "assistant_watches", "assistant_watch", "assistant_search", "assistant_foreground",
     "assistant_inbox", "assistant_checkpoint", "assistant_resolve"
   ]
 }
 ```
 
-The external `cockpit` scope requires session creation, get/status, loading the
+The external `cockpit` scope requires session discovery, creation, get/status, loading the
 original ID, prompt/steering, native ask response and lightweight Chat reading.
-Exact raw operation names are `cockpit_new_session`, `cockpit_get_session`,
+Exact raw operation names are `cockpit_list_sessions`, `cockpit_new_session`, `cockpit_get_session`,
 `cockpit_reload_session`, `cockpit_send_prompt`, `cockpit_respond_ask` and
 `cockpit_read_session_text` (public intent `session/chat/text`).
 Do not expose unrestricted `cockpit_call_intent`,
@@ -42,7 +42,10 @@ tools if necessary, then inspect actual configured/applied scope and offered
 names through `session/tool-scope`. A saved role or enabled connection alone does
 not establish that a model can call the tools.
 
-An old immutable scope excluding `cockpit` does not gain it from a role update.
+An old immutable scope excluding `cockpit` or the new watch tools does not gain
+them from a role update. Session discovery uses the public native listing, not
+a new Assistant session/status wrapper. Verify the actual offered names after
+an authorized upgrade before promising update collection for a new source.
 Changing the entrance requires separate user authorization and supported Host
 role/session operations: a second coordinator cannot be assigned while an owner
 exists. Keep old history in its original session and never silently change
@@ -55,8 +58,16 @@ disable receipts remain readable but inert. The actual saved coordinator role
 determines the address. No first-human selection occurs.
 Legacy `defaultCwd`/`worker` values remain readable but inert;
 business session creation and resource selection now belong to direct Host calls.
-The optional organizer role only contributes directory tools/instructions.
-It has no custom `historySessionIds` source-authorization syntax.
+The independent organizer role is retired. No replacement role, organizer
+session or topic preparation is needed. The existing `assistant-topics` Skill
+name/path stays stable for discovery compatibility; its body is session-centered.
+No session, native history or role selection is automatically deleted or reassigned.
+The current Host has no retired-role fallback: a saved `assistant/organizer`
+selection would fail assembly after this catalog change. Before installation,
+inspect saved selections and resolve any remaining legacy organizer sessions only
+under explicit user authorization. Do not silently substitute a role, erase
+history or interrupt active work. This is an installation prerequisite, not a
+runtime cleanup performed by Assistant.
 
 ## Tools
 
@@ -68,28 +79,60 @@ session arguments; Host access controls/tool filters remain unchanged.
 
 | Tool | Arguments | Effect |
 | --- | --- | --- |
-| `assistant_topics` | `{after?,limit?}` | Read identity/responsibility/scope metadata. |
-| `assistant_topic` | `{topicId?,title?,content?,archived?,sessionId?}` | Edit metadata/register an existing session; omit topic ID to create an entry. |
+| `assistant_topics` | `{after?,limit?}` | Optionally read retained legacy hints; `readOnly:true`, `contentUse:"legacy-discovery-only"`. Not responsibility authority or notification attention. |
+| `assistant_watches` | `{after?,limit?}` | List persistent session attention, including disabled entries, `version` and `updatedAt`. Not the native session catalog. |
+| `assistant_watch` | `{sessionId,enabled,expectedVersion?}` | Set notification attention for an existing session, without loading, prompting or reading its history. Disabling also works for a missing session. |
 | `assistant_search` | `{query,limit?}` | Literal keyword search in bounded recent primary text, with session metadata; default/max 10 results. Confirm matches in native Chat. |
 | `assistant_foreground` | `{}` | Query role-owned reminder health; selection and null-disable inputs are rejected. Does not create/load. |
 | `assistant_inbox` | `{ids?,after?,limit?,peek?,decisionsAfter?}` | List a bounded page of locations and current asks, with an exact inbox receipt. |
 | `assistant_checkpoint` | `{receiptId,sessionId,readIds?,position,complete,gap?,reset?,expectedCheckpointVersion?}` | Save an agent-reported read position, distinct from handling. |
 | `assistant_resolve` | `{receiptId,disposition:"silent"\|"notified"}` | Record handling of that returned inbox range; never sends or answers an ask. |
 
-`assistant_dispatch`, `assistant_history`, `assistant_status` and
+`assistant_topic`, `assistant_dispatch`, `assistant_history`, `assistant_status` and
 `assistant_read` are absent from discovery and return **TOOL_RETIRED** if called.
 There is no hidden fallback, business routing, worker creation, Chat pagination
 wrapper or general session-status interface.
 
-Directory `contentUse`/warnings explicitly mark old descriptions as background.
-Multiple topics may map to one session. Explicit registration requires an existing
-native ID. Old delivery and creation receipts remain archived without startup
-replay or replacement creation.
+Old topic descriptions and mappings are preserved as read-only historical clues.
+They neither authorize responsibility nor enroll or remove notification sources.
+Old delivery and creation receipts remain archived without startup replay or
+replacement creation. A known suitable session does not need a topic lookup.
+
+## Independent notification attention
+
+Enable a watch before an authorized conversation whose future replies/questions
+need collection. There is no topic title, description, mapping or business-status
+copy in a watch. Do not watch every search result or every native session.
+`assistant_watch` returns `sessionId`, `enabled`, `version`, `updatedAt`,
+`purpose:"notification-attention-only"` and `replayed`.
+`expectedVersion` is an optimistic concurrency guard (zero means no record).
+Conflicts return `WATCH_CHANGED`; invalid or transitional native evidence on
+enable propagates without saving a success. The check is repeated after the
+native lookup. Repeating the same state with a new call preserves the version;
+replaying the same native call reports current state without applying it again.
+Changing arguments under the same call identity is an idempotency error.
+
+Disabling attention stops future event collection and prevents new wakes for
+that source. It does not abort work, cancel an accepted/in-flight wake, clear
+pending pointers, reset checkpoints or mark anything handled. Existing replies
+remain explicitly readable; current asks are still confirmed against the Host.
+Re-enabling performs no history backfill or immediate reminder: later normal
+observations resume eligibility, while historical unknown notices stay unknown.
+Read the original Chat explicitly for any unobserved interval.
+
+The explicit schema-5-to-6 migration imports one enabled watch for each distinct
+nonempty legacy topic session mapping, including archived topics because the old
+observer included them. Its `updatedAt:0` means the old store had no attention
+timestamp. Unknown/unbound creation receipts, old deliveries and orphan mailbox
+rows do not create guessed subscriptions. They remain retained. Existing schema-6
+attention, including disabled records, is never reimported from topics on restart
+or repeated migration.
 
 ## Recent-session discovery
 
 `assistant_search` accepts a trimmed, nonempty `query` of at most 200 characters.
-Matching is literal and case-sensitive, including Chinese and punctuation; it
+No topic lookup or registration precedes this optional search. Matching is literal
+and case-sensitive, including Chinese and punctuation; it
 does not execute regular expressions. Results contain session metadata, exact
 event/message pointers, primary role, timestamp, a snippet, `syncedAt`,
 `truncated` and `scanLimited`. The response carries `discoveryOnly:true` and
@@ -124,7 +167,7 @@ Search neither resolves inbox entries nor advances any agent read checkpoint.
 Default page size is 50, maximum 100. `after` is the previously returned
 `nextAfter` sequence; `hasMore` reports additional currently readable entries.
 Items contain inbox ID, sequence, session ID, native message ID, optional exact
-event/time source pointer, kind, candidate topics and wake facts. Current asks
+event/time source pointer, kind, `watched` flag and wake facts. Current asks
 contain only `questionRequestId`, never their question/options. New writes store
 neither reply bodies, ask bodies, generated summaries nor tool results.
 Read source Chat and current questions directly through Host tools.

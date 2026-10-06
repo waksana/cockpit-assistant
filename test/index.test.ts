@@ -29,8 +29,7 @@ function fixture(t: TestContext, seed = true) {
     const store = new Store(database);
     try {
       store.remember('foreground', 'front');
-      store.saveTopic({ id: 'topic', title: 'Synthetic topic', content: '', version: 1, archived: false,
-        session_id: 'source', mapping_state: 'bound', mapping_error: null, creation_receipt: null });
+      store.saveWatch({ session_id: 'source', enabled: true, version: 1, updated_at: 0 });
       store.enqueue({ session_id: 'source', native_id: 'reply', kind: 'reply',
         text: 'Synthetic completed reply', attachments: [], question: null });
     } finally { store.close(); }
@@ -136,6 +135,8 @@ function fixture(t: TestContext, seed = true) {
         return {
           inbox: sql.prepare(`SELECT notice_state,notification_receipt,text FROM mailbox
             WHERE NOT EXISTS(SELECT 1 FROM seen WHERE seen.id='inbox-archived:'||mailbox.id) ORDER BY sequence`).all(),
+          watches: sql.prepare('SELECT session_id,enabled,version FROM watches ORDER BY rowid').all(),
+          topics: sql.prepare('SELECT id,session_id,archived FROM topics ORDER BY rowid').all(),
           wake: wake ? JSON.parse(String(wake.fingerprint)) as { sessionId: string; state: string } : null,
         };
       } finally { sql.close(); }
@@ -306,6 +307,10 @@ test('an inherited Host prompt guard failure preserves the inbox without replay 
   assert.equal(f.calls.filter(call => call.name === 'prompt').length, 0, 'Host guard rejected before native dispatch');
   assert.equal(f.state().inbox[0]!.notice_state, 'unknown');
   assert.equal(f.state().inbox[0]!.notification_receipt, null);
+  assert.equal((await callTool(backend, 'assistant_watch', 'disable-after-guard', { sessionId: 'source', enabled: false })).result.isError, false);
+  await backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
+    event: { id: 'disabled-reply', type: 'assistant.message', data: { messageId: 'disabled-reply', content: 'Not collected' } } });
+  assert.equal((await callTool(backend, 'assistant_watch', 'reenable-after-guard', { sessionId: 'source', enabled: true })).result.isError, false);
   await backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source', resources: ['queue'] });
   assert.equal(f.calls.filter(call => call.name === 'prompt').length, 0, 'A later clean context is not replay authority');
   assert.equal(f.state().inbox.length, 1, 'The original source remains available for explicit handling');
@@ -446,6 +451,114 @@ async function callTool(backend: ModuleBackend, name: string, toolCallId: string
   });
   return result.body as { result: { isError: boolean; content: { text: string }[] } };
 }
+
+test('MCP advertises eight session-centered tools and watch calls never scan, load, prompt or create a topic', async t => {
+  const f = fixture(t, false);
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  const backend = await f.activate();
+  await backend.onReady!();
+  const route = backend.routes.find(route => route.path === '/mcp')!;
+  const request = (body: unknown) => route.handler({
+    params: {}, query: {}, headers: {}, signal: f.context.signal, body,
+  });
+  const initialized = await request({ jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'synthetic', version: '1' } } });
+  assert.equal((initialized.body as { result: { serverInfo: { version: string } } }).result.serverInfo.version, '6');
+  const response = await request({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+  const listed = (response.body as { result: { tools: { name: string; inputSchema: {
+    properties: Record<string, unknown>; required: string[]; additionalProperties: boolean;
+  } }[] } }).result.tools;
+  assert.deepEqual(listed.map(tool => tool.name), ['assistant_topics', 'assistant_watches', 'assistant_watch',
+    'assistant_search', 'assistant_foreground', 'assistant_inbox', 'assistant_checkpoint', 'assistant_resolve']);
+  const watchSchema = listed.find(tool => tool.name === 'assistant_watch')!.inputSchema;
+  assert.deepEqual(watchSchema.required, ['sessionId', 'enabled']);
+  assert.deepEqual(Object.keys(watchSchema.properties), ['sessionId', 'enabled', 'expectedVersion']);
+  assert.equal(watchSchema.additionalProperties, false);
+  const retired = await callTool(backend, 'assistant_topic', 'retired-topic', { title: 'Do not create', sessionId: 'source' });
+  assert.equal(retired.result.isError, true);
+  assert.equal(JSON.parse(retired.result.content[0]!.text).error.code, 'TOOL_RETIRED');
+  const enabled = await callTool(backend, 'assistant_watch', 'enable-source', { sessionId: 'source', enabled: true, expectedVersion: 0 });
+  assert.equal(enabled.result.isError, false);
+  assert.equal(JSON.parse(enabled.result.content[0]!.text).version, 1);
+  const watches = await callTool(backend, 'assistant_watches', 'list-attention', {});
+  const items = JSON.parse(watches.result.content[0]!.text).items as { sessionId: string; enabled: boolean; version: number }[];
+  assert.deepEqual(items.map(item => [item.sessionId, item.enabled, item.version]), [['source', true, 1]]);
+  assert.ok(f.calls.every(call => call.name === 'session/get'), 'Only caller and enable-target existence checks use the Host');
+  assert.deepEqual(f.state().topics, []); assert.deepEqual(f.state().inbox, []); assert.deepEqual(f.errors, []);
+});
+
+test('disabled watches and unread checkpoints survive backend restart without wakes until re-enable and a natural event', async t => {
+  const f = fixture(t);
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  f.sessions.get('source')!.status = 'running';
+  const backend = await f.activate();
+  await backend.onReady!();
+  const first = await callTool(backend, 'assistant_inbox', 'read-before-disable', {});
+  const { receipt } = JSON.parse(first.result.content[0]!.text) as { receipt: { id: string; inboxIds: string[] } };
+  const checkpoint = await callTool(backend, 'assistant_checkpoint', 'checkpoint-before-disable', {
+    receiptId: receipt.id, sessionId: 'source', readIds: receipt.inboxIds, complete: true,
+    position: { query: { source: 'persisted', direction: 'backward' }, nextQuery: null,
+      boundaryEventId: 'original-source-event', hostCheckpoint: 'synthetic-host-checkpoint' },
+  });
+  assert.equal(checkpoint.result.isError, false);
+  assert.equal((await callTool(backend, 'assistant_watch', 'disable-source', {
+    sessionId: 'source', enabled: false, expectedVersion: 1,
+  })).result.isError, false);
+  const retained = f.state();
+  f.sessions.get('source')!.status = 'idle';
+  for (const event of [
+    { id: 'disabled-reply', type: 'assistant.message', data: { messageId: 'disabled-reply', content: 'Not collected' } },
+    { id: 'disabled-idle', type: 'session.idle', data: {} },
+  ]) await backend.events!.handle({ sessionId: 'source', cwd: '/synthetic', event });
+  assert.deepEqual(f.state(), retained);
+  assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
+  await backend.dispose!();
+  f.restart(); f.sessions.get('front')!.loaded = false;
+  const beforeRestart = f.calls.length, restarted = await f.activate();
+  await restarted.onReady!();
+  assert.deepEqual(f.state(), retained);
+  assert.equal(f.calls.length, beforeRestart, 'Disabled pending mail does not discover or wake the cold role owner');
+  const unread = await callTool(restarted, 'assistant_inbox', 'read-after-restart', {});
+  const restored = JSON.parse(unread.result.content[0]!.text);
+  assert.equal(restored.receipt.id, receipt.id);
+  assert.equal(restored.items[0].watched, false);
+  assert.equal(restored.receipt.progress[0].position.hostCheckpoint, 'synthetic-host-checkpoint');
+  assert.deepEqual(restored.receipt.progress[0].readIds, receipt.inboxIds);
+  const reenabled = await callTool(restarted, 'assistant_watch', 'reenable-source', {
+    sessionId: 'source', enabled: true, expectedVersion: 2,
+  });
+  assert.equal(reenabled.result.isError, false);
+  assert.equal(JSON.parse(reenabled.result.content[0]!.text).version, 3);
+  assert.equal(f.calls.some(call => ['session/load', 'prompt', 'session/chat'].includes(call.name)), false);
+  await restarted.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source', resources: ['queue'] });
+  assert.deepEqual(f.calls.filter(call => call.name === 'session/load' || call.name === 'prompt').map(call => call.name),
+    ['session/load', 'prompt']);
+  assert.equal(f.state().inbox.length, 1); assert.equal(f.state().inbox[0]!.notice_state, 'notified');
+  assert.deepEqual(f.state().topics, []); assert.deepEqual(f.errors, []);
+});
+
+test('shutdown drains a watch caller read and returns an explicit error without persisting attention', { timeout: 5000 }, async t => {
+  const f = fixture(t, false);
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  const backend = await f.activate();
+  await backend.onReady!();
+  const gate = f.gate('session/get');
+  const editing = callTool(backend, 'assistant_watch', 'enable-during-stop', { sessionId: 'source', enabled: true });
+  await gate.entered;
+  f.stop();
+  let drained = false;
+  const drain = Promise.resolve(backend.onStop!()).then(() => { drained = true; });
+  await setImmediate();
+  assert.equal(drained, false);
+  await assertIngressStopped(backend, f);
+  gate.release();
+  const [response] = await Promise.all([editing, drain]);
+  assert.equal(response.result.isError, true);
+  assert.equal(JSON.parse(response.result.content[0]!.text).error.code, 'STOPPING');
+  assert.deepEqual(f.state().watches, []);
+  assert.equal(f.calls.some(call => call.name !== 'session/get'), false);
+});
+
 function inputEvents(messageId: string, toolCallId: string): NativeChatEvent[] {
   return [
     { id: `event-${messageId}`, type: 'user.message', timestamp: Date.now(),

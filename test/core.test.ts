@@ -4,13 +4,16 @@ import type { McpInvocationMeta, ModuleHostApi, ModuleHostIntent, ModuleHostInte
   ModuleHostIntentResult, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
 import { Assistant, configInput, type Config } from '../src/core.ts';
 import type { Gateway } from '../src/gateway.ts';
-import { Store, type Topic } from '../src/store.ts';
+import { Store, type Topic, type Watch } from '../src/store.ts';
 
 const identity = (toolCallId: string): McpInvocationMeta =>
   ({ sessionId: 'assistant', runtimeSessionId: 'assistant', subagent: false, toolCallId });
 const message = (id: string, content = id): NativeChatEvent =>
   ({ id, type: 'assistant.message', data: { messageId: `message-${id}`, content } });
 const idle = (): NativeChatEvent => ({ id: 'idle', type: 'session.idle', ephemeral: true, data: {} });
+type WatchView = { sessionId: string; enabled: boolean; version: number; updatedAt: number;
+  purpose: 'notification-attention-only' };
+type WatchResult = WatchView & { replayed: boolean };
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>(done => { resolve = done; });
@@ -18,6 +21,7 @@ function deferred() {
 }
 function fixture(config: Partial<Config> = {}) {
   const store = new Store(':memory:'), calls: { name: string; body: unknown }[] = [], errors: unknown[] = [];
+  const reads: string[] = [];
   const meta = (id: string): PublicSessionMeta => ({
     sessionId: id, title: id, cwd: '/synthetic', loaded: true, status: 'idle', ask: null, lastActivity: 0,
     roles: [], appliedRoles: [], rolesNeedReload: false,
@@ -53,7 +57,7 @@ function fixture(config: Partial<Config> = {}) {
   };
   const native: Gateway = {
     host, async caller(call) { return { sessionId: call.sessionId!, toolCallId: call.toolCallId! }; },
-    async session(id) { if (onMeta) await onMeta(id); return sessions.get(id) ?? null; },
+    async session(id) { reads.push(id); if (onMeta) await onMeta(id); return sessions.get(id) ?? null; },
     foregroundId: () => foregroundId,
     async foreground() { return foregroundId ? sessions.get(foregroundId) ?? null : null; },
   };
@@ -61,9 +65,15 @@ function fixture(config: Partial<Config> = {}) {
   const topic = (id: string, sessionId: string | null): Topic => store.saveTopic({ id, title: id, content: '',
     version: 1, archived: false, session_id: sessionId, mapping_state: sessionId ? 'bound' : 'unbound',
     mapping_error: null, creation_receipt: null });
+  const watch = (sessionId: string, enabled = true): Watch => {
+    const current = store.watch(sessionId);
+    return current?.enabled === enabled ? current : store.saveWatch({
+      session_id: sessionId, enabled, version: (current?.version ?? 0) + 1, updated_at: Date.now(),
+    });
+  };
   const pointer = (id = 'pending', sessionId = 'a') =>
     store.enqueuePointer(sessionId, id, 'reply', { eventId: `event-${id}`, timestamp: null });
-  return { store, assistant, native, sessions, calls, errors, topic, pointer,
+  return { store, assistant, native, sessions, calls, errors, reads, topic, watch, pointer,
     roleOwner(id: string | null) { foregroundId = id; },
     onCall(value: typeof onCall) { onCall = value; }, onMeta(value: typeof onMeta) { onMeta = value; },
     load(value: typeof loadResult, changesState = true) { loadResult = value; loadChangesState = changesState; },
@@ -95,7 +105,7 @@ async function recordRead(f: ReturnType<typeof fixture>, receiptId: string, ids:
   }
 }
 function pending(f: ReturnType<typeof fixture>, id = 'pending') {
-  if (!f.store.topics().length) f.topic('topic', 'a');
+  if (!f.store.watch('a')) f.watch('a');
   f.pointer(id);
 }
 
@@ -105,7 +115,7 @@ const transition = () => Object.assign(new Error('Native session metadata is una
 test('transition observations preserve bodyless reply/error/abort pointers and idle without self-retrying', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     f.sessions.get('assistant')!.loaded = false;
     let reads = 0;
     f.onMeta(async id => { if (id === 'a') { reads++; throw transition(); } });
@@ -135,7 +145,7 @@ test('transition observations preserve bodyless reply/error/abort pointers and i
 test('transition leaves asks pending, explicit inbox rejects, and unrelated valid source still notifies', async () => {
   const f = fixture();
   try {
-    f.topic('topic-a', 'a'); f.topic('topic-b', 'b');
+    f.watch('a'); f.watch('b');
     f.store.enqueuePointer('a', 'old-ask', 'ask'); f.pointer('valid', 'b');
     f.sessions.get('a')!.ask = { requestId: 'new-ask', question: 'Current?' };
     f.onMeta(async id => { if (id === 'a') throw transition(); });
@@ -228,7 +238,7 @@ test('only coded passive transitions defer; ordinary and permission errors still
 test('transition capture retains primary filtering and does not enqueue unregistered or stopped sources', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     f.onMeta(async () => { throw transition(); });
     await f.assistant.observe('b', message('unregistered'));
     await f.assistant.observe('a', { ...message('child'), agentId: 'child' });
@@ -265,19 +275,19 @@ test('concurrent transition observations preserve pointer order and later genera
   } finally { release.resolve(); f.close(); }
 });
 
-test('deferred source diagnostics are bounded and pruned by absent reads and registry removal', async () => {
+test('deferred source diagnostics are bounded and pruned by absent reads and disabled watches', async () => {
   const f = fixture();
   try {
     f.onMeta(async () => { throw transition(); });
     for (let i = 0; i < 102; i++) {
-      f.topic(`topic-${i}`, `source-${i}`);
+      f.watch(`source-${i}`);
       await f.assistant.observe(`source-${i}`);
     }
     const health = await f.assistant.health();
     assert.equal(health.observations.deferredSourceCount, 102);
     assert.equal(health.observations.deferredSources.length, 100);
     assert.equal(health.observations.truncated, true);
-    await f.invoke('assistant_topic', { topicId: 'topic-0', sessionId: null });
+    await f.invoke('assistant_watch', { sessionId: 'source-0', enabled: false });
     f.onMeta(null);
     await f.assistant.observe('source-1');
     const recovered = await f.assistant.health();
@@ -290,7 +300,7 @@ test('deferred source diagnostics are bounded and pruned by absent reads and reg
 test('stop during a transition metadata read preserves its pointer but starts no new effects', async () => {
   const f = fixture(), entered = deferred(), release = deferred();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     f.onMeta(async () => { entered.resolve(); await release.promise; throw transition(); });
     const read = f.assistant.observe('a', message('before-stop'));
     await entered.promise;
@@ -326,13 +336,13 @@ test('recovered updates load the exact foreground, coalesce wakes, and keep unre
   } finally { release.resolve(); f.close(); }
 });
 
-test('empty, unrelated, duplicate, uncertain and active-source pointers never discover or load foreground', async () => {
-  for (const state of ['empty', 'unrelated', 'duplicate', 'unknown', 'running', 'unloaded', 'unknown-activity', 'stale-ask']) {
+test('empty, unwatched, duplicate, uncertain and active-source pointers never discover or load foreground', async () => {
+  for (const state of ['empty', 'unwatched', 'duplicate', 'unknown', 'running', 'unloaded', 'unknown-activity', 'stale-ask']) {
     const f = fixture();
     try {
       f.sessions.get('assistant')!.loaded = false;
       if (state !== 'empty') pending(f);
-      if (state === 'unrelated') f.store.saveTopic({ ...f.store.topic('topic')!, session_id: null, mapping_state: 'unbound' });
+      if (state === 'unwatched') f.watch('a', false);
       if (state === 'duplicate' || state === 'unknown') {
         const notice = f.store.reserveNotice()!;
         f.store.settleNotice(notice.id, state === 'duplicate' ? 'receipt' : null, state === 'duplicate');
@@ -474,20 +484,152 @@ test('stopping during foreground discovery prevents notice reservation', async (
   } finally { release.resolve(); f.close(); }
 });
 
-test('registry edits are idempotent for minimal Host callers without role or input provenance', async () => {
+test('watch edits are idempotent and replay reports current attention without reapplying an old enable', async () => {
   const f = fixture();
   try {
-    const query = { title: 'Travel', content: 'Discussion only', sessionId: 'a' };
-    const first = await f.invoke('assistant_topic', query, 'create-once') as { topicId: string };
-    assert.deepEqual(await f.invoke('assistant_topic', query, 'create-once'), first);
-    assert.equal(f.store.topics().length, 1);
-    await assert.rejects(f.invoke('assistant_topic', { ...query, title: 'Changed' }, 'create-once'), { code: 'IDEMPOTENCY_CONFLICT' });
-    await assert.rejects(f.invoke('assistant_topic', { topicId: 'invented', title: 'New' }), { code: 'TOPIC_NOT_FOUND' });
-    await assert.rejects(f.invoke('assistant_topic', { title: 'Missing', sessionId: 'not-there' }), { code: 'MAPPING_TARGET' });
-    await f.invoke('assistant_topic', { topicId: first.topicId, archived: true, sessionId: null });
-    const result = await f.invoke('assistant_topics') as { items: { sessionId: string | null; archived: boolean; warning: string }[] };
-    assert.equal(result.items[0]!.sessionId, null); assert.equal(result.items[0]!.archived, true);
-    assert.match(result.items[0]!.warning, /never current progress/);
+    const query = { sessionId: 'a', enabled: true, expectedVersion: 0 };
+    const first = await f.invoke('assistant_watch', query, 'enable-once') as WatchResult;
+    assert.equal(first.sessionId, 'a'); assert.equal(first.enabled, true);
+    assert.equal(first.version, 1); assert.equal(first.replayed, false);
+    assert.equal(first.purpose, 'notification-attention-only'); assert.ok(first.updatedAt > 0);
+    assert.deepEqual(await f.invoke('assistant_watch', query, 'enable-once'), { ...first, replayed: true });
+    assert.deepEqual(f.reads, ['a'], 'Same-call replay does not validate or reapply the old enable');
+    const same = await f.invoke('assistant_watch', { ...query, expectedVersion: 1 }, 'already-enabled');
+    assert.deepEqual(same, first, 'An already enabled watch keeps its version and timestamp');
+    assert.equal(f.store.watches().length, 1); assert.deepEqual(f.store.topics(), []);
+    const disabled = await f.invoke('assistant_watch', { sessionId: 'a', enabled: false, expectedVersion: 1 }) as WatchResult;
+    assert.equal(disabled.enabled, false); assert.equal(disabled.version, 2);
+    f.sessions.delete('a');
+    assert.deepEqual(await f.invoke('assistant_watch', query, 'enable-once'), { ...disabled, replayed: true });
+    for (const changed of [{ ...query, enabled: false }, { ...query, sessionId: 'b' }, { ...query, expectedVersion: 1 }])
+      await assert.rejects(f.invoke('assistant_watch', changed, 'enable-once'), { code: 'IDEMPOTENCY_CONFLICT' });
+    assert.equal(f.store.managed('a'), false);
+    assert.deepEqual(f.reads, ['a', 'a']); assert.deepEqual(f.calls, []);
+  } finally { f.close(); }
+});
+
+test('enabled and disabled watches paginate independently of legacy topics without native side effects', async () => {
+  const f = fixture();
+  try {
+    f.topic('legacy', 'b');
+    f.watch('a'); f.watch('b', false); f.watch('observer');
+    const before = f.store.watches(), seen = f.store.sql.prepare('SELECT * FROM seen').all();
+    f.onMeta(async () => { throw new Error('Listing attention must not sample native sessions'); });
+    const first = await f.invoke('assistant_watches', { limit: 1 }) as { items: WatchView[]; after: number; hasMore: boolean };
+    const second = await f.invoke('assistant_watches', { after: first.after, limit: 2 }) as typeof first;
+    const empty = await f.invoke('assistant_watches', { after: second.after, limit: 1 }) as typeof first;
+    assert.deepEqual(first.items.map(item => [item.sessionId, item.enabled, item.version]), [['a', true, 1]]);
+    assert.equal(first.after, 1); assert.equal(first.hasMore, true);
+    assert.deepEqual(second.items.map(item => [item.sessionId, item.enabled, item.version]), [['b', false, 1], ['observer', true, 1]]);
+    assert.equal(second.after, 3); assert.equal(second.hasMore, false);
+    assert.deepEqual(empty.items, []); assert.equal(empty.hasMore, false);
+    assert.ok([...first.items, ...second.items].every(item => item.purpose === 'notification-attention-only'));
+    assert.deepEqual(f.store.watches(), before);
+    assert.deepEqual(f.store.sql.prepare('SELECT * FROM seen').all(), seen);
+    assert.deepEqual(f.reads, []); assert.deepEqual(f.calls, []);
+  } finally { f.close(); }
+});
+
+test('a watch on an existing unloaded session neither loads nor scans it and collects future events without topics', async () => {
+  const f = fixture();
+  try {
+    f.sessions.get('a')!.loaded = false;
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: true });
+    assert.deepEqual(f.reads, ['a']);
+    assert.equal(f.calls.length, 0); assert.deepEqual(f.store.inbox(), []);
+    assert.deepEqual(f.store.topics(), []);
+    f.sessions.get('a')!.loaded = true;
+    await f.assistant.observe('a', message('first-future'));
+    assert.equal(f.store.inbox().length, 1); assert.equal(f.calls.length, 0);
+    await f.assistant.observe('a', idle());
+    assert.equal(f.calls.length, 1); assert.equal(f.calls[0]!.name, 'prompt');
+    assert.equal(f.store.inbox()[0]!.notice_state, 'notified');
+    const inbox = await f.invoke('assistant_inbox') as { items: { watched: boolean; sessionId: string }[] };
+    assert.equal(inbox.items[0]!.watched, true); assert.equal(inbox.items[0]!.sessionId, 'a');
+    assert.ok(!Object.hasOwn(inbox.items[0]!, 'candidateTopicIds'));
+    assert.deepEqual(f.store.topics(), []);
+  } finally { f.close(); }
+});
+
+test('topic-only sources never collect or wake and legacy directory reads remain optional and passive', async () => {
+  const f = fixture();
+  try {
+    f.topic('first', 'a'); f.store.saveTopic({ ...f.topic('archived', 'a'), archived: true });
+    f.sessions.get('a')!.ask = { requestId: 'not-watched', question: 'Private question' };
+    f.onMeta(async () => { throw new Error('Topic metadata is not a notification subscription'); });
+    for (const event of [message('unwatched'), { id: 'error', type: 'session.error', data: {} },
+      { id: 'abort', type: 'abort', data: {} }, idle()]) await f.assistant.observe('a', event);
+    await f.assistant.notify();
+    const before = f.store.topics();
+    const first = await f.invoke('assistant_topics', { limit: 1 }) as {
+      items: { topicId: string; readOnly: boolean; contentUse: string; archived: boolean; warning: string }[];
+      after: number; hasMore: boolean;
+    };
+    const second = await f.invoke('assistant_topics', { after: first.after, limit: 1 }) as typeof first;
+    assert.equal(first.hasMore, true); assert.equal(second.hasMore, false);
+    assert.deepEqual([first.items[0]!.topicId, second.items[0]!.topicId], ['first', 'archived']);
+    assert.equal(second.items[0]!.archived, true);
+    for (const item of [...first.items, ...second.items]) {
+      assert.equal(item.readOnly, true); assert.equal(item.contentUse, 'legacy-discovery-only');
+      assert.match(item.warning, /not current responsibility, progress or a notification subscription/);
+    }
+    assert.deepEqual(f.store.topics(), before); assert.deepEqual(f.store.watches(), []);
+    assert.deepEqual(f.store.inbox(), []); assert.deepEqual(f.reads, []);
+    assert.deepEqual(f.calls, []);
+  } finally { f.close(); }
+});
+
+test('missing, transitioning and unreadable watch targets reject without writing state or idempotency receipts', async () => {
+  for (const existing of [false, true]) for (const failure of ['missing', 'transition', 'unknown']) {
+    const f = fixture();
+    try {
+      const meta = f.sessions.get('a')!, error = failure === 'transition' ? transition() : new Error('Native metadata unavailable');
+      if (existing) f.watch('a', false);
+      f.topic('legacy', 'a');
+      const before = f.store.watches(), seen = f.store.sql.prepare('SELECT * FROM seen').all(), topics = f.store.topics();
+      if (failure === 'missing') f.sessions.delete('a'); else f.onMeta(async () => { throw error; });
+      const query = { sessionId: 'a', enabled: true, expectedVersion: existing ? 1 : 0 };
+      await assert.rejects(f.invoke('assistant_watch', query, 'failed-enable'), failure === 'missing'
+        ? { code: 'WATCH_TARGET', status: 404 } : value => value === error);
+      assert.deepEqual(f.store.watches(), before);
+      assert.deepEqual(f.store.sql.prepare('SELECT * FROM seen').all(), seen);
+      assert.deepEqual(f.store.topics(), topics); assert.deepEqual(f.calls, []); assert.deepEqual(f.errors, []);
+      f.onMeta(null); f.sessions.set('a', meta);
+      const retry = await f.invoke('assistant_watch', query, 'failed-enable') as WatchResult;
+      assert.equal(retry.enabled, true); assert.equal(retry.replayed, false);
+      assert.equal(retry.version, existing ? 2 : 1);
+    } finally { f.close(); }
+  }
+});
+
+test('disabling a missing native session is local and same-state edits do not bump its revision', async () => {
+  const f = fixture();
+  try {
+    f.onMeta(async () => { throw new Error('A deleted native session need not be readable to disable attention'); });
+    const first = await f.invoke('assistant_watch', { sessionId: 'deleted', enabled: false, expectedVersion: 0 }) as WatchResult;
+    assert.equal(first.sessionId, 'deleted'); assert.equal(first.enabled, false); assert.equal(first.version, 1);
+    const second = await f.invoke('assistant_watch', { sessionId: 'deleted', enabled: false, expectedVersion: 1 });
+    assert.deepEqual(second, first);
+    assert.equal(f.store.watches().length, 1); assert.equal(f.store.managed('deleted'), false);
+    assert.deepEqual(f.reads, []); assert.deepEqual(f.calls, []);
+  } finally { f.close(); }
+});
+
+test('watch revision preconditions and strict inputs fail before native lookup or any state writes', async () => {
+  const f = fixture();
+  try {
+    f.watch('a');
+    const before = f.store.watches(), seen = f.store.sql.prepare('SELECT * FROM seen').all();
+    for (const input of [{ sessionId: 'a', enabled: true, expectedVersion: 0 },
+      { sessionId: 'a', enabled: false, expectedVersion: 2 }, { sessionId: 'b', enabled: false, expectedVersion: 1 }])
+      await assert.rejects(f.invoke('assistant_watch', input), { code: 'WATCH_CHANGED', status: 409 });
+    for (const input of [{}, { sessionId: 'a' }, { sessionId: '', enabled: true }, { sessionId: 'a', enabled: 'true' },
+      { sessionId: 'a', enabled: true, expectedVersion: -1 }, { sessionId: 'a', enabled: true, expectedVersion: 1.5 },
+      { sessionId: 'a', enabled: true, topicId: 'legacy' }, { sessionId: 'a', enabled: true, title: 'Not routing metadata' }])
+      await assert.rejects(f.invoke('assistant_watch', input), { name: 'ZodError' });
+    assert.deepEqual(f.store.watches(), before);
+    assert.deepEqual(f.store.sql.prepare('SELECT * FROM seen').all(), seen);
+    assert.deepEqual(f.reads, []);
     assert.deepEqual(f.calls, []);
   } finally { f.close(); }
 });
@@ -496,7 +638,7 @@ test('business and evidence tools are explicitly retired without any Host calls 
   const f = fixture({ defaultCwd: '/legacy', worker: { roles: [{ moduleId: 'assistant', roleId: 'worker' }] } });
   try {
     f.topic('topic', 'a');
-    for (const tool of ['assistant_dispatch', 'assistant_history', 'assistant_status', 'assistant_read']) {
+    for (const tool of ['assistant_topic', 'assistant_dispatch', 'assistant_history', 'assistant_status', 'assistant_read']) {
       await assert.rejects(f.invoke(tool, { items: [{ topicId: 'topic', prompt: 'Do more' }] }), { code: 'TOOL_RETIRED' });
       await assert.rejects(f.invoke(tool, {}), { code: 'TOOL_RETIRED' });
     }
@@ -530,20 +672,320 @@ test('legacy unknown and interrupted deliveries stay inert across recovery and n
   } finally { f.close(); }
 });
 
-test('concurrent registry edits detect a changed mapping after native lookup instead of overwriting it', async () => {
+test('a later disable wins over an enable awaiting native metadata, including a previously disabled watch', async () => {
+  for (const prior of ['missing', 'enabled', 'disabled']) {
+    const f = fixture(), entered = deferred(), release = deferred();
+    try {
+      if (prior !== 'missing') f.watch('a', prior === 'enabled');
+      f.onMeta(async id => { if (id === 'a') { entered.resolve(); await release.promise; } });
+      const first = f.invoke('assistant_watch', { sessionId: 'a', enabled: true }, 'slow-enable');
+      const rejected = assert.rejects(first, { code: 'WATCH_CHANGED', status: 409 });
+      await entered.promise;
+      const disabled = await f.invoke('assistant_watch', { sessionId: 'a', enabled: false,
+        expectedVersion: prior === 'missing' ? 0 : 1 }) as WatchResult;
+      release.resolve(); await rejected;
+      assert.equal(disabled.enabled, false);
+      assert.equal(f.store.managed('a'), false);
+      assert.equal(f.store.watch('a')!.version, disabled.version);
+      assert.equal(f.store.receipt('watch:assistant:slow-enable'), null);
+      assert.deepEqual(f.calls, []);
+    } finally { release.resolve(); f.close(); }
+  }
+});
+
+test('concurrent identical watch calls recheck idempotency after native lookup without reviving disabled attention', async () => {
+  const f = fixture(), entered = [deferred(), deferred()], release = [deferred(), deferred()];
+  try {
+    let count = 0;
+    f.onMeta(async () => {
+      const index = count++;
+      entered[index]!.resolve(); await release[index]!.promise;
+    });
+    const input = { sessionId: 'a', enabled: true, expectedVersion: 0 };
+    const first = f.invoke('assistant_watch', input, 'same-native-call');
+    await entered[0]!.promise;
+    const second = f.invoke('assistant_watch', input, 'same-native-call');
+    await entered[1]!.promise;
+    release[0]!.resolve();
+    assert.equal((await first as WatchResult).enabled, true);
+    const disabled = await f.invoke('assistant_watch', { sessionId: 'a', enabled: false, expectedVersion: 1 });
+    release[1]!.resolve();
+    assert.deepEqual(await second, { ...disabled as WatchResult, replayed: true });
+    assert.equal(f.store.managed('a'), false); assert.equal(f.store.watches().length, 1);
+    assert.deepEqual(f.calls, []);
+  } finally { for (const item of release) item.resolve(); f.close(); }
+});
+
+test('stopping an awaited watch validation rejects without writing attention or an operation receipt', async () => {
   const f = fixture(), entered = deferred(), release = deferred();
   try {
-    f.topic('topic', 'a');
-    f.onMeta(async id => { if (id === 'b') { entered.resolve(); await release.promise; } });
-    const first = f.invoke('assistant_topic', { topicId: 'topic', sessionId: 'b', title: 'Stale title' });
-    await entered.promise;
-    await f.invoke('assistant_topic', { topicId: 'topic', title: 'Current title' });
-    release.resolve();
-    await assert.rejects(first, { code: 'TOPIC_CHANGED' });
-    assert.equal(f.store.topic('topic').title, 'Current title');
-    assert.equal(f.store.topic('topic').session_id, 'a');
+    f.watch('a', false);
+    const before = f.store.watches(), seen = f.store.sql.prepare('SELECT * FROM seen').all();
+    f.onMeta(async () => { entered.resolve(); await release.promise; });
+    const editing = f.invoke('assistant_watch', { sessionId: 'a', enabled: true, expectedVersion: 1 });
+    const rejected = assert.rejects(editing, { code: 'STOPPING', status: 503 });
+    await entered.promise; f.assistant.stop(); release.resolve(); await rejected;
+    assert.deepEqual(f.store.watches(), before);
+    assert.deepEqual(f.store.sql.prepare('SELECT * FROM seen').all(), seen);
     assert.deepEqual(f.calls, []);
   } finally { release.resolve(); f.close(); }
+});
+
+test('stopping during caller validation does not return a successful replayed watch state', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    const input = { sessionId: 'a', enabled: true };
+    await f.invoke('assistant_watch', input, 'existing-operation');
+    f.native.caller = async call => {
+      entered.resolve(); await release.promise;
+      return { sessionId: call.sessionId!, toolCallId: call.toolCallId! };
+    };
+    const replay = f.invoke('assistant_watch', input, 'existing-operation');
+    const rejected = assert.rejects(replay, { code: 'STOPPING', status: 503 });
+    await entered.promise; f.assistant.stop(); release.resolve(); await rejected;
+    assert.equal(f.store.watch('a')!.version, 1); assert.deepEqual(f.calls, []);
+  } finally { release.resolve(); f.close(); }
+});
+
+test('queued observations cannot restore an idle latch across a disable and re-enable boundary', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    f.watch('a');
+    let firstRead = true;
+    f.onMeta(async id => {
+      if (id === 'a' && firstRead) {
+        firstRead = false; entered.resolve(); await release.promise;
+      }
+    });
+    const first = f.assistant.observe('a', message('first'));
+    await entered.promise;
+    const queued = f.assistant.observe('a', message('queued'));
+    assert.equal(f.store.inbox().length, 2, 'Already observed replies are durable before their queued metadata reads');
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: false });
+    await f.assistant.observe('a', idle());
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: true });
+    assert.equal(f.calls.length, 0);
+    release.resolve();
+    await Promise.all([first, queued]);
+    await f.assistant.observe('a');
+    await f.assistant.notify();
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['notified', 'notified']);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  } finally { release.resolve(); f.close(); }
+});
+
+test('disabling preserves pending, accepted and unknown pointers, read receipts, checkpoints and legacy history', async () => {
+  const f = fixture();
+  try {
+    f.watch('a'); f.store.saveTopic({ ...f.topic('legacy', 'a'), archived: true });
+    f.store.sql.exec(`INSERT INTO deliveries VALUES('old','assistant','input','legacy','hash','a','unknown',
+      'prompt',NULL,NULL,NULL,'Original uncertainty',1)`);
+    f.store.enqueue({ session_id: 'a', native_id: 'old-body', kind: 'reply',
+      text: 'Legacy private history', attachments: [], question: null });
+    f.store.removeResolved(f.store.inbox().map(item => item.id));
+    f.pointer('uncertain');
+    const unknown = f.store.reserveNotice()!;
+    f.store.settleNotice(unknown.id, null, false);
+    f.pointer('accepted');
+    const accepted = f.store.reserveNotice()!;
+    f.store.settleNotice(accepted.id, 'accepted-native-receipt', true);
+    f.pointer('pending');
+    f.store.enqueuePointer('a', 'current-question', 'ask');
+    f.sessions.get('a')!.ask = { requestId: 'current-question', question: 'Private current question' };
+    f.store.saveForegroundWake({ sessionId: 'assistant', state: 'unknown', error: 'Original load uncertainty' });
+    const first = await f.invoke('assistant_inbox') as { items: { id: string }[]; receipt: { id: string } };
+    const pendingId = f.store.inbox().find(item => item.native_id === 'pending')!.id;
+    await recordRead(f, first.receipt.id, [pendingId]);
+    const retained = () => ({
+      tables: ['topics', 'deliveries', 'mailbox'].map(table => f.store.sql.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()),
+      evidence: f.store.sql.prepare("SELECT * FROM seen WHERE id NOT LIKE 'watch:%' ORDER BY id").all(),
+    });
+    const before = retained(), reads = f.reads.length;
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: false, expectedVersion: 1 });
+    assert.deepEqual(retained(), before);
+    for (const event of [message('while-disabled'), { id: 'error-disabled', type: 'session.error', data: {} },
+      { id: 'abort-disabled', type: 'abort', data: {} }, idle()]) await f.assistant.observe('a', event);
+    await f.assistant.notify();
+    assert.deepEqual(retained(), before, 'Unwatch does not erase or automatically handle old work');
+    assert.equal(f.reads.length, reads, 'Disabled sources do not receive automatic metadata refreshes');
+    const listed = await f.invoke('assistant_inbox') as {
+      items: { id: string; watched: boolean; questionRequestId?: string; wake: { state: string; nativeMessageId: string | null } }[];
+      receipt: { id: string; progress: { readIds: string[] }[] };
+    };
+    assert.equal(f.reads.length, reads + 1, 'Explicit inbox checks the current native ask even when disabled');
+    assert.equal(listed.receipt.id, first.receipt.id);
+    assert.deepEqual(listed.receipt.progress[0]!.readIds, [pendingId]);
+    assert.ok(listed.items.every(item => item.watched === false && !Object.hasOwn(item, 'candidateTopicIds')));
+    assert.deepEqual(listed.items.map(item => item.wake.state), ['unknown', 'accepted', 'pending', 'pending']);
+    assert.equal(listed.items[1]!.wake.nativeMessageId, 'accepted-native-receipt');
+    assert.equal(listed.items[3]!.questionRequestId, 'current-question');
+    assert.doesNotMatch(JSON.stringify(listed), /Legacy private history|Private current question/);
+    assert.deepEqual(retained(), before);
+    await recordRead(f, first.receipt.id, first.items.map(item => item.id));
+    await f.invoke('assistant_resolve', { receiptId: first.receipt.id, disposition: 'silent' });
+    assert.deepEqual(f.store.inbox(), []);
+    assert.equal(f.store.sql.prepare('SELECT text FROM mailbox').get()!.text, 'Legacy private history');
+    assert.equal(f.store.foregroundWake()!.state, 'unknown');
+    assert.deepEqual(f.calls, []);
+  } finally { f.close(); }
+});
+
+test('disabled ask pointers remain available only after explicit native confirmation and unreadable asks still reject', async () => {
+  for (const error of [transition(), new Error('Native ask metadata unavailable')]) {
+    const f = fixture();
+    try {
+      f.watch('a', false); f.store.enqueuePointer('a', 'ask', 'ask');
+      f.sessions.get('a')!.ask = { requestId: 'ask', question: 'Current question' };
+      f.onMeta(async () => { throw error; });
+      await f.assistant.observe('a'); await f.assistant.notify();
+      assert.deepEqual(f.reads, []);
+      for (const input of [{}, { peek: true }])
+        await assert.rejects(f.invoke('assistant_inbox', input), value => value === error);
+      assert.equal(f.store.inbox()[0]!.native_id, 'ask');
+      f.onMeta(null);
+      const current = await f.invoke('assistant_inbox') as { items: { watched: boolean; questionRequestId: string }[] };
+      assert.equal(current.items[0]!.watched, false); assert.equal(current.items[0]!.questionRequestId, 'ask');
+      f.sessions.get('a')!.ask = null;
+      await f.assistant.notify();
+      assert.equal(f.store.inbox().length, 1, 'Automatic notification passes leave disabled asks untouched');
+      assert.deepEqual(await f.invoke('assistant_inbox', { peek: true }), { count: 0 });
+      assert.deepEqual(f.store.inbox(), []); assert.deepEqual(f.calls, []);
+    } finally { f.close(); }
+  }
+});
+
+test('disabling during source metadata sampling keeps the captured pointer but admits no later reply or ask', async () => {
+  const f = fixture(), entered = deferred(), release = deferred();
+  try {
+    f.watch('a');
+    f.sessions.get('a')!.ask = { requestId: 'not-yet-captured', question: 'Current question' };
+    f.onMeta(async () => { entered.resolve(); await release.promise; });
+    const observation = f.assistant.observe('a', message('before-disable'));
+    await entered.promise;
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: false });
+    await f.assistant.observe('a', message('after-disable'));
+    release.resolve(); await observation;
+    assert.deepEqual(f.store.inbox().map(item => [item.native_id, item.notice_state]), [['message-before-disable', 'pending']]);
+    assert.deepEqual(f.reads, ['a']); assert.deepEqual(f.calls, []);
+  } finally { release.resolve(); f.close(); }
+});
+
+test('disabling before notice reservation fences pending source, foreground and in-flight load samples', async () => {
+  for (const phase of ['source', 'foreground', 'load']) {
+    const f = fixture(), entered = deferred(), release = deferred();
+    try {
+      pending(f);
+      if (phase === 'source') f.onMeta(async () => { entered.resolve(); await release.promise; });
+      if (phase === 'foreground') f.native.foreground = async () => {
+        entered.resolve(); await release.promise; return f.sessions.get('assistant')!;
+      };
+      if (phase === 'load') {
+        f.sessions.get('assistant')!.loaded = false;
+        f.onCall(async () => { entered.resolve(); await release.promise; });
+      }
+      const sending = f.assistant.notify();
+      await entered.promise;
+      await f.invoke('assistant_watch', { sessionId: 'a', enabled: false, expectedVersion: 1 });
+      release.resolve(); await sending;
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+      assert.deepEqual(f.calls.map(call => call.name), phase === 'load' ? ['session/load'] : []);
+      if (phase === 'load') assert.equal(f.store.foregroundWake()!.state, 'loaded', 'Do not cancel an already accepted original load');
+      assert.deepEqual(f.errors, []);
+    } finally { release.resolve(); f.close(); }
+  }
+});
+
+test('disabling an in-flight notice preserves accepted or unknown outcomes and re-enabling never cancels or retries them', async () => {
+  for (const outcome of ['accepted', 'lost', 'missing', 'rejected']) {
+    const f = fixture(), entered = deferred(), release = deferred();
+    try {
+      pending(f);
+      if (outcome === 'lost') f.fail('prompt');
+      if (outcome === 'missing') f.missingReceipt();
+      if (outcome === 'rejected') f.rejectPrompt();
+      f.onCall(async () => { entered.resolve(); await release.promise; });
+      const sending = f.assistant.notify();
+      await entered.promise;
+      const reserved = f.store.inbox()[0]!;
+      assert.equal(reserved.notice_state, 'calling');
+      await f.invoke('assistant_watch', { sessionId: 'a', enabled: false });
+      assert.deepEqual(f.store.inbox()[0], reserved);
+      release.resolve(); await sending;
+      const settled = f.store.inbox()[0]!;
+      assert.equal(settled.notice_state, outcome === 'accepted' ? 'notified' : 'unknown');
+      assert.equal(settled.notice_id, reserved.notice_id);
+      assert.equal(settled.notification_receipt !== null, outcome === 'accepted' || outcome === 'rejected');
+      f.store.recover();
+      await f.invoke('assistant_watch', { sessionId: 'a', enabled: true, expectedVersion: 2 });
+      await f.assistant.observe('a', idle()); await f.assistant.notify();
+      assert.deepEqual(f.store.inbox()[0], settled);
+      assert.deepEqual(f.calls.map(call => call.name), ['prompt']);
+      assert.equal(f.errors.length, outcome === 'accepted' ? 0 : 1);
+    } finally { release.resolve(); f.close(); }
+  }
+});
+
+test('re-enabling does not scan history or notify until a natural event, and never replays uncertain wakes', async () => {
+  const f = fixture();
+  try {
+    f.watch('a'); f.pointer('uncertain');
+    const uncertain = f.store.reserveNotice()!;
+    f.store.settleNotice(uncertain.id, null, false);
+    f.pointer('pending');
+    const retained = f.store.inbox();
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: false });
+    await f.assistant.observe('a', message('missed-while-disabled')); await f.assistant.observe('a', idle());
+    const reads = f.reads.length;
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: true, expectedVersion: 2 });
+    assert.deepEqual(f.reads.slice(reads), ['a'], 'Only existence is checked; no history discovery or replay');
+    assert.deepEqual(f.store.inbox(), retained); assert.equal(f.calls.length, 0);
+    await f.assistant.observe('a', idle());
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['unknown', 'notified']);
+    assert.equal(f.calls.length, 1);
+    const notice = (f.calls[0]!.body as { text: string }).text;
+    assert.ok(notice.includes(retained[1]!.id)); assert.ok(!notice.includes(retained[0]!.id));
+    await f.assistant.observe('a', message('future-after-enable'));
+    assert.equal(f.calls.length, 1, 'A fresh reply still waits for an actual idle event');
+    await f.assistant.observe('a', idle());
+    assert.equal(f.calls.length, 2);
+    assert.deepEqual(f.store.inbox().map(item => item.native_id), ['uncertain', 'pending', 'message-future-after-enable']);
+    assert.equal(f.store.inbox()[0]!.notice_state, 'unknown');
+    assert.deepEqual(f.store.topics(), []);
+  } finally { f.close(); }
+});
+
+test('a reply captured before disabling is not stuck behind an idle event ignored while disabled', async () => {
+  const f = fixture();
+  try {
+    f.watch('a'); f.pointer('uncertain');
+    const uncertain = f.store.reserveNotice()!;
+    f.store.settleNotice(uncertain.id, null, false);
+    const source = f.sessions.get('a')!;
+    source.status = 'running'; source.activity!.processing = true; source.activity!.hasActiveWork = true;
+    await f.assistant.observe('a', message('before-disable'));
+    const retained = f.store.inbox();
+    assert.deepEqual(retained.map(item => item.notice_state), ['unknown', 'pending']);
+    assert.equal(f.calls.length, 0);
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: false, expectedVersion: 1 });
+    const reads = f.reads.length;
+    source.status = 'idle'; source.activity!.processing = false; source.activity!.hasActiveWork = false;
+    await f.assistant.observe('a', idle());
+    assert.equal(f.reads.length, reads, 'Disabled observation does not process the root idle event');
+    assert.deepEqual(f.store.inbox(), retained); assert.equal(f.calls.length, 0);
+    await f.invoke('assistant_watch', { sessionId: 'a', enabled: true, expectedVersion: 2 });
+    assert.deepEqual(f.reads.slice(reads), ['a'], 'Re-enable only validates the existing native identity');
+    assert.deepEqual(f.store.inbox(), retained);
+    assert.equal(f.calls.length, 0, 'Re-enable itself neither loads, scans history nor sends a wake');
+    await f.assistant.observe('a');
+    assert.deepEqual(f.store.inbox().map(item => item.notice_state), ['unknown', 'notified']);
+    assert.deepEqual(f.store.inbox()[0], retained[0], 'An uncertain old wake remains unchanged');
+    assert.deepEqual(f.calls.map(call => call.name), ['prompt']);
+    const notice = (f.calls[0]!.body as { text: string }).text;
+    assert.ok(notice.includes(retained[1]!.id)); assert.ok(!notice.includes(retained[0]!.id));
+    await f.assistant.observe('a'); await f.assistant.notify();
+    assert.equal(f.calls.length, 1, 'Fresh native idle metadata admits the pending pointer exactly once');
+    assert.deepEqual(f.store.topics(), []); assert.deepEqual(f.errors, []);
+  } finally { f.close(); }
 });
 
 test('foreground is query-only and reports the role owner without a separate selection', async () => {
@@ -623,21 +1065,26 @@ test('foreground health retains the configured identity when metadata is missing
   }
 });
 
-test('explicit rebind repairs unknown mappings while retaining archived creation and error facts', async () => {
+test('retired topic writes cannot repair legacy mappings or erase their retained creation and error facts', async () => {
   const f = fixture();
   try {
     const legacy = { stage: 'creation', sessionId: 'possibly-created', promptAttempted: false };
     f.store.saveTopic({ ...f.topic('legacy', null), mapping_state: 'unknown',
       mapping_error: 'Creation acknowledgement lost', creation_receipt: legacy });
-    await f.invoke('assistant_topic', { topicId: 'legacy', sessionId: 'b' });
-    const repaired = f.store.topic('legacy');
-    assert.equal(repaired.session_id, 'b');
-    assert.equal(repaired.mapping_state, 'bound');
-    assert.equal(repaired.mapping_error, 'Creation acknowledgement lost');
-    assert.deepEqual(repaired.creation_receipt, legacy);
-    assert.equal(repaired.version, 2);
-    await assert.rejects(f.invoke('assistant_topic', { topicId: 'legacy', sessionId: 'missing' }), { code: 'MAPPING_TARGET' });
-    assert.deepEqual(f.store.topic('legacy'), repaired);
+    const before = f.store.topic('legacy');
+    for (const input of [{ topicId: 'legacy', sessionId: 'b' }, { topicId: 'legacy', archived: true },
+      { topicId: 'legacy', sessionId: 'missing' }])
+      await assert.rejects(f.invoke('assistant_topic', input), { code: 'TOOL_RETIRED', status: 410 });
+    await f.invoke('assistant_watch', { sessionId: 'b', enabled: true });
+    await f.invoke('assistant_watch', { sessionId: 'b', enabled: false });
+    const listing = await f.invoke('assistant_topics') as { items: {
+      mappingState: string; error: string; creationReceipt: unknown; readOnly: boolean; version: number;
+    }[] };
+    assert.equal(listing.items[0]!.mappingState, 'unknown');
+    assert.equal(listing.items[0]!.error, 'Creation acknowledgement lost');
+    assert.deepEqual(listing.items[0]!.creationReceipt, legacy);
+    assert.equal(listing.items[0]!.readOnly, true); assert.equal(listing.items[0]!.version, 1);
+    assert.deepEqual(f.store.topic('legacy'), before);
     assert.deepEqual(f.calls, []);
   } finally { f.close(); }
 });
@@ -749,7 +1196,7 @@ test('empty and filtered inbox pages do not create receipts or consume unrelated
 test('interrupted handling receipts remain paginated and repeated handling never restores items', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     const ids: string[] = [];
     for (let index = 0; index < 52; index++) {
       f.pointer(`result-${index}`);
@@ -780,7 +1227,7 @@ test('interrupted handling receipts remain paginated and repeated handling never
 test('an expired ask receipt can be handled harmlessly without answering a native question', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a'); f.sessions.get('assistant')!.status = 'running';
+    f.watch('a'); f.sessions.get('assistant')!.status = 'running';
     f.sessions.get('a')!.ask = { requestId: 'ask', question: 'Original question' };
     await f.assistant.observe('a');
     const first = await f.invoke('assistant_inbox') as { receipt: { id: string } };
@@ -911,7 +1358,7 @@ test('gapped reads require explicit reset and complete Chat reports require actu
 test('read reports cannot cover another caller, source or IDs outside their receipt', async () => {
   const f = fixture();
   try {
-    pending(f); f.topic('second-topic', 'b'); f.pointer('second', 'b');
+    pending(f); f.watch('b'); f.pointer('second', 'b');
     const page = await f.invoke('assistant_inbox') as { receipt: { id: string }; items: { id: string }[] };
     const base = { receiptId: page.receipt.id, sessionId: 'a', readIds: [page.items[0]!.id], complete: true,
       position: { query: { source: 'persisted', direction: 'backward' }, nextQuery: null, boundaryEventId: 'event-pending' } };
@@ -931,7 +1378,7 @@ test('read reports cannot cover another caller, source or IDs outside their rece
 test('only managed primary messages become body-free pointers and idle is not proof of success', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a'); f.sessions.get('assistant')!.status = 'running';
+    f.watch('a'); f.sessions.get('assistant')!.status = 'running';
     const event = { ...message('reply', 'Private result body'), data: {
       messageId: 'native-reply', content: 'Private result body', reasoningOpaque: 'encrypted reasoning',
       toolRequests: [{ toolCallId: 'internal-action' }],
@@ -959,7 +1406,7 @@ test('only managed primary messages become body-free pointers and idle is not pr
 test('legacy body rows remain archived unchanged while new listing, observation and handling use pointers only', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a'); f.sessions.get('assistant')!.status = 'running';
+    f.watch('a'); f.sessions.get('assistant')!.status = 'running';
     f.store.enqueue({ session_id: 'a', native_id: 'message-legacy', kind: 'reply',
       text: 'Preserved legacy private body', attachments: [], question: null }, 'pending',
     { eventId: 'legacy', timestamp: null });
@@ -984,7 +1431,7 @@ test('legacy body rows remain archived unchanged while new listing, observation 
 test('progress, queued and unknown source activity wait for known idle and an idle foreground', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     const source = f.sessions.get('a')!;
     source.status = 'running'; source.activity!.processing = true; source.activity!.hasActiveWork = true;
     for (const event of [message('progress'), message('final-a'), message('queued-b'), message('final-b')])
@@ -1010,7 +1457,7 @@ test('progress, queued and unknown source activity wait for known idle and an id
 test('current asks can wake a running source without bundling unfinished progress or exposing question bodies', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a'); f.sessions.get('assistant')!.loaded = false;
+    f.watch('a'); f.sessions.get('assistant')!.loaded = false;
     const source = f.sessions.get('a')!;
     source.status = 'running'; source.activity!.processing = true;
     source.ask = { requestId: 'current', question: 'Private question', choices: ['A', 'B'] };
@@ -1035,7 +1482,7 @@ test('current asks can wake a running source without bundling unfinished progres
 test('stale asks expire while unloaded asks retain identity without claiming read or presentation', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a'); f.sessions.get('assistant')!.status = 'running';
+    f.watch('a'); f.sessions.get('assistant')!.status = 'running';
     const source = f.sessions.get('a')!;
     source.ask = { requestId: 'old', question: 'Old' }; await f.assistant.observe('a');
     source.ask = { requestId: 'new', question: 'Current' }; await f.assistant.observe('a');
@@ -1057,7 +1504,7 @@ test('stale asks expire while unloaded asks retain identity without claiming rea
 test('manual handling before source idle does not leave a fresh reminder', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     const source = f.sessions.get('a')!;
     source.status = 'running'; source.activity!.processing = true;
     await f.assistant.observe('a', message('manual-progress'));
@@ -1072,7 +1519,7 @@ test('abort and error pointers retain incomplete native identities, not successf
   for (const type of ['abort', 'session.error']) {
     const f = fixture();
     try {
-      f.topic('topic', 'a');
+      f.watch('a');
       const source = f.sessions.get('a')!;
       source.status = 'running'; source.activity!.processing = true;
       const event = { id: type, type, data: { message: 'Failure detail' } };
@@ -1129,7 +1576,7 @@ test('the original notification promise drains follow-up sends and records an in
 test('an arrival during empty notification-loop exit receives a reminder without another wake', async () => {
   const f = fixture();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     const empty = f.assistant.notify(), arrived = f.assistant.observe('a', message('at-loop-exit'));
     const settled = f.assistant.observe('a', idle());
     await Promise.all([empty, arrived, settled]);
@@ -1140,7 +1587,7 @@ test('an arrival during empty notification-loop exit receives a reminder without
 test('overlapping callbacks drain in order and do not flush a partial batch on idle metadata alone', async () => {
   const f = fixture(), entered = deferred(), release = deferred();
   try {
-    f.topic('topic', 'a');
+    f.watch('a');
     let first = true;
     f.onMeta(async id => { if (id === 'a' && first) { first = false; entered.resolve(); await release.promise; } });
     const progress = f.assistant.observe('a', message('slow-progress'));
@@ -1159,7 +1606,7 @@ test('overlapping callbacks drain in order and do not flush a partial batch on i
 test('source resumption while another source is sampled invalidates notice eligibility before reservation', async () => {
   const f = fixture(), entered = deferred(), release = deferred();
   try {
-    f.topic('one', 'a'); f.topic('two', 'b'); f.pointer('a'); f.pointer('b', 'b');
+    f.watch('a'); f.watch('b'); f.pointer('a'); f.pointer('b', 'b');
     let paused = false;
     f.onMeta(async id => { if (id === 'b' && !paused) { paused = true; entered.resolve(); await release.promise; } });
     const notice = f.assistant.notify();
@@ -1179,7 +1626,7 @@ test('ask invalidation during another source lookup never returns stale question
   for (const unloaded of [true, false]) {
     const f = fixture(), entered = deferred(), release = deferred();
     try {
-      f.topic('one', 'a'); f.topic('two', 'b'); f.sessions.get('assistant')!.status = 'running';
+      f.watch('a'); f.watch('b'); f.sessions.get('assistant')!.status = 'running';
       for (const id of ['a', 'b']) {
         f.sessions.get(id)!.ask = { requestId: id, question: id }; await f.assistant.observe(id);
       }

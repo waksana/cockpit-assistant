@@ -15,20 +15,7 @@
         "assistant": {
           "type": "http",
           "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_topic", "assistant_search", "assistant_foreground", "assistant_inbox", "assistant_checkpoint", "assistant_resolve"]
-        }
-      }
-    },
-    {
-      "id": "organizer",
-      "name": "Topic organizer",
-      "instructions": "dist/roles/organizer.md",
-      "skillDirectories": ["skills"],
-      "mcpServers": {
-        "assistant": {
-          "type": "http",
-          "path": "/mcp",
-          "tools": ["assistant_topics", "assistant_topic"]
+          "tools": ["assistant_topics", "assistant_watches", "assistant_watch", "assistant_search", "assistant_foreground", "assistant_inbox", "assistant_checkpoint", "assistant_resolve"]
         }
       }
     }

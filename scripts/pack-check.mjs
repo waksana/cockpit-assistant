@@ -12,8 +12,10 @@ try {
   assert.equal(manifest.frontend, undefined);
   const [pack] = JSON.parse(execFileSync('npm', ['pack', '--json', '--ignore-scripts', '--pack-destination', temporary], { encoding: 'utf8' }));
   const files = new Set(pack.files.map(file => file.path));
-  assert.ok(!manifest.roles.some(role => role.id === 'worker'));
-  assert.ok(!files.has('roles/worker.md') && !files.has('dist/roles/worker.md'));
+  for (const retired of ['worker', 'organizer']) {
+    assert.ok(!manifest.roles.some(role => role.id === retired));
+    assert.ok(!files.has(`roles/${retired}.md`) && !files.has(`dist/roles/${retired}.md`));
+  }
   for (const path of [manifest.backend,
     'cockpit.module.json', 'README.md', 'dist/migrate.js',
     'skills/assistant-topics/SKILL.md', ...manifest.roles.map(role => role.instructions)]) {
@@ -25,13 +27,13 @@ try {
   assert.equal(typeof backend.activate, 'function');
   const skill = (await readFile(join(temporary, 'package/skills/assistant-topics/SKILL.md'), 'utf8'))
     .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim();
-  for (const role of manifest.roles.filter(role => role.id === 'coordinator' || role.id === 'organizer')) {
+  for (const role of manifest.roles.filter(role => role.id === 'coordinator')) {
     const instructions = await readFile(join(temporary, 'package', role.instructions), 'utf8');
     assert.ok(instructions.endsWith(`${skill}\n`), `Packaged ${role.id} must include the actual shared Skill body`);
   }
   await verifySchemaBoundary(backend.activate, temporary, join(temporary, 'package/dist/migrate.js'));
   console.log(`Pack closure verified: ${pack.filename}`);
-  console.log('Packaged migration retains schema 3/4 archives and moves unread entries into the minimal schema 5');
+  console.log('Packaged migration retains schema 3/4/5 records and preserves attention in schema 6');
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }

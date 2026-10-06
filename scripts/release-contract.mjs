@@ -4,11 +4,11 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { applicationTables, schemaVersion } from './schema-preflight.mjs';
-import { preservedTopics, schema5Migrations } from './migration-contract.mjs';
+import { preservedSchema, schema6Migrations } from './migration-contract.mjs';
 
 export const repository = 'waksana/cockpit-assistant';
 // The role consumes these through the external Host MCP, not module wrappers.
-export const agentRequiredIntents = ['session/chat/text', 'session/new', 'session/get', 'session/load', 'prompt', 'respondAsk'];
+export const agentRequiredIntents = ['session/directory', 'session/chat/text', 'session/new', 'session/get', 'session/load', 'prompt', 'respondAsk'];
 export const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 export function identity(sequence, sourceSha) {
   assert.match(String(sequence), /^[1-9]\d*$/);
@@ -85,9 +85,9 @@ export async function product(root) {
         'roleAssignment.v1', 'roleAvailability.v1', 'sessionDirectory.v1', 'chatRead.v1'],
       requiredIntents: [...new Set([...agentRequiredIntents, ...hostSources.flatMap(source =>
         [...source.matchAll(/host\.call\('([^']+)'/g)].map(match => match[1]))])].sort(),
-      databases: [{ path: 'assistant.sqlite', schema, preserve: preservedTopics() },
+      databases: [{ path: 'assistant.sqlite', schema, preserve: preservedSchema(5) },
         { path: 'recent.sqlite', schema: 1, preserve: [], initialization: 'rebuildable-cache' }],
-      migrations: schema5Migrations,
+      migrations: schema6Migrations,
     };
     assertMigrationTargets(result);
     return result;

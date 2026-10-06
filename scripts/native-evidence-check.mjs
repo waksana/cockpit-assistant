@@ -50,10 +50,11 @@ export async function runNativeCheck(mode = 'evidence') {
   }
   const errors = [], diagnostics = [], events = [], requests = [], calls = [], intents = [];
   const gates = new Map(), sourceCounts = new Map(), checkpoints = new Map();
-  let engine, runtime, app, moduleHost, provider, foregroundId, sourceId, topicId, plan, clean = false;
-  const hostTools = ['cockpit_new_session', 'cockpit_get_session', 'cockpit_reload_session',
+  let engine, runtime, app, moduleHost, provider, foregroundId, sourceId, plan, clean = false;
+  const hostTools = ['cockpit_new_session', 'cockpit_list_sessions', 'cockpit_get_session', 'cockpit_reload_session',
     'cockpit_send_prompt', 'cockpit_respond_ask', 'cockpit_read_session_text'];
-  const assistantTools = ['assistant_topics', 'assistant_topic', 'assistant_search', 'assistant_foreground',
+  // Directory discovery is advertised; this isolated fixture creates known IDs instead of invoking cockpit_list_sessions.
+  const assistantTools = ['assistant_topics', 'assistant_watches', 'assistant_watch', 'assistant_search', 'assistant_foreground',
     'assistant_inbox', 'assistant_checkpoint', 'assistant_resolve'];
   const scope = { builtins: [], mcpServers: [
     { name: 'assistant', tools: assistantTools }, { name: 'cockpit', tools: hostTools },
@@ -442,11 +443,14 @@ export async function runNativeCheck(mode = 'evidence') {
         sourceId = /Created session ([0-9a-f-]{36})/.exec(String(value))?.[1];
         assert.ok(sourceId, JSON.stringify(value));
       }),
-      step('assistant_topic', () => ({ title: 'Synthetic ordinary source', sessionId: sourceId }), value => {
-        assert.equal(value.sessionId, sourceId); topicId = value.topicId;
+      step('assistant_watch', () => ({ sessionId: sourceId, enabled: true, expectedVersion: 0 }), value => {
+        assert.equal(value.sessionId, sourceId); assert.equal(value.enabled, true);
+        assert.equal(value.version, 1); assert.equal(value.replayed, false);
       }),
       step('assistant_foreground', {}, value => assert.equal(value.foregroundSessionId, foregroundId)),
-      step('assistant_topics', {}, value => assert.ok(value.items.some(item => item.topicId === topicId))),
+      step('assistant_watches', {}, value => assert.ok(value.items.some(item =>
+        item.sessionId === sourceId && item.enabled && item.version === 1))),
+      step('assistant_topics', {}, value => assert.deepEqual(value.items, [])),
     ]);
     assert.deepEqual((await engine.getMeta(sourceId)).roles, []);
     assert.ok(requests[0].tools.every(tool => {

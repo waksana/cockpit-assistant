@@ -1,11 +1,11 @@
-# Directory, inbox and one Skill
+# Native sessions, independent attention and one Skill
 
 ```text
-User <-> native Assistant Chat -> Host MCP -> session create/load/prompt/ask
+User <-> native Assistant Chat -> Host MCP -> session discovery/create/load/prompt/ask
                   |                  +-----> native lightweight Chat/status
-                  +-> Assistant MCP -> directory / recent search / inbox / checkpoint / handling
+                  +-> Assistant MCP -> watches / optional search / inbox / checkpoint / handling
                   ^                         |
-                  +-- enqueue update pointer+ <- registered source idle / ask
+                  +-- enqueue update pointer+ <- watched source idle / ask
 ```
 
 The entrance owns conversational context, topic interpretation/routing and
@@ -22,8 +22,8 @@ or extra requirements. Reply integration is faithful, without work-order templat
 or routine attribution.
 
 The agent uses direct Host tools for session creation, prompt/steering and native
-ask answers. The module supplies a responsibility directory, recent-session
-search, inbox and shared guidance. The unique coordinator role owner receives
+ask answers. The module supplies independent session attention, optional recent-session
+search, read-only legacy hints, inbox and shared guidance. The unique coordinator role owner receives
 reminders; there is no independently selected notification address. Native Chat
 and status remain direct Host capabilities, not business execution wrappers.
 
@@ -37,19 +37,29 @@ MCP resources are assembled separately with exact creation-time scope.
 
 ## Persistence
 
-Schema 5 retains its exact four table definitions:
+Schema 6 adds session attention while retaining all four schema-5 tables unchanged:
 
 | Table | Responsibility |
 | --- | --- |
-| `topics` | Identity, responsibility, scope and session mapping; retained legacy creation receipts. |
+| `watches` | Independent session notification choices, revision and update time; no responsibility or progress copy. |
+| `topics` | Read-only legacy identity/scope/mapping hints and creation receipts. Not the notification source set. |
 | `deliveries` | Inert legacy routing archive, never replayed on startup. |
 | `mailbox` | New native event/message/ask pointers; legacy body/snapshot rows remain in-place as historical data. |
 | `seen` | Native-ID tombstones, returned inbox ranges/agent handling and historical wake attempts; old foreground selection, routing and provenance facts are inert. |
 
-Multiple topics can refer to a session. Explicit registration only accepts an
-existing native ID. Old descriptions containing progress remain background,
-not rewritten or promoted into current facts. Legacy deliveries and creation
-fields are not replayed or reset on startup.
+The explicit offline migration seeds one watch per distinct legacy mapped session,
+including archived topics to preserve the old observer's scope. It does not guess
+identities from unfinished creation receipts or enroll unrelated delivery history.
+Old descriptions and original mappings remain byte-preserved background, not
+rewritten or promoted into current facts. Repeated migration/restart never derives
+attention from topics again. Legacy deliveries and creation fields are not replayed.
+
+The organizer role and topic writes are retired. Coordinator owns natural
+conversation, not directory maintenance. It starts with known session context,
+reads authoritative native sources on demand and uses an index only when useful.
+No source needs a topic before receiving a prompt or contributing watched updates.
+Other composed discovery capabilities remain optional; no particular metadata
+system is a required route.
 
 ### Independent recent-message cache
 
@@ -94,11 +104,18 @@ See [search API and budgets](api.md#recent-session-discovery).
 
 ## Observation and handling
 
-Only explicitly registered sources contribute inbox updates. Reply content is represented by
+Only enabled session watches contribute new inbox updates. Reply content is represented by
 native source pointers, not a transcript mirror. Primary nonempty message bodies
 are eligible even when accompanied by tool calls; tool payloads/results and
 subagent/ephemeral streams are not separate updates. Errors/aborts retain source
 identities and do not establish success.
+
+Watch changes use a per-session revision and native call idempotency. Enabling
+checks an existing native identity without loading or prompting; disabling can
+retain a tombstone for a deleted session. A disabled source's old pointers and
+read/handling state remain explicitly readable, but cannot generate new wakes.
+The service does not cancel accepted wakes or replay history on re-enable.
+Interest is not responsibility, lifecycle, authorization or business completion.
 
 New ordinary updates wait for root `session.idle`, not `assistant.turn_end`.
 Unknown activity, active work or queues and unloaded state cannot establish idle.
@@ -109,9 +126,11 @@ directly, including after context loss or missed observations.
 Current native asks bypass source-idle waiting. Ask request IDs are checked against
 loaded live state; question bodies/options are read directly from Host `get_session`.
 Stale asks expire, unavailable ones stay pending. Per-source
-serialized observations and versioned samples reject stale asynchronous facts.
+serialized metadata reads and versioned samples reject stale asynchronous facts.
 Trusted primary reply/error/abort pointers and root idle bookkeeping are
-captured before sampling native metadata. A typed `SESSION_TRANSITION` from
+captured when the event is admitted, before queuing metadata reads. Older queued
+reads cannot restore an idle latch after attention is disabled and re-enabled.
+A typed `SESSION_TRANSITION` from
 that passive sample defers the source without losing the pointer or declaring
 it idle. Deferred sources do not block unrelated eligible sources; unreadable
 asks remain pending and are not presented as live. Explicit inbox reads
@@ -188,9 +207,10 @@ current Host Chat, honor attention preferences and preserve uncertainty.
 Guidance does not constitute a service authorization layer. `immediate` steers
 an active run, not aborts it or clears its queue. Ask answers use exact live
 request IDs through Host tools, not guessed dispatch text.
-Session selection starts with the current goal and intent, then identifies actual
-responsibility using the directory, recent search and relevant composed discovery
-capabilities. Clearly relevant candidates are not excluded by recent snippets alone;
+Session selection starts with the current goal, intent and known session context,
+then uses authoritative native discovery/Chat and relevant composed capabilities
+only to resolve missing evidence. Recent search and legacy topic hints are optional,
+not ordered gates. Clearly relevant candidates are not excluded by recent snippets alone;
 scope corrections reopen the comparison, not automatically the execution. Native
 Chat and current activity/queues establish context and suitability, not a substitute
 for enduring scope. An existing integration owner retains business decomposition
@@ -203,7 +223,7 @@ Queue acceptance does not establish suitability.
 
 | Input | Expected entrance behavior |
 | --- | --- |
-| "Find our export topic" / "What has changed recently?" | Locate topics and summarize actual recent evidence without starting new business work. |
+| "Find our export discussion" / "What has changed recently?" | Locate relevant sessions and summarize actual native evidence without starting new business work or requiring a topic entry. |
 | "How should the export work?" | Reuse a suitable export session, or search recent candidates and create only if none fits. Do not ask about devices or propose formats at the entrance. |
 | "Why are you analyzing business questions yourself?" | Resolve "you" to Assistant coordinator and select a session matching this routing discussion, not a catch-all product owner; do not first diagnose the Skill. |
 | "Why did you send such a long message?" continuing a routing discussion | Continue the question in the suitable discussion session, resolving "you" to Assistant only if needed and adding only missing facts about the message. Do not append an analysis agenda, required recommendations or a reporting template. |
@@ -212,6 +232,8 @@ Queue acceptance does not establish suitability.
 | An integrated goal spans several areas and a clearly relevant candidate's recent snippet covers only one subtask | Use relevant available discovery guidance and native Chat to establish the candidate's actual scope. If it already owns integration, continue there and retain its execution owners rather than splitting the goal at the entrance. |
 | The user corrects a partial request to an overall goal after one recipient was chosen | Reconsider the relevant candidates and responsibility evidence, not just the first recipient's current work. The correction alone does not authorize duplicate dispatch or cancellation. |
 | Current evidence already establishes a suitable recipient | Reuse it; do not require another metadata lookup or a full directory scan merely to satisfy a checklist. |
+| A session has no topic mapping but its updates matter to this conversation | Enable its independent watch before sending the relevant authorized prompt. Do not invent a topic or enroll other search candidates. |
+| A legacy topic is archived or its text is stale | Treat it only as an optional locator. It cannot alter the watch or override current native context. |
 | A correction, constraint, material or answer needed by an active execution | Keep the executing session as recipient despite its workload; answer its exact current ask or choose enqueue/authorized steering according to urgency and intent. |
 | A candidate is `running`, has a shell or has been active for a long time | Combine recent native Chat goals/phases with current activity and queues; no one signal proves heavy work, and unknown activity does not prove idle. |
 | A busy candidate has a superior or several related sessions | Do not mechanically escalate or broadcast; select the specific recipient needed for each necessary action. |

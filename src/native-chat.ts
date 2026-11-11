@@ -2,7 +2,7 @@ import type { McpInvocationMeta, ModuleHostApi, PublicSessionMeta, RoleAssignmen
   RoleAssignmentNotification, RoleAvailabilityCheck, ModuleRoleAvailabilityReason, RoleSelection,
 } from '@waksana/cockpit-module-sdk/backend';
 import { z } from 'zod';
-import { requireFact } from './errors.ts';
+import { ForegroundDiscoveryInvalidated, requireFact } from './errors.ts';
 import type { Caller, Gateway } from './gateway.ts';
 import type { Store } from './store.ts';
 
@@ -99,8 +99,7 @@ export class NativeChat implements Gateway {
     const owners = await this.owners();
     const assertCurrent = () => {
       this.assertOpen();
-      requireFact(discovery === this.discovery, 'FOREGROUND_CHANGED',
-        'Coordinator ownership changed during discovery; no stale destination can be used');
+      if (discovery !== this.discovery) throw new ForegroundDiscoveryInvalidated();
     };
     assertCurrent();
     requireFact(owners.length <= 1, 'COORDINATOR_CONFLICT',

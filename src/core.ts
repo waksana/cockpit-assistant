@@ -1,6 +1,6 @@
 import type { McpInvocationMeta, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
 import { z } from 'zod';
-import { BusinessError, errorText, requireFact, sampleMetadata, type MetadataSample } from './errors.ts';
+import { BusinessError, ForegroundDiscoveryInvalidated, errorText, requireFact, sampleMetadata, type MetadataSample } from './errors.ts';
 import type { Caller, Gateway } from './gateway.ts';
 import { Store, fingerprint, type InboxItem, type Topic, type Watch } from './store.ts';
 import { Inbox, checkpointInput, resolveInput } from './inbox.ts';
@@ -51,12 +51,14 @@ export class Assistant {
   readonly inbox: Inbox;
   private notice: Promise<void> | null = null;
   private noticeAgain = false;
+  private notificationVersion = 0;
+  private notificationsBlockedThrough = 0;
   private observations = new Map<string, Promise<void>>();
   private awaitingIdle = new Set<string>();
   private sourceVersions = new Map<string, number>();
   private watchEdits = new Map<string, number>();
   private deferredSources = new Map<string, number>();
-  private coordinatorDeferred = false;
+  private coordinatorDeferredCode: 'SESSION_TRANSITION' | 'COORDINATOR_DISCOVERY_INVALIDATED' | null = null;
   private foregroundObservation = { sessionId: '', version: 0 };
   private stopped = false;
   constructor(readonly store: Store, readonly native: Gateway, readonly config: Config,
@@ -126,7 +128,7 @@ export class Assistant {
       const sample = await this.sampleForeground();
       if (sample.state === 'deferred') return {
         foregroundSessionId: this.native.foregroundId(), destination: 'coordinator-role' as const,
-        current: { checkedAt, status: 'deferred', code: 'SESSION_TRANSITION' },
+        current: { checkedAt, status: 'deferred', code: sample.code },
         lastWakeAttempt, pendingUpdates: this.store.inbox().length, observations: this.observationHealth(),
       };
       const meta = sample.meta;
@@ -144,14 +146,20 @@ export class Assistant {
   private observationHealth() {
     for (const sessionId of this.deferredSources.keys())
       if (!this.store.managed(sessionId)) this.deferredSources.delete(sessionId);
-    return { coordinatorDeferred: this.coordinatorDeferred, deferredSourceCount: this.deferredSources.size,
+    return { coordinatorDeferred: this.coordinatorDeferredCode !== null, coordinatorDeferredCode: this.coordinatorDeferredCode,
+      deferredSourceCount: this.deferredSources.size,
       deferredSources: [...this.deferredSources.keys()].slice(0, 100).map(sessionId => ({
         sessionId, code: 'SESSION_TRANSITION' as const,
       })), truncated: this.deferredSources.size > 100 };
   }
   private async sampleForeground() {
-    const sample = await sampleMetadata(() => this.native.foreground());
-    if (!this.stopped) this.coordinatorDeferred = sample.state === 'deferred';
+    const sample = await sampleMetadata(() => this.native.foreground()).catch(error => {
+      // Only our pure discovery fence is deferrable, never a Host/caller error with a similar code.
+      if (error instanceof ForegroundDiscoveryInvalidated)
+        return { state: 'deferred' as const, code: 'COORDINATOR_DISCOVERY_INVALIDATED' as const };
+      throw error;
+    });
+    if (!this.stopped) this.coordinatorDeferredCode = sample.state === 'deferred' ? sample.code : null;
     return sample;
   }
   private async editWatch(caller: Caller, value: z.infer<typeof watchInput>) {
@@ -197,10 +205,15 @@ export class Assistant {
     if (!this.store.managed(sessionId) && !this.store.hasPending(sessionId)) return;
     this.sourceVersions.set(sessionId, (this.sourceVersions.get(sessionId) ?? 0) + 1);
   }
-  observe(sessionId: string, event?: NativeChatEvent): Promise<void> {
+  admitNotification(): number {
+    if (this.notice) this.noticeAgain = true;
+    return ++this.notificationVersion;
+  }
+  observe(sessionId: string, event?: NativeChatEvent, notification?: number): Promise<void> {
     if (this.stopped) return Promise.resolve();
     this.invalidateObservation(sessionId);
     if (!this.store.managed(sessionId)) return Promise.resolve();
+    const admitted = notification ?? this.admitNotification();
     // Capture event facts at admission; queued reads must not restore an old idle
     // latch after notification attention has been disabled and enabled again.
     if (event && primary(event) && event.type === 'assistant.message'
@@ -214,14 +227,14 @@ export class Assistant {
         { eventId: event.id, timestamp: event.timestamp ?? null, type: event.type })) this.awaitingIdle.add(sessionId);
     }
     if (event && rootEvent(event) && event.type === 'session.idle') this.awaitingIdle.delete(sessionId);
-    const run = () => this.observeSource(sessionId);
+    const run = () => this.observeSource(sessionId, admitted);
     const previous = this.observations.get(sessionId), operation = previous ? previous.then(run, run) : run();
     this.observations.set(sessionId, operation);
     const finished = () => { if (this.observations.get(sessionId) === operation) this.observations.delete(sessionId); };
     void operation.then(finished, finished);
     return operation;
   }
-  private async observeSource(sessionId: string): Promise<void> {
+  private async observeSource(sessionId: string, notification: number): Promise<void> {
     if (this.stopped || !this.store.managed(sessionId)) return;
     const sample = await this.sampleSource(sessionId);
     if (this.stopped) return;
@@ -229,12 +242,12 @@ export class Assistant {
     if (meta?.status === 'error' && settled(meta)) this.awaitingIdle.delete(sessionId);
     if (this.store.managed(sessionId) && meta?.loaded && meta.ask)
       this.store.enqueuePointer(sessionId, meta.ask.requestId, 'ask');
-    await this.notify();
+    await this.notify(notification);
   }
   private async sampleSource(sessionId: string, defer = true) {
     const version = this.sourceVersions.get(sessionId) ?? 0;
     const sample: MetadataSample<PublicSessionMeta | null> = defer && this.deferredSources.get(sessionId) === version
-      ? { state: 'deferred' }
+      ? { state: 'deferred', code: 'SESSION_TRANSITION' }
       : defer ? await sampleMetadata(() => this.native.session(sessionId))
         : { state: 'read', meta: await this.native.session(sessionId) };
     if (!this.stopped && version === (this.sourceVersions.get(sessionId) ?? 0)) {
@@ -261,14 +274,27 @@ export class Assistant {
     }
     return sessions;
   }
-  notify(): Promise<void> {
-    if (this.stopped) return Promise.resolve();
+  notify(notification = this.admitNotification()): Promise<void> {
+    if (this.stopped || notification <= this.notificationsBlockedThrough) return Promise.resolve();
     if (this.notice) { this.noticeAgain = true; return this.notice; }
     this.notice = (async () => {
+      let discoveryDeferrals = 0;
       try {
         do {
           this.noticeAgain = false;
-          try { await this.sendNotice(); } catch (error) { this.report(error); }
+          const admitted = this.notificationVersion;
+          try {
+            // Consume an already-arrived natural event once, but never spin on invalidation feedback.
+            if (await this.sendNotice() === 'discovery-deferred' && ++discoveryDeferrals >= 2) {
+              this.notificationsBlockedThrough = this.notificationVersion;
+              break;
+            }
+          } catch (error) {
+            // Fence queued source observations admitted before uncertainty, not just this promise.
+            this.notificationsBlockedThrough = this.notificationVersion;
+            this.report(error); break;
+          }
+          if (this.notificationVersion > admitted) this.noticeAgain = true;
         } while (this.noticeAgain && !this.stopped);
       } finally { this.notice = null; }
     })();
@@ -293,12 +319,13 @@ export class Assistant {
     }
     return eligible;
   }
-  private async sendNotice(): Promise<void> {
+  private async sendNotice(): Promise<'discovery-deferred' | void> {
     if (this.stopped || !this.store.inbox().some(item => item.notice_state === 'pending')) return;
     let sources = await this.noticeSources();
     if (this.stopped || !this.eligibleNotices(sources).size) return;
     const foreground = await this.sampleForeground();
-    if (foreground.state === 'deferred') return;
+    if (foreground.state === 'deferred')
+      return foreground.code === 'COORDINATOR_DISCOVERY_INVALIDATED' ? 'discovery-deferred' : undefined;
     let meta = foreground.meta;
     if (this.stopped || !meta) return;
     const sessionId = meta.sessionId;
@@ -333,7 +360,8 @@ export class Assistant {
     sources = await this.noticeSources();
     if (this.stopped) return;
     const confirmation = await this.sampleForeground();
-    if (confirmation.state === 'deferred') return;
+    if (confirmation.state === 'deferred')
+      return confirmation.code === 'COORDINATOR_DISCOVERY_INVALIDATED' ? 'discovery-deferred' : undefined;
     const current = confirmation.meta;
     requireFact(this.native.foregroundId() === sessionId && current?.sessionId === sessionId,
       'FOREGROUND_CHANGED', 'Foreground selection changed; no message was sent');

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import type { McpInvocationMeta, ModuleHostApi, ModuleHostIntent, ModuleHostIntentBody,
   ModuleHostIntentResult, NativeChatEvent, PublicSessionMeta } from '@waksana/cockpit-module-sdk/backend';
 import { Assistant, configInput, type Config } from '../src/core.ts';
+import { ForegroundDiscoveryInvalidated } from '../src/errors.ts';
 import type { Gateway } from '../src/gateway.ts';
 import { Store, type Topic, type Watch } from '../src/store.ts';
 
@@ -189,6 +190,119 @@ test('transition foreground samples before load or reserve defer without selecti
       await f.assistant.notify();
       assert.deepEqual(f.calls.map(call => call.name), phase === 'initial' ? ['session/load', 'prompt'] : ['prompt']);
       assert.equal((await f.assistant.health()).observations.coordinatorDeferred, false);
+    } finally { f.close(); }
+  }
+});
+
+test('only internal discovery invalidation defers initial and final passive samples with a precise health reason', async () => {
+  for (const phase of ['initial', 'final'] as const) {
+    const f = fixture();
+    try {
+      pending(f);
+      f.sessions.get('assistant')!.loaded = phase !== 'initial';
+      let reads = 0;
+      f.native.foreground = async () => {
+        if (++reads >= (phase === 'initial' ? 1 : 2)) throw new ForegroundDiscoveryInvalidated();
+        return f.sessions.get('assistant')!;
+      };
+      await f.assistant.notify();
+      assert.equal(reads, phase === 'initial' ? 1 : 2, 'Deferral alone does not retry');
+      const health = await f.assistant.health();
+      assert.equal(health.current.status, 'deferred');
+      assert.equal('code' in health.current && health.current.code, 'COORDINATOR_DISCOVERY_INVALIDATED');
+      assert.equal(health.observations.coordinatorDeferredCode, 'COORDINATOR_DISCOVERY_INVALIDATED');
+      assert.equal(health.lastWakeAttempt, null);
+      assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+      assert.equal(f.calls.length, 0); assert.deepEqual(f.errors, []);
+      f.native.foreground = async () => f.sessions.get('assistant')!;
+      await f.assistant.notify();
+      assert.deepEqual(f.calls.map(call => call.name), phase === 'initial' ? ['session/load', 'prompt'] : ['prompt']);
+      assert.equal((await f.assistant.health()).observations.coordinatorDeferredCode, null);
+    } finally { f.close(); }
+  }
+});
+
+test('a concurrent natural notification survives late discovery failure; repeated invalidation has a bounded drain', async () => {
+  for (const repeated of [false, true]) {
+    const f = fixture(), entered = deferred(), release = deferred();
+    const followups: Promise<void>[] = [];
+    try {
+      pending(f);
+      let reads = 0;
+      f.native.foreground = async () => {
+        reads++;
+        if (reads === 1) { entered.resolve(); await release.promise; throw new ForegroundDiscoveryInvalidated(); }
+        if (repeated) { followups.push(f.assistant.notify()); throw new ForegroundDiscoveryInvalidated(); }
+        return f.sessions.get('assistant')!;
+      };
+      const sending = f.assistant.notify();
+      await entered.promise;
+      followups.push(f.assistant.notify(), f.assistant.notify());
+      release.resolve();
+      await sending; await Promise.all(followups);
+      assert.equal(reads, repeated ? 2 : 3, 'At most one coalesced discovery retry, then final confirmation if recovered');
+      assert.equal(f.store.inbox()[0]!.notice_state, repeated ? 'pending' : 'notified');
+      assert.equal(f.calls.length, repeated ? 0 : 1);
+      assert.deepEqual(f.errors, []);
+      f.native.foreground = async () => f.sessions.get('assistant')!;
+      await f.assistant.notify();
+      assert.equal(f.calls.length, 1, 'A later natural event can recover the preserved pending update');
+    } finally { release.resolve(); f.close(); }
+  }
+});
+
+test('lookalike discovery codes, genuine ownership failures and explicit source calls are never softened', async () => {
+  for (const code of ['FOREGROUND_CHANGED', 'COORDINATOR_DISCOVERY_INVALIDATED',
+    'COORDINATOR_CONFLICT', 'COORDINATOR_NOT_APPLIED', 'SESSION_MISMATCH']) {
+    const f = fixture(), error = Object.assign(new Error(code), { code });
+    try {
+      pending(f);
+      f.native.foreground = async () => { throw error; };
+      await f.assistant.notify();
+      assert.deepEqual(f.errors, [error]);
+      assert.equal((await f.assistant.health()).current.status, 'unknown');
+      assert.deepEqual(f.calls, []);
+    } finally { f.close(); }
+  }
+  const f = fixture(), error = new ForegroundDiscoveryInvalidated();
+  try {
+    f.watch('a'); f.store.enqueuePointer('a', 'question', 'ask');
+    f.onMeta(async () => { throw error; });
+    await assert.rejects(f.invoke('assistant_inbox'), value => value === error);
+    await assert.rejects(f.invoke('assistant_watch', { sessionId: 'b', enabled: true }), value => value === error);
+    await assert.rejects(f.assistant.observe('a'), value => value === error);
+  } finally { f.close(); }
+});
+
+test('discovery invalidation after side effects is reported and never replays inside the same notification drain', async () => {
+  for (const phase of ['prompt', 'session/load', 'confirmation']) {
+    const f = fixture(), error = new ForegroundDiscoveryInvalidated();
+    const followups: Promise<void>[] = [];
+    try {
+      pending(f);
+      f.sessions.get('assistant')!.loaded = phase === 'prompt';
+      f.onCall(async name => {
+        followups.push(f.assistant.notify());
+        if (name === phase) throw error;
+        if (phase === 'confirmation' && name === 'session/load') {
+          f.native.foreground = async () => {
+            f.native.foreground = async () => f.sessions.get('assistant')!;
+            throw error;
+          };
+        }
+      });
+      await f.assistant.notify(); await Promise.all(followups);
+      assert.deepEqual(f.errors, [error]);
+      assert.equal(f.calls.length, 1, 'A queued notification cannot turn uncertain post-load confirmation into a retry');
+      if (phase === 'prompt') assert.equal(f.store.inbox()[0]!.notice_state, 'unknown');
+      else {
+        assert.equal(f.store.foregroundWake()!.state, 'unknown');
+        assert.equal(f.store.inbox()[0]!.notice_state, 'pending');
+      }
+      f.onCall(null);
+      f.sessions.get('assistant')!.loaded = phase === 'prompt';
+      await f.assistant.notify();
+      assert.equal(f.calls.length, 1);
     } finally { f.close(); }
   }
 });

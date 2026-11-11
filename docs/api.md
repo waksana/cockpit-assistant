@@ -320,8 +320,11 @@ Passive health reads discover saved role ownership but do not load/send or call
 role-selection availability.
 
 When that passive target sample returns `SESSION_TRANSITION`, `current.status`
-is `deferred` with the fixed `code:"SESSION_TRANSITION"`; it is not unconfigured,
-idle or unloaded. `health.observations` adds `coordinatorDeferred`,
+is `deferred` with `code:"SESSION_TRANSITION"`; it is not unconfigured,
+idle or unloaded. A concurrent invalidation of the passive coordinator directory
+or identity read instead gives `code:"COORDINATOR_DISCOVERY_INVALIDATED"`.
+This does not assert that ownership actually changed; no stale destination is used.
+`health.observations` adds `coordinatorDeferred`, `coordinatorDeferredCode` (or null),
 `deferredSourceCount`, a bodyless `deferredSources` list of `{sessionId,code}`
 (at most 100 entries), and `truncated`. Source records are bounded by registered
 sources and cleared on a definitive successful read or removal. They describe
@@ -329,6 +332,9 @@ in-process observations, not delivery receipts; persisted inbox pointers and
 historical wake attempts retain their separate meaning. No later natural
 notification means no claimed recovery. Activity-only metadata-read feedback
 does not reschedule observations.
+An event already received while discovery was in flight is coalesced into at most
+one follow-up after discovery defers. If that discovery is invalidated again,
+updates remain pending until another natural event; no timer or self-retry runs.
 
 Ordinary updates await genuine source `session.idle`, known inactive work and
 empty pending/steering queues; `assistant.turn_end` is not completion. Valid asks
@@ -340,7 +346,9 @@ An initially deferred passive sample cannot start a load or reserve a notice.
 After a load is confirmed, passive revalidation may defer the prompt without
 repeating that load. The same error code during an actual load/prompt or
 uncertain post-load confirmation remains reported with its original
-unknown/failed receipt and never authorizes replay. Other metadata errors
+unknown/failed receipt and never authorizes replay. An uncertain post-load
+confirmation ends the current notification drain, including its coalesced events.
+Other metadata errors
 retain their existing behavior.
 
 No role owner reports an unconfigured target; conflicting or unreadable ownership

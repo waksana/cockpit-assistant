@@ -178,10 +178,21 @@ Natural native events and identity/control/queue lifecycle notifications
 resample fresh state; read-generated activity or controls-only notifications
 invalidate stale evidence without scheduling another read. They do not create
 a feedback loop. Without a later event, deferral remains visible.
+Coordinator discovery uses a generation fence and single-flight reads within
+each generation. Invalidation discards the selection, never an identity guard.
+An internal discovery-invalidated result defers only passive foreground samples;
+real ownership conflicts, unapplied roles, identity mismatches and Host errors
+still surface. A natural event arriving before a stale discovery settles can
+drive one coalesced follow-up. A second invalidation ends that drain with pending
+pointers intact, rather than spinning on continuous changes.
+Notification admission versions fence even serialized source observations
+already queued when a drain stops. Those observations still retain source
+pointers, but cannot open a new drain around the retry bound or uncertainty fence.
 There is no timer, backoff, synthetic coordinator selection or stale-state
 send. This exception applies only to passive metadata samples before effect
 reservation: transition errors from load, prompt or post-load confirmation
-retain the original failed/unknown receipt and reporting behavior. Direct
+retain the original failed/unknown receipt and reporting behavior; a failed
+post-load confirmation also ends the drain without replaying queued notifications. Direct
 native caller, registration and role checks still propagate their errors.
 
 After revalidating source and target, an idle foreground receives a bounded

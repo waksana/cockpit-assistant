@@ -86,13 +86,14 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
     events: { types: ['user.message', 'assistant.message', 'session.idle', 'session.error', 'abort'],
       handle(observation: Parameters<NonNullable<ModuleBackend['events']>['handle']>[0]) {
       if (ready) {
+        const notification = assistant.admitNotification();
         const event = observation.event;
         if (!event.agentId && !event.parentToolCallId && !event.data.agentId && !event.data.parentToolCallId
           && (!event.ephemeral || !['user.message', 'assistant.message'].includes(event.type)))
           recent.invalidate(observation.sessionId, 'dirty');
         return track(async () => {
-          await assistant.observe(observation.sessionId, observation.event);
-          if (!store.managed(observation.sessionId)) await assistant.notify();
+          await assistant.observe(observation.sessionId, observation.event, notification);
+          if (!store.managed(observation.sessionId)) await assistant.notify(notification);
         });
       }
     } },
@@ -122,10 +123,11 @@ export async function activate(context: ModuleBackendContext): Promise<ModuleBac
           if (!lifecycleChanged && event.type === 'session/patch'
             && (event.activity === null || event.controls !== undefined)) assistant.invalidateObservation(sessionId);
           if (lifecycleChanged) {
+            const notification = assistant.admitNotification();
             if (!cacheChanged) recent.resumeDeferred(sessionId);
             return track(async () => {
-              await assistant.observe(sessionId);
-              if (!store.managed(sessionId)) await assistant.notify();
+              await assistant.observe(sessionId, undefined, notification);
+              if (!store.managed(sessionId)) await assistant.notify(notification);
             });
           }
         }

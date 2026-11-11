@@ -7,6 +7,7 @@ import { z } from 'zod';
 import type { ModuleHostApi, ModuleHostIntent, ModuleHostIntentBody, ModuleHostIntentResult,
   PublicSessionMeta, RoleAssignment } from '@waksana/cockpit-module-sdk/backend';
 import { NativeChat } from '../src/native-chat.ts';
+import { ForegroundDiscoveryInvalidated } from '../src/errors.ts';
 import { Store } from '../src/store.ts';
 
 const coordinator = { moduleId: 'assistant', roleId: 'coordinator', name: 'Coordinator', moduleName: 'Assistant' };
@@ -300,7 +301,7 @@ test('explicit invalidation and saved-role changes prevent older discovery resto
         assert.equal(f.calls.length, calls, 'Saved hook performs no Host calls or notification work');
       }
       release(stale);
-      await assert.rejects(older, { code: invalidate === 'close' ? 'STOPPING' : 'FOREGROUND_CHANGED' });
+      await assert.rejects(older, { code: invalidate === 'close' ? 'STOPPING' : 'COORDINATOR_DISCOVERY_INVALIDATED' });
       assert.equal(f.chat.foregroundId(), invalidate === 'discovery' ? 'other' : null);
     } finally { f.close(); }
   }
@@ -323,6 +324,30 @@ test('concurrent passive health and notification discovery share a read without 
     const results = await Promise.all([first, second]);
     assert.ok(results.every(meta => meta?.sessionId === 'front'));
     assert.equal(f.chat.foregroundId(), 'front');
+  } finally { f.close(); }
+});
+
+test('an invalidated directory generation cannot clear or join the newer single-flight discovery', async () => {
+  const f = fixture();
+  try {
+    f.owner();
+    const releases: Array<(page: Directory) => void> = [];
+    f.directoryWith(() => new Promise(resolve => { releases.push(resolve); }));
+    const older = f.chat.foreground(), sameGeneration = f.chat.foreground();
+    assert.equal(releases.length, 1);
+    f.chat.invalidateForeground();
+    f.sessions.get('front')!.roles = []; f.owner('other');
+    const newer = f.chat.foreground();
+    assert.equal(releases.length, 2);
+    releases[0]!({ sessions: [{ ...f.sessions.get('front')!, roles: [coordinator] }] });
+    await assert.rejects(older, ForegroundDiscoveryInvalidated);
+    await assert.rejects(sameGeneration, ForegroundDiscoveryInvalidated);
+    const joined = f.chat.foreground();
+    assert.equal(releases.length, 2, 'Stale cleanup must not clear the newer in-flight read');
+    releases[1]!({ sessions: structuredClone([...f.sessions.values()]) });
+    assert.deepEqual((await Promise.all([newer, joined])).map(meta => meta?.sessionId), ['other', 'other']);
+    assert.equal(f.chat.foregroundId(), 'other');
+    assert.deepEqual(f.calls.filter(call => call.name === 'session/get').map(call => call.body), [{ sessionId: 'other' }]);
   } finally { f.close(); }
 });
 

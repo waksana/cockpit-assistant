@@ -82,7 +82,7 @@ function fixture(t: TestContext, seed = true) {
         case 'roles/readiness': result = { sessionId, ready: true, loaded: true, rolesNeedReload: false,
           roles: sessions.get(sessionId!)!.roles, appliedRoles: sessions.get(sessionId!)!.appliedRoles }; break;
         case 'prompt':
-          assert.ok(sessionId === 'front' || sessionId === 'source');
+          assert.ok(sessionId && sessions.has(sessionId));
           result = { ok: true, ...(missingReceipt ? {} : { messageId: 'native-notice-receipt' }) }; break;
         case 'session/chat': result = { sessionId, source: 'source' in body ? body.source : 'live',
           direction: 'backward', events: events.get(sessionId!) ?? [], cursorStatus: 'ok',
@@ -282,6 +282,215 @@ test('activation defers unreadable coordinator identity then loads only its fres
     event: { id: 'front-idle', type: 'session.idle', data: {} } });
   assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
   assert.deepEqual(f.errors, []);
+});
+
+test('ordinary-session and real-owner invalidations recover from an event received before discovery settles', async t => {
+  for (const phase of ['initial', 'final'] as const) for (const changeOwner of [false, true]) {
+    const f = fixture(t), entered = deferred(), release = deferred();
+    t.mock.method(RecentSessions.prototype, 'start', () => {});
+    f.sessions.set('unrelated', { ...structuredClone(f.sessions.get('source')!), sessionId: 'unrelated' });
+    const backend = await f.activate();
+    let directories = 0;
+    f.respond((name, result) => {
+      if (name === 'session/directory' && ++directories === (phase === 'initial' ? 1 : 2)) {
+        entered.resolve(); return release.promise.then(() => result);
+      }
+      return result;
+    });
+    const ready = backend.onReady!();
+    try {
+      await entered.promise;
+      if (changeOwner) {
+        f.sessions.set('replacement', { ...structuredClone(f.sessions.get('front')!), sessionId: 'replacement' });
+        f.sessions.get('front')!.roles = []; f.sessions.get('front')!.appliedRoles = [];
+      }
+      const event = backend.controlEvents!.handle({ type: 'session/patch',
+        sessionId: changeOwner ? 'front' : 'unrelated', roles: [] });
+      await setImmediate();
+      assert.equal(f.calls.some(call => call.name === 'prompt' || call.name === 'session/load'), false);
+      release.resolve();
+      await ready; await event;
+      const prompts = f.calls.filter(call => call.name === 'prompt');
+      assert.equal(prompts.length, 1);
+      assert.equal((prompts[0]!.body as { sessionId: string }).sessionId, changeOwner ? 'replacement' : 'front');
+      assert.equal(f.state().inbox[0]!.notice_state, 'notified');
+      assert.deepEqual(f.errors, []);
+      await backend.dispose!();
+    } finally { release.resolve(); }
+  }
+});
+
+test('in-flight discovery invalidation preserves new message and ask pointers through bounded recovery', async t => {
+  const f = fixture(t), entered = deferred(), release = deferred();
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  const backend = await f.activate();
+  let first = true;
+  f.respond((name, result) => {
+    if (name === 'session/directory' && first) {
+      first = false; entered.resolve(); return release.promise.then(() => result);
+    }
+    return result;
+  });
+  const ready = backend.onReady!();
+  try {
+    await entered.promise;
+    f.sessions.get('source')!.ask = { requestId: 'current-question', question: 'Choose?' };
+    const message = backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
+      event: { id: 'new-event', type: 'assistant.message', data: { messageId: 'new-message', content: 'Not mirrored' } } });
+    const changed = backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'front', resources: ['instructions'] });
+    await setImmediate();
+    assert.equal(f.state().inbox.length, 3);
+    assert.ok(f.state().inbox.every(item => item.notice_state === 'pending'));
+    const idle = backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
+      event: { id: 'idle', type: 'session.idle', data: {} } });
+    release.resolve();
+    await Promise.all([ready, message, idle, changed]);
+    assert.equal(f.state().inbox.length, 3);
+    assert.deepEqual(f.state().inbox.map(item => item.notice_state), ['pending', 'pending', 'notified']);
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+    f.sessions.get('source')!.ask = null;
+    await backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
+      event: { id: 'after-answer', type: 'session.idle', data: {} } });
+    assert.equal(f.state().inbox.length, 2, 'Only the answered ask is retired, never either reply pointer');
+    assert.ok(f.state().inbox.every(item => item.notice_state === 'notified'));
+    assert.equal(f.calls.filter(call => call.name === 'prompt').length, 2);
+    assert.deepEqual(f.errors, []);
+  } finally { release.resolve(); }
+});
+
+test('queued watched-source observations cannot restart exhausted discovery drains', async t => {
+  const f = fixture(t);
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  f.sessions.get('source')!.status = 'running';
+  const backend = await f.activate(), events: Array<void | Promise<void>> = [];
+  await backend.onReady!();
+  let directories = 0, invalidating = true;
+  f.respond((name, result) => {
+    if (name === 'session/directory') {
+      if (++directories > 8) { f.stop(); return result; }
+      if (invalidating) events.push(backend.controlEvents!.handle({
+        type: 'session/invalidated', sessionId: 'source', resources: ['identity'],
+      }));
+    }
+    return result;
+  });
+  f.sessions.get('source')!.status = 'idle';
+  await backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
+    event: { id: 'initial-idle', type: 'session.idle', data: {} } });
+  await Promise.all(events);
+  assert.equal(directories, 2, 'Source serialization cannot mint another recovery budget for pre-failure events');
+  assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+  assert.deepEqual(f.errors, []);
+  invalidating = false;
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', loading: false });
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  assert.equal(f.state().inbox[0]!.notice_state, 'notified');
+});
+
+test('read feedback cannot spin invalidated discovery; later lifecycle events recover without a timer', async t => {
+  const f = fixture(t);
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  const backend = await f.activate(), events: Array<void | Promise<void>> = [];
+  let directories = 0, invalidating = true;
+  f.respond((name, result) => {
+    if (name === 'session/directory') {
+      directories++;
+      if (invalidating) events.push(backend.controlEvents!.handle({
+        type: 'session/invalidated', sessionId: 'unrelated', resources: ['identity'],
+      }));
+    }
+    if (name === 'session/get') {
+      events.push(backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'source', activeOperations: 1 }));
+      events.push(backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source', resources: ['usage'] }));
+    }
+    return result;
+  });
+  await backend.onReady!(); await Promise.all(events);
+  assert.equal(directories, 2);
+  assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+  assert.deepEqual(f.errors, []);
+  const before = f.calls.length;
+  await setImmediate();
+  assert.equal(f.calls.length, before, 'Settled invalidation starts no autonomous work');
+  invalidating = false;
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'front', loading: false });
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1);
+  assert.equal(f.state().inbox[0]!.notice_state, 'notified');
+  assert.deepEqual(f.errors, []);
+});
+
+test('invalidated post-load confirmation keeps unknown receipt and ends coalesced discovery recovery', async t => {
+  const f = fixture(t), events: Array<void | Promise<void>> = [];
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  f.sessions.get('front')!.loaded = false;
+  const backend = await f.activate();
+  let directories = 0;
+  f.respond((name, result) => {
+    if (name === 'session/directory' && ++directories === 2)
+      events.push(backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'unrelated', roles: [] }));
+    return result;
+  });
+  await backend.onReady!(); await Promise.all(events);
+  assert.equal(directories, 2, 'The same drain must not retry the failed confirmation');
+  assert.equal(f.sessions.get('front')!.loaded, true, 'Actual load succeeded but confirmation is uncertain');
+  assert.equal(f.state().wake!.state, 'unknown');
+  assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+  assert.deepEqual(f.calls.filter(call => call.name === 'session/load' || call.name === 'prompt').map(call => call.name),
+    ['session/load']);
+  assert.equal(f.errors.length, 1);
+  assert.equal((f.errors[0] as { code: string }).code, 'COORDINATOR_DISCOVERY_INVALIDATED');
+});
+
+test('events admitted before uncertain post-load confirmation cannot reopen a drain through the source queue', async t => {
+  const f = fixture(t), events: Array<void | Promise<void>> = [];
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  f.sessions.get('front')!.loaded = false;
+  const backend = await f.activate();
+  let directories = 0;
+  f.respond((name, result) => {
+    if (name === 'session/directory' && ++directories === 2) {
+      events.push(backend.controlEvents!.handle({ type: 'session/invalidated', sessionId: 'source', resources: ['identity'] }));
+      events.push(backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
+        event: { id: 'queued-reply', type: 'assistant.message', data: { messageId: 'queued-reply', content: 'Not mirrored' } } }));
+      events.push(backend.events!.handle({ sessionId: 'source', cwd: '/synthetic',
+        event: { id: 'queued-idle', type: 'session.idle', data: {} } }));
+    }
+    return result;
+  });
+  await backend.onReady!(); await Promise.all(events);
+  assert.equal(directories, 2, 'Events queued before the failure cannot trigger a new confirmation or prompt');
+  assert.equal(f.state().wake!.state, 'unknown');
+  assert.equal(f.state().inbox.length, 2, 'Queued observations still capture their reply pointers');
+  assert.ok(f.state().inbox.every(item => item.notice_state === 'pending'));
+  assert.deepEqual(f.calls.filter(call => call.name === 'session/load' || call.name === 'prompt').map(call => call.name),
+    ['session/load']);
+  assert.equal(f.errors.length, 1);
+  await backend.controlEvents!.handle({ type: 'session/patch', sessionId: 'front', loading: false });
+  assert.equal(f.calls.filter(call => call.name === 'prompt').length, 1, 'Only a genuinely later event may observe a loaded owner');
+  assert.equal(f.state().wake!.state, 'unknown', 'Fresh health does not rewrite the uncertain historical load');
+  assert.ok(f.state().inbox.every(item => item.notice_state === 'notified'));
+});
+
+test('stop fences a coalesced notification while invalidated discovery is still in flight', async t => {
+  const f = fixture(t), entered = deferred(), release = deferred();
+  t.mock.method(RecentSessions.prototype, 'start', () => {});
+  const backend = await f.activate();
+  f.respond((name, result) => {
+    if (name === 'session/directory') { entered.resolve(); return release.promise.then(() => result); }
+    return result;
+  });
+  const ready = backend.onReady!();
+  try {
+    await entered.promise;
+    const event = backend.controlEvents!.handle({ type: 'session/removed', sessionId: 'unrelated' });
+    await setImmediate();
+    f.stop(); release.resolve();
+    await Promise.all([ready, event, backend.onStop!()]);
+    assert.equal(f.calls.filter(call => call.name === 'session/directory').length, 1);
+    assert.equal(f.calls.some(call => call.name === 'session/load' || call.name === 'prompt'), false);
+    assert.equal(f.state().inbox[0]!.notice_state, 'pending');
+    await assertIngressStopped(backend, f);
+  } finally { release.resolve(); }
 });
 
 test('an inherited Host prompt guard failure preserves the inbox without replay from later events', async t => {

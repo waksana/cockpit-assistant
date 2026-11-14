@@ -83,6 +83,13 @@ test('session guidance is embedded only in coordinator and retires organizer wit
       /Use the exact current native ask/,
       /Do not mechanically redirect to a superior or broadcast to multiple recipients/,
       /Being able to enqueue does not make a session suitable to receive/,
+      /Historical relevance establishes a candidate, not confirmed topic continuity/,
+      /If a past-discussion summary is the only link, read the relevant original Chat/,
+      /distinguish a continuation from a related but independent question/,
+      /does not require full-history reads on every turn/,
+      /An idle snapshot, empty queue or absence of direct background processes does not\s+cancel evidence of continuing work, coordination or pending results in Chat/,
+      /Check continuity and current receiving suitability separately/,
+      /ongoing work is not an automatic reason to reject reuse/,
       /not a catch-all\s+Assistant owner/,
     ]) {
       assert.match(front, selection);
@@ -121,6 +128,8 @@ test('session guidance is embedded only in coordinator and retires organizer wit
       /Add only context the recipient lacks and needs to understand this turn/,
       /not the full routing rationale, known history or a checklist of standing rules/,
       /Keep added factual context distinguishable from the user's request/,
+      /Do not add "this continues our earlier discussion" unless continuity is established\s+by the user's context or relevant Chat evidence/,
+      /Saying a new question "will not affect ongoing work" is\s+not a substitute for checking whether the recipient is suitable now/,
       /Do not expand an ordinary question into a work order or prescribe analysis\s+directions, conclusions, deliverables or extra requirements the user did not ask\s+for/,
       /Preserve open questions as open questions/,
       /For an authorized execution handoff, include the concrete scope, prerequisites\s+and limits needed for that action without inventing additional obligations/,

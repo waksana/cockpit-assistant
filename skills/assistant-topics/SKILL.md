@@ -39,6 +39,10 @@ not the full routing rationale, known history or a checklist of standing rules.
 A familiar session usually needs only the follow-up and relevant new facts; a new
 one needs the minimum background that makes the message understandable.
 Keep added factual context distinguishable from the user's request.
+Do not add "this continues our earlier discussion" unless continuity is established
+by the user's context or relevant Chat evidence. Related subject matter alone does
+not justify that claim. Saying a new question "will not affect ongoing work" is
+not a substitute for checking whether the recipient is suitable now.
 
 Do not expand an ordinary question into a work order or prescribe analysis
 directions, conclusions, deliverables or extra requirements the user did not ask
@@ -91,6 +95,11 @@ source; metadata assists discovery. A fresh summary is still not a complete
 responsibility definition. No index hit, topic mapping or attention record grants
 ownership, execution authority or a progress conclusion.
 
+Historical relevance establishes a candidate, not confirmed topic continuity.
+If a past-discussion summary is the only link, read the relevant original Chat
+to distinguish a continuation from a related but independent question. Reuse
+sufficient current evidence; this does not require full-history reads on every turn.
+
 Choose when evidence supports the responsibility needed for this request and
 material candidate conflicts are resolved, not just when one lookup returns a
 match. After a scope correction, reconsider relevant candidates rather than only
@@ -107,6 +116,10 @@ Neither `running`, elapsed time nor shell count alone establishes heavy or
 long-running work. Interpret activity with the actual current work; unknown
 activity is not idle, and an idle session is not necessarily a suitable owner.
 Do not introduce a scheduler or workload score to replace this judgment.
+An idle snapshot, empty queue or absence of direct background processes does not
+cancel evidence of continuing work, coordination or pending results in Chat.
+Check continuity and current receiving suitability separately; neither implies
+the other, and ongoing work is not an automatic reason to reject reuse.
 
 Distinguish independent discussion from feedback required by current execution.
 Independent questions must not default to the queue of a session occupied by
